@@ -127,6 +127,18 @@ bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params)
 
 uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, const int child_height)
 {
+    const auto& consensus = params.GetConsensus();
+    // Relax admission on the existing Betanet identity without rewriting its
+    // genesis/manifest preimage. Historical 100-deep deposits remain valid.
+    if (params.NetworkIDString() == CBaseChainParams::ELEMENTS &&
+        consensus.elements_mode && consensus.has_parent_chain &&
+        consensus.drivechain_slot == 24 &&
+        consensus.hashGenesisBlock == uint256S("a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f") &&
+        consensus.drivechain_protocol_manifest_hash == uint256S("5c3d0dab899b95e05a47691bed1a0bdca87938faca69ab04985a4c43a970a673") &&
+        params.ParentGenesisBlockHash() == uint256S("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f") &&
+        consensus.pegin_min_depth == 100) {
+        return 6;
+    }
     if (child_height >= ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT &&
         HasAlphaPeginOneConfirmationUpgrade(params)) {
         return 1;

@@ -31,7 +31,9 @@ bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
 inline constexpr int ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT{64};
 bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params);
 /** child_height is the validated block-index height (active tip + 1 for admission).
- * Unknown/negative heights retain the historical depth. No witness/RPC height override is accepted.
+ * Unknown/negative heights retain the historical Alpha depth; the exact Betanet
+ * identity requires six confirmations at every height, including admission.
+ * No witness/RPC height override is accepted.
  */
 uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, int child_height = -1);
 

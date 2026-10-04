@@ -1540,18 +1540,25 @@ public:
     }
 };
 
-BOOST_AUTO_TEST_CASE(betanet_pegin_depth_excludes_historical_alpha_upgrade)
+BOOST_AUTO_TEST_CASE(betanet_pegin_requires_six_confirmations_without_changing_identity)
 {
     ArgsManager args;
     // An ordinary configuration override cannot reduce the frozen depth.
     args.ForceSetArg("-peginconfirmationdepth", "0");
     const auto beta = CreateChainParams(args, CBaseChainParams::ELEMENTS);
     BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*beta));
+    BOOST_CHECK_EQUAL(beta->GetConsensus().pegin_min_depth, 100U);
+    BOOST_CHECK_EQUAL(beta->GetConsensus().hashGenesisBlock.GetHex(),
+        "a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f");
     for (const int height : {-1, 0, 63, 64, 65, std::numeric_limits<int>::max()}) {
         const auto depth = GetDrivechainPeginConfirmationDepth(*beta, height);
-        BOOST_CHECK_EQUAL(depth, 100U);
-        BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 1098, depth));
-        BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1099, depth));
+        BOOST_CHECK_EQUAL(depth, 6U);
+        for (uint32_t parent = 1000; parent < 1005; ++parent) {
+            BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, parent, depth));
+        }
+        BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1005, depth));
+        BOOST_CHECK(HasRequiredDrivechainDepositDepth(1000, 1006, depth));
+        BOOST_CHECK(!HasRequiredDrivechainDepositDepth(1000, 999, depth));
     }
 }
 
@@ -1592,6 +1599,9 @@ BOOST_AUTO_TEST_CASE(alpha_pegin_depth_upgrade_is_identity_and_height_scoped)
         (other.*mutate)();
         BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(other));
         BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(other, 64), 100U);
+        MutatedIdentity beta_other{*CreateChainParams(ArgsManager{}, CBaseChainParams::ELEMENTS)};
+        (beta_other.*mutate)();
+        BOOST_CHECK_EQUAL(GetDrivechainPeginConfirmationDepth(beta_other, 64), 100U);
     }
     const auto private_chain = CreateChainParams(ArgsManager{}, "elementsregtest");
     BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*private_chain));
