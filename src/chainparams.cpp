@@ -8,8 +8,10 @@
 #endif
 
 #include <chainparams.h>
+#include <haskell/pegin_identity.h>
 
 #include <chainparamsbase.h>
+#include <haskell/bridge.h>
 #include <common/args.h>
 #include <consensus/params.h>
 #include <crypto/sha256.h>
@@ -111,39 +113,36 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
 
 static std::unique_ptr<const CChainParams> globalChainParams;
 
+static uint32_t PeginConfirmationPolicy(const CChainParams& params, int height, bool alpha_only)
+{
+    static_assert(ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT == 64);
+    const auto& consensus = params.GetConsensus();
+    return drivechain::haskell::PeginConfirmationPolicy(alpha_only, height, consensus.pegin_min_depth,
+        [&](uint32_t step) {
+            switch (step) {
+            case 0: return params.NetworkIDString() == drivechain::PEGIN_IDENTITY_NETWORK;
+            case 1: return consensus.elements_mode;
+            case 2: return consensus.has_parent_chain;
+            case 3: return consensus.drivechain_slot == drivechain::PEGIN_IDENTITY_SLOT;
+            case 4: return consensus.hashGenesisBlock == uint256S(drivechain::PEGIN_ALPHA_GENESIS);
+            case 5: return params.ParentGenesisBlockHash() == uint256S(drivechain::PEGIN_PARENT_GENESIS);
+            case 6: return consensus.drivechain_protocol_manifest_hash == uint256S(drivechain::PEGIN_ALPHA_MANIFEST);
+            case 7: return consensus.pegin_min_depth == drivechain::PEGIN_IDENTITY_DEPTH;
+            case 8: return consensus.hashGenesisBlock == uint256S(drivechain::PEGIN_BETA_GENESIS);
+            case 9: return consensus.drivechain_protocol_manifest_hash == uint256S(drivechain::PEGIN_BETA_MANIFEST);
+            default: throw std::logic_error("Unknown pegin identity fact");
+            }
+        });
+}
+
 bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params)
 {
-    const auto& consensus = params.GetConsensus();
-    // Pin the existing Alpha identity, not just a mutable network name or slot.
-    // Keep pegin_min_depth=100 in the historical protocol manifest and genesis.
-    return params.NetworkIDString() == CBaseChainParams::ELEMENTS &&
-        consensus.elements_mode && consensus.has_parent_chain &&
-        consensus.drivechain_slot == 24 &&
-        consensus.hashGenesisBlock == uint256S("672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd") &&
-        params.ParentGenesisBlockHash() == uint256S("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f") &&
-        consensus.drivechain_protocol_manifest_hash == uint256S("fbd55822590e0e7a3389c2316171068b2fe7ddbb35c52aa010159bfbd92d09e6") &&
-        consensus.pegin_min_depth == 100;
+    return PeginConfirmationPolicy(params, 0, true) == 1;
 }
 
 uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, const int child_height)
 {
-    const auto& consensus = params.GetConsensus();
-    // Relax admission on the existing Betanet identity without rewriting its
-    // genesis/manifest preimage. Historical 100-deep deposits remain valid.
-    if (params.NetworkIDString() == CBaseChainParams::ELEMENTS &&
-        consensus.elements_mode && consensus.has_parent_chain &&
-        consensus.drivechain_slot == 24 &&
-        consensus.hashGenesisBlock == uint256S("a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f") &&
-        consensus.drivechain_protocol_manifest_hash == uint256S("5c3d0dab899b95e05a47691bed1a0bdca87938faca69ab04985a4c43a970a673") &&
-        params.ParentGenesisBlockHash() == uint256S("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f") &&
-        consensus.pegin_min_depth == 100) {
-        return 6;
-    }
-    if (child_height >= ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT &&
-        HasAlphaPeginOneConfirmationUpgrade(params)) {
-        return 1;
-    }
-    return params.GetConsensus().pegin_min_depth;
+    return PeginConfirmationPolicy(params, child_height, false);
 }
 
 const CChainParams &Params() {
@@ -153,9 +152,7 @@ const CChainParams &Params() {
 
 std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const ChainTypeMeta chain)
 {
-    if (chain.chain_name == "usdd") {
-        throw std::runtime_error("The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
-    }
+    drivechain::haskell::ValidateNetworkSelection(drivechain::haskell::NetworkSelection::CHAIN_NAME, chain.chain_name);
     switch (chain.chain_type) {
     case ChainType::ELEMENTS:
         return CChainParams::ElementsDrivechain();
@@ -175,24 +172,10 @@ std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, c
         // the exact network-selection boundary instead of in the base
         // constructor. Otherwise every custom Elements chain that explicitly
         // enables Elements mode is rejected before its parameters are applied.
-        if (args.GetBoolArg("-con_elementsmode", false)) {
-            throw std::runtime_error(
-                "-con_elementsmode is not supported with -chain=regtest; "
-                "use -chain=elementsregtest for Elements/ECX testing");
-        }
+        drivechain::haskell::ValidateNetworkSelection(drivechain::haskell::NetworkSelection::REGTEST_OPTION,
+            "", args.GetBoolArg("-con_elementsmode", false));
         for (const std::string& deployment : args.GetArgs("-vbparams")) {
-            const auto separator{deployment.find(':')};
-            const std::string deployment_name{deployment.substr(0, separator)};
-            if (deployment_name == "simplicity") {
-                throw std::runtime_error(
-                    "the Simplicity deployment is not supported with "
-                    "-chain=regtest; use an Elements-mode chain");
-            }
-            if (deployment_name == "dynafed") {
-                throw std::runtime_error(
-                    "the dynafed deployment is not supported with "
-                    "-chain=regtest; use an Elements-mode chain");
-            }
+            drivechain::haskell::ValidateNetworkSelection(drivechain::haskell::NetworkSelection::REGTEST_OPTION, deployment);
         }
         auto opts = CChainParams::RegTestOptions{};
         ReadRegTestArgs(args, opts);

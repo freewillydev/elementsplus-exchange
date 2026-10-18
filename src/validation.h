@@ -1506,13 +1506,9 @@ public:
 };
 
 /** Pure generation comparison shared by mining policy and focused tests. */
-constexpr bool IsDrivechainMempoolEpochCurrent(
+bool IsDrivechainMempoolEpochCurrent(
     const uint64_t authenticated_epoch,
-    const uint64_t mempool_epoch)
-{
-    return authenticated_epoch != 0 &&
-           authenticated_epoch == mempool_epoch;
-}
+    const uint64_t mempool_epoch);
 
 /** Deployment* info via ChainstateManager */
 template<typename DEP>

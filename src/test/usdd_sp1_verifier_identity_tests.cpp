@@ -11,10 +11,42 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <boost/test/unit_test.hpp>
 
 BOOST_AUTO_TEST_SUITE(usdd_sp1_verifier_identity_tests)
+
+BOOST_AUTO_TEST_CASE(startup_admission_orders_every_failure_and_skips_inactive)
+{
+    const char* errors[]{
+        "USDD SP1 activation has no frozen verifier semantic identity",
+        "USDD SP1 activation requires the pinned verifier, but this binary was built without it",
+        "linked USDD SP1 verifier ABI does not match the production identity",
+        "linked USDD SP1 verifier semantic-identity format does not match the production identity",
+        "linked USDD SP1 verifier could not export its semantic identity",
+        "linked USDD SP1 verifier semantics do not match the production identity"};
+    for (unsigned mask = 0; mask < 64; ++mask) {
+        unsigned failure = 0;
+        while (failure < 6 && (mask & (1U << failure))) ++failure;
+        for (bool diagnostic : {false,true}) {
+            unsigned calls = 0;
+            std::string error{"stale"};
+            const bool accepted = drivechain::haskell::VerifierStartup(true, [&](uint32_t step) {
+                BOOST_CHECK_EQUAL(step, calls++);
+                return bool(mask & (1U << step));
+            }, diagnostic ? &error : nullptr);
+            BOOST_CHECK_EQUAL(accepted, failure == 6);
+            BOOST_CHECK_EQUAL(calls, std::min(6U,failure+1));
+            BOOST_CHECK_EQUAL(error, diagnostic ? (failure == 6 ? "" : errors[failure]) : "stale");
+        }
+    }
+    std::string error{"stale"};
+    const auto unexpected = [](uint32_t) -> bool { throw std::logic_error("unexpected verifier read"); };
+    BOOST_CHECK(drivechain::haskell::VerifierStartup(false, unexpected, &error));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK_THROW(drivechain::haskell::VerifierStartup(true, unexpected, nullptr), std::logic_error);
+}
 
 BOOST_AUTO_TEST_CASE(inactive_gate_does_not_require_a_native_archive)
 {
@@ -96,6 +128,24 @@ BOOST_AUTO_TEST_CASE(production_fee_asset_is_immutable)
     const CAsset pegged{uint256S(ElementsDrivechainIdentity::PEGGED_ASSET)};
     CAsset resolved;
     std::string error;
+
+    const std::vector<std::optional<std::string>> inputs{
+        std::nullopt,"",pegged.GetHex(),std::string(64,'0'),std::string(64,'A'),
+        std::string(64,'1'),std::string(63,'1'),std::string(65,'1'),std::string(64,'z'),
+        "0x"+std::string(62,'1'),std::string(63,'1')+" ",std::string(63,'1')+std::string(1,'\0')};
+    for (const bool canonical : {false,true}) {
+        for (const auto& configured : inputs) {
+            const auto parsed = configured ? uint256::FromHex(*configured) : std::optional<uint256>{pegged.id};
+            const bool allowed = parsed && (!canonical || *parsed == pegged.id);
+            const CAsset sentinel{uint256::ONE};
+            CAsset actual{sentinel};
+            std::string message{"stale"};
+            BOOST_CHECK_EQUAL(ResolveElementsFeeAsset(configured,pegged,canonical,actual,&message),allowed);
+            BOOST_CHECK(actual == (allowed ? CAsset{*parsed} : sentinel));
+            BOOST_CHECK_EQUAL(message,!parsed ? "-feeasset must be exactly 64 hexadecimal characters" :
+                !allowed ? "-feeasset must equal the immutable Elements pegged asset" : "");
+        }
+    }
 
     BOOST_CHECK(ResolveElementsFeeAsset(std::nullopt, pegged, true, resolved, &error));
     BOOST_CHECK(resolved == pegged);

@@ -31,6 +31,7 @@ class Chainstate;
 class ChainstateManager;
 
 namespace Consensus { struct Params; };
+namespace util { class SignalInterrupt; }
 
 namespace node {
 static const bool DEFAULT_PRINT_MODIFIED_FEE = false;
@@ -194,7 +195,7 @@ public:
         DynaFedParamEntry proposed_entry{};
         // ELEMENTS: non-consensus commitment scripts for coinbase outputs
         std::vector<CScript> commit_scripts{};
-        std::optional<uint64_t> authenticated_parent_height;
+        std::optional<uint64_t> authenticated_parent_height{};
     };
 
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);
@@ -234,7 +235,7 @@ private:
       * locktime, premature-witness, serialized size (if necessary)
       * These checks should always succeed, and they're here
       * only as an extra check in case of suboptimal node configuration */
-    bool TestPackageTransactions(const CTxMemPool::setEntries& package) const EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+    bool TestPackageTransactions(const CTxMemPool& mempool, const CTxMemPool::setEntries& package) const EXCLUSIVE_LOCKS_REQUIRED(cs_main, mempool.cs);
     /** Sort the package in an order that is valid to appear in a block */
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
 };
@@ -250,6 +251,15 @@ int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParam
 
 /** Update an old GenerateCoinbaseCommitment from CreateNewBlock after the block txs have changed */
 void IncrementExtraNonce(CBlock* block, const CBlockIndex* previous, unsigned int& extra_nonce);
+
+/** Run the shared PoW search. False means budget exhaustion or interruption;
+ * callers must handle nonce exhaustion separately. */
+bool SearchBlockNonce(CBlock& block, uint64_t& max_tries, const Consensus::Params& consensus,
+                      const util::SignalInterrupt& interrupt);
+
+/** Append OP_TRUE only for an exact WSH(OP_TRUE) signing script. Existing
+ * witness entries are retained. Returns false without mutation otherwise. */
+bool AppendOpTrueBlockWitness(CBlockHeader& block);
 
 void RegenerateCommitments(CBlock& block, ChainstateManager& chainman);
 

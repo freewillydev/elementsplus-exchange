@@ -7,6 +7,7 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <core_io.h>
+#include <haskell/bridge.h>
 #include <key_io.h>
 #include <policy/policy.h>
 #include <rpc/server.h>
@@ -71,7 +72,9 @@ static RPCHelpMan balance()
     const CAmount immature = valueFor(bal.m_mine_immature, ::policyAsset);
 
     UniValue obj(UniValue::VOBJ);
-    obj.pushKV("total_sats", trusted + pending + immature);
+    const auto total = drivechain::haskell::WalletBalanceTotal(trusted, pending, immature);
+    if (total < 0) throw JSONRPCError(RPC_WALLET_ERROR, "Wallet balance is negative or exceeds the supported range");
+    obj.pushKV("total_sats", total);
     obj.pushKV("available_sats", trusted);
     return obj;
 },

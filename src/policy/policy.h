@@ -8,6 +8,7 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <haskell/resource_constants.h>
 #include <policy/discount.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -131,7 +132,9 @@ static constexpr unsigned int STANDARD_SCRIPT_VERIFY_FLAGS{MANDATORY_SCRIPT_VERI
                                                              SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS |
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE |
                                                              SCRIPT_VERIFY_SIMPLICITY |
-                                                             SCRIPT_VERIFY_USDD_SP1_ANNEX};
+                                                             ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS};
+static_assert(ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS == SCRIPT_VERIFY_USDD_SP1_ANNEX);
+static_assert((MANDATORY_SCRIPT_VERIFY_FLAGS & ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS) == 0);
 
 /** For convenience, standard but not mandatory verify flags. */
 static constexpr unsigned int STANDARD_NOT_MANDATORY_VERIFY_FLAGS{STANDARD_SCRIPT_VERIFY_FLAGS & ~MANDATORY_SCRIPT_VERIFY_FLAGS};

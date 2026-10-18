@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <script/interpreter.h>
+#include <haskell/bridge.h>
 #include <script/ecx_activation_annex.h>
 
 #include <consensus/consensus.h>
@@ -33,9 +34,12 @@ static bool VerifyEcxSp1Groth16(
     const uint32_t* program_id_words,
     const unsigned char* public_values_sha256)
 {
-    if (context != nullptr) return false;
-    return ecx_sp1_6_3_1_verify_groth16_sha256(
-        nullptr, proof, proof_len, program_id_words, public_values_sha256);
+    try {
+        return drivechain::haskell::VerifyGroth16(ecx_sp1_6_3_1_verify_groth16_sha256,
+            context, proof, proof_len, program_id_words, public_values_sha256);
+    } catch (...) {
+        return false; // No C++ exception may escape into the Simplicity C caller.
+    }
 }
 #endif
 #include <simplicity/errorCodes.h>
@@ -768,37 +772,23 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
                 case OP_CHECKTEMPLATEVERIFY:
                 {
-                    if (flags & SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY) {
-                        return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
-                    }
-
-                    // If not enabled, keep the historical OP_NOP4 behavior.
-                    if (!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY)) {
-                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) {
-                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
-                        }
+                    const uint32_t options = bool(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY) |
+                        (bool(flags & SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY) << 1) |
+                        (bool(flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) << 2) |
+                        (bool(flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH) << 3) |
+                        (!stack.empty() << 4);
+                    switch (drivechain::haskell::CtvAdmission(options, stack.empty() ? 0 : stack.back().size())) {
+                    case drivechain::haskell::CtvAction::IGNORE:
                         break;
-                    }
-
-                    if (stack.size() < 1) {
+                    case drivechain::haskell::CtvAction::DISCOURAGE:
+                        return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                    case drivechain::haskell::CtvAction::EMPTY_STACK:
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
-                    }
-
-                    switch (stack.back().size()) {
-                    case 32:
-                    {
-                        const Span<const unsigned char> hash{stack.back()};
-                        if (!checker.CheckDefaultCheckTemplateVerifyHash(hash)) {
+                    case drivechain::haskell::CtvAction::CHECK_HASH:
+                        if (!checker.CheckDefaultCheckTemplateVerifyHash(Span<const unsigned char>{stack.back()})) {
                             return set_error(serror, SCRIPT_ERR_TEMPLATE_MISMATCH);
                         }
                         break;
-                    }
-                    default:
-                        // Future upgrades can assign semantics to other
-                        // argument lengths, so discourage them in policy.
-                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH) {
-                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
-                        }
                     }
                 }
                 break;
@@ -2545,6 +2535,12 @@ std::vector<uint256> GetSpentScriptPubKeysSHA256(const std::vector<CTxOut>& outp
     return spent_spk_single_hashes;
 }
 
+template <typename... Values>
+static uint8_t ContextPresence(const Values&... values)
+{
+    return drivechain::haskell::ContextPresence((0U + ... + unsigned(values.has_value())), sizeof...(Values));
+}
+
 /** Compute the (single) SHA256 of the concatenation of all scriptSigs in a tx. */
 template <class T>
 uint256 GetScriptSigsSHA256(const T& txTo)
@@ -2557,54 +2553,22 @@ uint256 GetScriptSigsSHA256(const T& txTo)
 }
 
 template <class T>
-bool NoScriptSigs(const T& txTo)
-{
-    return std::all_of(txTo.vin.begin(), txTo.vin.end(), [](const CTxIn& txin) {
-        return txin.scriptSig.empty();
-    });
-}
-
-template <class T>
-uint256 GetDefaultCheckTemplateVerifyHashWithScript(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint256& scriptSig_hash, const uint32_t input_index)
-{
-    HashWriter ss;
-    ss << txTo.version;
-    ss << txTo.nLockTime;
-    ss << scriptSig_hash;
-    ss << uint32_t(txTo.vin.size());
-    ss << sequences_hash;
-    ss << uint32_t(txTo.vout.size());
-    ss << outputs_hash;
-    ss << input_index;
-    return ss.GetSHA256();
-}
-
-template <class T>
-uint256 GetDefaultCheckTemplateVerifyHashEmptyScript(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint32_t input_index)
-{
-    HashWriter ss;
-    ss << txTo.version;
-    ss << txTo.nLockTime;
-    ss << uint32_t(txTo.vin.size());
-    ss << sequences_hash;
-    ss << uint32_t(txTo.vout.size());
-    ss << outputs_hash;
-    ss << input_index;
-    return ss.GetSHA256();
-}
-
-template <class T>
-uint256 GetDefaultCheckTemplateVerifyHash(const T& txTo, const uint256& outputs_hash, const uint256& sequences_hash, const uint32_t input_index)
-{
-    return NoScriptSigs(txTo) ?
-        GetDefaultCheckTemplateVerifyHashEmptyScript(txTo, outputs_hash, sequences_hash, input_index) :
-        GetDefaultCheckTemplateVerifyHashWithScript(txTo, outputs_hash, sequences_hash, GetScriptSigsSHA256(txTo), input_index);
-}
-
-template <class T>
 uint256 GetDefaultCheckTemplateVerifyHash(const T& txTo, const uint32_t input_index)
 {
-    return GetDefaultCheckTemplateVerifyHash(txTo, GetOutputsSHA256(txTo), GetSequencesSHA256(txTo), input_index);
+    const uint256 outputs_hash = GetOutputsSHA256(txTo);
+    const uint256 sequences_hash = GetSequencesSHA256(txTo);
+    HashWriter ss;
+    ss << txTo.version;
+    ss << txTo.nLockTime;
+    if (!drivechain::haskell::ParentReplayEach(txTo.vin, [](const CTxIn& input) {
+        return input.scriptSig.empty();
+    })) ss << GetScriptSigsSHA256(txTo);
+    ss << uint32_t(txTo.vin.size());
+    ss << sequences_hash;
+    ss << uint32_t(txTo.vout.size());
+    ss << outputs_hash;
+    ss << input_index;
+    return ss.GetSHA256();
 }
 
 /** Compute the vector where each element is SHA256 of output scriptPubKey of a tx. */
@@ -2638,6 +2602,42 @@ uint256 GetRangeproofsHash(const T& txTo) {
 }
 
 } // namespace
+
+uint8_t PrecomputedTransactionData::EcxBondV2IdentityPresence() const
+{
+    return ContextPresence(m_bond_v2_configuration_hash, m_bond_v2_asset_id,
+        m_bond_v2_deployment_commitment, m_bond_v2_transition_cmr,
+        m_bond_v2_collateral_vault_script_sha256, m_bond_v2_collateral_vault_cmr,
+        m_bond_v2_insurance_reserve_script_sha256, m_bond_v2_insurance_reserve_cmr);
+}
+
+uint8_t PrecomputedTransactionData::EcxBondV2ProjectionPresence() const
+{
+    return ContextPresence(m_prior_active_bond_inbox_root, m_prior_active_bond_inbox_count, m_current_sidechain_height);
+}
+
+uint8_t PrecomputedTransactionData::EcxBondV2IncrementalActivationIdentityPresence() const
+{
+    return ContextPresence(m_bond_v2_incremental_activation_program_id, m_bond_v2_incremental_activation_configuration_hash,
+        m_bond_v2_incremental_activation_cmr, m_incremental_successor_program_id,
+        m_bond_v2_incremental_successor_configuration_hash, m_incremental_successor_transition_cmr,
+        m_incremental_successor_state_node_domain_sha256);
+}
+
+uint8_t PrecomputedTransactionData::EcxForcedInboxPresence() const
+{
+    return ContextPresence(m_prior_active_forced_inbox_root, m_prior_active_forced_processed_cursor);
+}
+
+uint8_t PrecomputedTransactionData::EcxDepositInboxPresence() const
+{
+    return ContextPresence(m_prior_active_deposit_inbox_root, m_prior_active_deposit_processed_cursor);
+}
+
+uint8_t PrecomputedTransactionData::EcxCurrentBmmPresence() const
+{
+    return ContextPresence(m_current_bmm_parent_block_hash, m_current_bmm_parent_height, m_current_bmm_parent_mtp);
+}
 
 template <class T>
 void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
@@ -3326,16 +3326,8 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
                 *txdata->m_prior_active_deposit_processed_cursor;
         }
     }
-    const bool bmm_hash_present{
-        txdata->m_current_bmm_parent_block_hash.has_value()};
-    const bool bmm_height_present{
-        txdata->m_current_bmm_parent_height.has_value()};
-    const bool bmm_mtp_present{txdata->m_current_bmm_parent_mtp.has_value()};
-    if (bmm_hash_present != bmm_height_present ||
-        bmm_hash_present != bmm_mtp_present) {
-        ecx_root.current_bmm_parent_present = 2;
-    } else if (bmm_hash_present) {
-        ecx_root.current_bmm_parent_present = 1;
+    ecx_root.current_bmm_parent_present = txdata->EcxCurrentBmmPresence();
+    if (ecx_root.current_bmm_parent_present == 1) {
         std::copy(
             txdata->m_current_bmm_parent_block_hash->begin(),
             txdata->m_current_bmm_parent_block_hash->end(),
@@ -3345,76 +3337,24 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
         ecx_root.current_bmm_parent_mtp = *txdata->m_current_bmm_parent_mtp;
     }
     ecx_root.bond_v2_identity_present = txdata->EcxBondV2IdentityPresence();
-    if (txdata->m_bond_v2_configuration_hash.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_configuration_hash->begin(),
-            txdata->m_bond_v2_configuration_hash->end(),
-            ecx_root.bond_v2_configuration_hash_wire);
-    }
-    if (txdata->m_bond_v2_asset_id.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_asset_id->begin(),
-            txdata->m_bond_v2_asset_id->end(),
-            ecx_root.bond_v2_asset_id_wire);
-    }
-    if (txdata->m_bond_v2_deployment_commitment.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_deployment_commitment->begin(),
-            txdata->m_bond_v2_deployment_commitment->end(),
-            ecx_root.bond_v2_deployment_commitment_wire);
-    }
-    if (txdata->m_bond_v2_transition_cmr.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_transition_cmr->begin(),
-            txdata->m_bond_v2_transition_cmr->end(),
-            ecx_root.bond_v2_transition_cmr_wire);
-    }
-    if (txdata->m_bond_v2_collateral_vault_script_sha256.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_collateral_vault_script_sha256->begin(),
-            txdata->m_bond_v2_collateral_vault_script_sha256->end(),
-            ecx_root.bond_v2_collateral_vault_script_sha256_wire);
-    }
-    if (txdata->m_bond_v2_collateral_vault_cmr.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_collateral_vault_cmr->begin(),
-            txdata->m_bond_v2_collateral_vault_cmr->end(),
-            ecx_root.bond_v2_collateral_vault_cmr_wire);
-    }
-    if (txdata->m_bond_v2_insurance_reserve_script_sha256.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_insurance_reserve_script_sha256->begin(),
-            txdata->m_bond_v2_insurance_reserve_script_sha256->end(),
-            ecx_root.bond_v2_insurance_reserve_script_sha256_wire);
-    }
-    if (txdata->m_bond_v2_insurance_reserve_cmr.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_insurance_reserve_cmr->begin(),
-            txdata->m_bond_v2_insurance_reserve_cmr->end(),
-            ecx_root.bond_v2_insurance_reserve_cmr_wire);
-    }
+    const auto copy_optional_hash = [](const auto& value, auto& output) {
+        if (value) std::copy(value->begin(), value->end(), output);
+    };
+    copy_optional_hash(txdata->m_bond_v2_configuration_hash, ecx_root.bond_v2_configuration_hash_wire);
+    copy_optional_hash(txdata->m_bond_v2_asset_id, ecx_root.bond_v2_asset_id_wire);
+    copy_optional_hash(txdata->m_bond_v2_deployment_commitment, ecx_root.bond_v2_deployment_commitment_wire);
+    copy_optional_hash(txdata->m_bond_v2_transition_cmr, ecx_root.bond_v2_transition_cmr_wire);
+    copy_optional_hash(txdata->m_bond_v2_collateral_vault_script_sha256, ecx_root.bond_v2_collateral_vault_script_sha256_wire);
+    copy_optional_hash(txdata->m_bond_v2_collateral_vault_cmr, ecx_root.bond_v2_collateral_vault_cmr_wire);
+    copy_optional_hash(txdata->m_bond_v2_insurance_reserve_script_sha256, ecx_root.bond_v2_insurance_reserve_script_sha256_wire);
+    copy_optional_hash(txdata->m_bond_v2_insurance_reserve_cmr, ecx_root.bond_v2_insurance_reserve_cmr_wire);
     ecx_root.bond_v2_incremental_activation_identity_present =
         txdata->EcxBondV2IncrementalActivationIdentityPresence();
-    if (txdata->m_bond_v2_incremental_activation_cmr.has_value()) {
-        std::copy(
-            txdata->m_bond_v2_incremental_activation_cmr->begin(),
-            txdata->m_bond_v2_incremental_activation_cmr->end(),
-            ecx_root.bond_v2_incremental_activation_cmr_wire);
-    }
-    if (txdata->m_incremental_successor_transition_cmr.has_value()) {
-        std::copy(
-            txdata->m_incremental_successor_transition_cmr->begin(),
-            txdata->m_incremental_successor_transition_cmr->end(),
-            ecx_root.incremental_successor_transition_cmr_wire);
-    }
+    copy_optional_hash(txdata->m_bond_v2_incremental_activation_cmr, ecx_root.bond_v2_incremental_activation_cmr_wire);
+    copy_optional_hash(txdata->m_incremental_successor_transition_cmr, ecx_root.incremental_successor_transition_cmr_wire);
     ecx_root.bond_v2_projection_present =
         txdata->EcxBondV2ProjectionPresence();
-    if (txdata->m_prior_active_bond_inbox_root.has_value()) {
-        std::copy(
-            txdata->m_prior_active_bond_inbox_root->begin(),
-            txdata->m_prior_active_bond_inbox_root->end(),
-            ecx_root.prior_active_bond_inbox_root_wire);
-    }
+    copy_optional_hash(txdata->m_prior_active_bond_inbox_root, ecx_root.prior_active_bond_inbox_root_wire);
     if (txdata->m_prior_active_bond_inbox_count.has_value()) {
         ecx_root.prior_active_bond_inbox_count =
             *txdata->m_prior_active_bond_inbox_count;
@@ -3423,9 +3363,9 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
         ecx_root.current_sidechain_height =
             *txdata->m_current_sidechain_height;
     }
-    if (txdata->m_ecx_activation_execution_anchor_authenticated &&
-        txdata->EcxBondV2IncrementalActivationIdentityPresence() == 1 &&
-        nIn < txTo->witness.vtxinwit.size()) {
+    if (drivechain::haskell::ParentReplayAll<3>({[&] { return txdata->m_ecx_activation_execution_anchor_authenticated; },
+        [&] { return txdata->EcxBondV2IncrementalActivationIdentityPresence() == 1; },
+        [&] { return nIn < txTo->witness.vtxinwit.size(); }})) {
         budget = ecx::ActivationExecutionBudget(budget, nIn,
             txTo->witness.vtxinwit[nIn].scriptWitness.stack,
             txdata->m_bond_v2_incremental_activation_cmr ?
@@ -3633,13 +3573,15 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if ((flags & SCRIPT_VERIFY_SIMPLICITY) && (control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSIMPLICITY) {
                 if (stack.size() != 2 || script.size() != 32) return set_error(serror, SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH);
                 // Tapsimplicity (leaf version 0xbe)
-                bool has_usdd_sp1_verifier_credit{false};
-                if (tap_annex != nullptr && (flags & SCRIPT_VERIFY_USDD_SP1_ANNEX)) {
+                static_assert(ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE,
+                    "legacy verifier credit requires an explicit execution-budget policy");
+                if (drivechain::haskell::ParentReplayAll<2>({[&] { return tap_annex != nullptr; },
+                    [&] { return bool(flags & SCRIPT_VERIFY_USDD_SP1_ANNEX); }})) {
                     const PrecomputedTransactionData* txdata = checker.GetPrecomputedTransactionData();
                     switch (usdd::GateUsddSp1ProofAnnex(
                         *tap_annex, script,
-                        txdata != nullptr &&
-                            txdata->m_prior_active_bmm_parent_checkpoint.has_value())) {
+                        drivechain::haskell::ParentReplayAll<2>({[&] { return txdata != nullptr; },
+                            [&] { return txdata->m_prior_active_bmm_parent_checkpoint.has_value(); }}))) {
                     case usdd::Sp1ConsensusGateResult::NOT_USDD:
                         break;
                     case usdd::Sp1ConsensusGateResult::MALFORMED:
@@ -3669,19 +3611,12 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                     case usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE:
                         return set_error(serror, SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE);
                     case usdd::Sp1ConsensusGateResult::READY_FOR_JET:
-                        if constexpr (!ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
-                            has_usdd_sp1_verifier_credit = true;
-                        }
                         break;
                     }
                 }
                 const valtype& simplicity_program = SpanPopBack(stack);
                 const valtype& simplicity_witness = SpanPopBack(stack);
-                int64_t budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
-                if (has_usdd_sp1_verifier_credit &&
-                    !usdd::ComputeUsddSp1VerifierBudget(budget, budget)) {
-                    return set_error(serror, SCRIPT_ERR_USDD_SP1_BUDGET);
-                }
+                const int64_t budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
                 rawElementsTapEnv simplicityRawTap;
                 simplicityRawTap.controlBlock = control.data();
                 simplicityRawTap.pathLen = (control.size() - TAPROOT_CONTROL_BASE_SIZE) / TAPROOT_CONTROL_NODE_SIZE;

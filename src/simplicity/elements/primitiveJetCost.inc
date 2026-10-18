@@ -1,4 +1,4 @@
-/* This file has been automatically generated. */
+/* Generated from BmmConstants.jetCostHeader; do not edit. */
 #ifndef SIMPLICITY_ELEMENTS_PRIMITIVE_JET_COST_INC
 #define SIMPLICITY_ELEMENTS_PRIMITIVE_JET_COST_INC
 #define SIMPLICITY_VERIFY_SP1_COMPRESSED_SHA256_COST_MWU 900007720u

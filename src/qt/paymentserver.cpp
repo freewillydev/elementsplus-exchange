@@ -10,6 +10,7 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <haskell/bridge.h>
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
@@ -33,7 +34,12 @@
 #include <QUrlQuery>
 
 const int BITCOIN_IPC_CONNECT_TIMEOUT = 1000; // milliseconds
-const QString ELEMENTS_IPC_PREFIX("elements:");
+const QString& ElementsIpcPrefix()
+{
+    static const QString prefix = QString::fromStdString(std::string{
+        drivechain::haskell::PaymentUriScheme(true, true, false)}) + ':';
+    return prefix;
+}
 
 //
 // Create a name that is unique for:
@@ -74,7 +80,7 @@ void PaymentServer::ipcParseCommandLine(int argc, char* argv[])
         QString arg(argv[i]);
         if (arg.startsWith("-")) continue;
 
-        if (arg.startsWith(ELEMENTS_IPC_PREFIX, Qt::CaseInsensitive))
+        if (arg.startsWith(ElementsIpcPrefix(), Qt::CaseInsensitive))
         {
             savedPaymentRequests.insert(arg);
         }
@@ -187,12 +193,12 @@ void PaymentServer::handleURIOrFile(const QString& s)
         return;
     }
 
-    if (s.startsWith("elements://", Qt::CaseInsensitive))
+    if (s.startsWith(ElementsIpcPrefix() + "//", Qt::CaseInsensitive))
     {
         Q_EMIT message(tr("URI handling"), tr("'elements://' is not a valid URI. Use 'elements:' instead."),
             CClientUIInterface::MSG_ERROR);
     }
-    else if (s.startsWith(ELEMENTS_IPC_PREFIX, Qt::CaseInsensitive))
+    else if (s.startsWith(ElementsIpcPrefix(), Qt::CaseInsensitive))
     {
         QUrlQuery uri((QUrl(s)));
         // normal URI

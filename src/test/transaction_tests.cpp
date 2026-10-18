@@ -35,7 +35,9 @@
 #include <util/transaction_identifier.h>
 #include <validation.h>
 
+#include <array>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 
@@ -201,6 +203,53 @@ std::set<unsigned int> ExcludeIndividualFlags(unsigned int flags)
 }
 
 BOOST_FIXTURE_TEST_SUITE(transaction_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(taproot_native_shape_with_fork_policy)
+{
+    CCoinsView base;
+    CCoinsViewCache coins(&base);
+    const COutPoint outpoint{Txid::FromUint256(uint256S("01")),0};
+    coins.AddCoin(outpoint, Coin(CTxOut(Params().GetConsensus().pegged_asset,1,
+        CScript() << OP_1 << std::vector<unsigned char>(32,0x22)),1,false),false);
+    CMutableTransaction tx;
+    tx.vin.emplace_back(outpoint);
+    tx.witness.vtxinwit.resize(1);
+    for (size_t count : {1U,2U,3U,4U,5U})
+    for (unsigned leaf : {0xbeU,0xc4U,0xfeU,256U})
+    for (size_t script_size : {31U,32U,33U})
+    for (size_t item_size : {MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE,
+                             MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE+1}) {
+        auto& stack = tx.witness.vtxinwit[0].scriptWitness.stack;
+        stack.assign(count,std::vector<unsigned char>(item_size,0x11));
+        bool expected{true};
+        if (count >= 2) {
+            stack[count-2].assign(script_size,0x22);
+            stack.back() = leaf == 256 ? std::vector<unsigned char>{} :
+                std::vector<unsigned char>{static_cast<unsigned char>(leaf)};
+            expected = leaf != 256;
+            if (leaf == TAPROOT_LEAF_TAPSIMPLICITY) expected = count == 4 && script_size == 32;
+            if (leaf == TAPROOT_LEAF_TAPSCRIPT && count > 2)
+                expected = item_size <= MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE;
+        }
+        BOOST_CHECK_EQUAL(IsWitnessStandard(CTransaction(tx),coins),expected);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(frozen_resource_schedule)
+{
+    using namespace ElementsDrivechainIdentity;
+    const uint32_t actual[]{CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE, CONSENSUS_MAX_BLOCK_WEIGHT,
+        USDD_SP1_ANNEXES_PER_BLOCK, USDD_SP1_PROOF_TX_MAX_WEIGHT, USDD_SP1_ANNEX_MAX_BYTES,
+        USDD_SP1_PUBLIC_VALUES_MAX_BYTES, USDD_SP1_MEASURED_RAW_PROOF_BYTES,
+        USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES, USDD_SP1_MEASURED_ANNEX_BYTES,
+        USDD_SP1_MEASURED_ANNEX_WEIGHT, USDD_SP1_MAX_ANNEX_WEIGHT, USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT,
+        ::MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK};
+    const uint32_t expected[]{6000000,6000000,1,1500000,1310720,16384,1272546,1001,1273602,
+        1273607,1310725,189275,64};
+    BOOST_CHECK_EQUAL_COLLECTIONS(std::begin(actual),std::end(actual),std::begin(expected),std::end(expected));
+    BOOST_CHECK_EQUAL(MAX_BLOCK_SERIALIZED_SIZE,6000000U);
+    BOOST_CHECK_EQUAL(MAX_BLOCK_WEIGHT,6000000U);
+}
 
 BOOST_AUTO_TEST_CASE(tx_valid)
 {
@@ -1073,6 +1122,16 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
     CheckIsNotStandard(t, "dust");
 }
 
+BOOST_AUTO_TEST_CASE(usdd_sp1_lane_limit_boundaries)
+{
+    const std::size_t limit = usdd::SP1_ANNEXES_PER_BLOCK;
+    const std::array<std::size_t,5> counts{0,1,limit,limit+1,std::numeric_limits<std::size_t>::max()};
+    for (const auto current : counts) for (const auto additional : counts) {
+        const bool expected = current>limit || additional>limit || current+additional>limit;
+        BOOST_CHECK_EQUAL(usdd::ExceedsUsddSp1AnnexLane(current,additional),expected);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(usdd_sp1_annex_standardness_and_weight_policy)
 {
     LOCK(cs_main);
@@ -1239,6 +1298,22 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_standardness_and_weight_policy)
     BOOST_CHECK(!IsStandardTx(CTransaction(unrelated), MAX_OP_RETURN_RELAY, g_bare_multi, g_dust, reason));
     BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex");
     BOOST_CHECK(!IsWitnessStandard(CTransaction(unrelated), coins));
+
+    // Resource failures precede unrelated-annex classification in either order.
+    for (bool reverse : {false, true}) {
+        CMutableTransaction mixed{minimal};
+        mixed.vin.emplace_back(first_outpoint);
+        mixed.witness.vtxinwit.resize(2);
+        auto& bad_shape = mixed.witness.vtxinwit[reverse ? 1 : 0].scriptWitness.stack;
+        bad_shape = make_tapsimplicity_stack(make_annex(1));
+        bad_shape[3].resize(34);
+        mixed.witness.vtxinwit[reverse ? 0 : 1].scriptWitness.stack =
+            unrelated.witness.vtxinwit[0].scriptWitness.stack;
+        reason.clear();
+        BOOST_CHECK(!IsStandardTx(CTransaction(mixed), MAX_OP_RETURN_RELAY, g_bare_multi, g_dust, reason));
+        BOOST_CHECK_EQUAL(reason, "usdd-sp1-annex-shape");
+        BOOST_CHECK(!IsWitnessStandard(CTransaction(mixed), coins));
+    }
 
     CMutableTransaction multiple{minimal};
     const COutPoint second_outpoint{Txid::FromUint256(uint256S("02")), 0};

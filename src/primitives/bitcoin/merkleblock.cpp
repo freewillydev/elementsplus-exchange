@@ -8,6 +8,7 @@
 #include <hash.h>
 #include <consensus/consensus.h>
 #include <util/strencodings.h>
+#include <haskell/bridge.h>
 
 #include <algorithm>
 #include <limits>
@@ -106,7 +107,8 @@ uint256 CPartialMerkleTree::TraverseAndExtract(
         if (height==0 && fParentOfMatch) { // in case of height 0, we have a matched txid
             vMatch.push_back(hash);
             vnIndex.push_back(pos);
-            if (replacement_index && replacement_hash && pos == *replacement_index) {
+            if (drivechain::haskell::MerkleReplacement(1, replacement_index ? *replacement_index : 0,
+                    pos, (replacement_index ? 1U : 0U) | (replacement_hash ? 2U : 0U))) {
                 return *replacement_hash;
             }
         }
@@ -182,7 +184,7 @@ uint256 CPartialMerkleTree::ExtractMatchesWithReplacement(
         nHeight++;
     // traverse the partial tree
     unsigned int nBitsUsed = 0, nHashUsed = 0;
-    const bool replace = replacement_index != std::numeric_limits<unsigned int>::max();
+    const bool replace = drivechain::haskell::MerkleReplacement(0, replacement_index, 0, 0);
     uint256 hashMerkleRoot = TraverseAndExtract(
         nHeight,
         0,
@@ -201,7 +203,8 @@ uint256 CPartialMerkleTree::ExtractMatchesWithReplacement(
     // verify that all hashes were consumed
     if (nHashUsed != vHash.size())
         return uint256();
-    if (replace && std::find(vnIndex.begin(), vnIndex.end(), replacement_index) == vnIndex.end())
+    if (!drivechain::haskell::MerkleReplacement(2, replacement_index, 0,
+            replace && std::find(vnIndex.begin(), vnIndex.end(), replacement_index) != vnIndex.end()))
         return uint256();
     return hashMerkleRoot;
 }

@@ -6,6 +6,8 @@
 #define BITCOIN_QT_ISSUEASSETDIALOG_H
 
 #include <QDialog>
+#include <functional>
+#include <univalue.h>
 
 class ClientModel;
 class QLineEdit;
@@ -18,15 +20,15 @@ class IssueAssetDialog : public QDialog
     Q_OBJECT
 
 public:
+    using IssueRpc = std::function<UniValue(const UniValue&)>;
     explicit IssueAssetDialog(ClientModel* clientModel, QWidget* parent = nullptr);
-    ~IssueAssetDialog();
+    IssueAssetDialog(ClientModel* clientModel, QWidget* parent, IssueRpc rpc);
 
 private Q_SLOTS:
     void onIssueClicked();
-    void onCloseClicked();
 
 private:
-    ClientModel* m_client_model;
+    IssueRpc m_rpc;
     QLineEdit* m_asset_amount_edit;
     QLineEdit* m_token_amount_edit;
     QLineEdit* m_asset_name_edit; // optional metadata for UI

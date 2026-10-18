@@ -31,6 +31,10 @@ bool CheckBitcoinSignetBlockSolution(const Sidechain::Bitcoin::CBlock& block,
                                      const uint256& genesis_hash,
                                      std::string* error = nullptr);
 
+// Hash a replacement coinbase followed by the block's non-null remaining transactions.
+uint256 ComputeBitcoinModifiedMerkleRoot(const Sidechain::Bitcoin::CMutableTransaction& coinbase,
+    const Sidechain::Bitcoin::CBlock& block);
+
 /**
  * Generate the signet tx corresponding to the given block
  *

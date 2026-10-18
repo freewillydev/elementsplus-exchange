@@ -9,6 +9,7 @@
 #include <kernel/chainparams.h> // IWYU pragma: export
 
 #include <memory>
+#include <haskell/resource_constants.h>
 
 class ArgsManager;
 class CBaseChainParams;
@@ -28,7 +29,7 @@ bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
                                            std::string* error = nullptr);
 
 /** Post-genesis Alpha-only consensus upgrade; never part of the historical M1/genesis commitment. */
-inline constexpr int ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT{64};
+inline constexpr int ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT{ElementsDrivechainIdentity::ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT};
 bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params);
 /** child_height is the validated block-index height (active tip + 1 for admission).
  * Unknown/negative heights retain the historical Alpha depth; the exact Betanet

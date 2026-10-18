@@ -21,6 +21,11 @@
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
+#include <test/usdd_journal_reference.h>
+#include <test/usdd_resource_reference.h>
+#include <chrono>
+#include <thread>
+#include <tuple>
 #include <util/fs.h>
 #include <util/strencodings.h>
 
@@ -484,6 +489,91 @@ std::string JSONPrettyPrint(const UniValue& univalue)
 
 BOOST_FIXTURE_TEST_SUITE(script_tests, ScriptTest)
 
+BOOST_AUTO_TEST_CASE(ctv_execution_matrix)
+{
+    struct Checker : BaseSignatureChecker {
+        bool accept{false};
+        mutable unsigned calls{0};
+        bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override
+        {
+            ++calls;
+            BOOST_CHECK_EQUAL(hash.size(), 32U);
+            return accept;
+        }
+    };
+    for (unsigned mask = 0; mask < 16; ++mask) {
+        const unsigned flags = ((mask & 1) ? SCRIPT_VERIFY_CHECKTEMPLATEVERIFY : 0) |
+            ((mask & 2) ? SCRIPT_VERIFY_DISCOURAGE_CHECKTEMPLATEVERIFY : 0) |
+            ((mask & 4) ? SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS : 0) |
+            ((mask & 8) ? SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH : 0);
+        for (int size : {-1,0,1,31,32,33,520}) for (bool accept : {false,true}) {
+            std::vector<std::vector<unsigned char>> stack;
+            if (size >= 0) stack.emplace_back(size, 0x42);
+            const auto original = stack;
+            Checker checker;
+            checker.accept = accept;
+            ScriptError expected = SCRIPT_ERR_OK;
+            unsigned calls = 0;
+            if ((mask & 2) || (!(mask & 1) && (mask & 4))) expected = SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS;
+            else if (mask & 1) {
+                if (size == -1) expected = SCRIPT_ERR_INVALID_STACK_OPERATION;
+                else if (size == 32) {
+                    calls = 1;
+                    if (!accept) expected = SCRIPT_ERR_TEMPLATE_MISMATCH;
+                } else if (mask & 8) expected = SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS;
+            }
+            ScriptError error = SCRIPT_ERR_UNKNOWN_ERROR;
+            BOOST_CHECK_EQUAL(EvalScript(stack, CScript() << OP_CHECKTEMPLATEVERIFY, flags,
+                checker, SigVersion::BASE, &error), expected == SCRIPT_ERR_OK);
+            BOOST_CHECK_EQUAL(error, expected);
+            BOOST_CHECK_EQUAL(checker.calls, calls);
+            BOOST_CHECK(stack == original);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(ctv_hash_preimage_reference)
+{
+    for (unsigned inputs = 0; inputs <= 3; ++inputs) {
+      for (unsigned script_mask = 0; script_mask < (1U << inputs); ++script_mask) {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.nLockTime = 123;
+        tx.vin.resize(inputs);
+        tx.vout.resize(2);
+        for (unsigned i = 0; i < inputs; ++i) {
+            tx.vin[i].nSequence = 400 + i;
+            if (script_mask & (1U << i)) tx.vin[i].scriptSig = CScript() << int64_t(i + 1);
+        }
+        for (unsigned i = 0; i < 2; ++i) {
+            tx.vout[i].nValue.SetToAmount(1000 + i);
+            tx.vout[i].scriptPubKey = CScript() << OP_TRUE;
+        }
+        HashWriter scripts, sequences, outputs;
+        for (const auto& input : tx.vin) {
+            scripts << input.scriptSig;
+            sequences << input.nSequence;
+        }
+        for (const auto& output : tx.vout) outputs << output;
+        const auto script_hash = scripts.GetSHA256();
+        const auto sequence_hash = sequences.GetSHA256();
+        const auto output_hash = outputs.GetSHA256();
+        for (unsigned index = 0; index <= inputs; ++index) {
+            HashWriter preimage;
+            preimage << tx.version << tx.nLockTime;
+            if (script_mask) preimage << script_hash;
+            preimage << uint32_t{inputs} << sequence_hash << uint32_t{2} << output_hash << index;
+            const auto expected = preimage.GetSHA256();
+            MutableTransactionSignatureChecker checker(&tx, index, CConfidentialValue{0}, MissingDataBehavior::FAIL);
+            BOOST_CHECK(checker.CheckDefaultCheckTemplateVerifyHash(Span{expected}));
+            auto wrong = expected;
+            wrong.begin()[0] ^= 1;
+            BOOST_CHECK(!checker.CheckDefaultCheckTemplateVerifyHash(Span{wrong}));
+        }
+      }
+    }
+}
+
 namespace {
 
 void WriteUint32BE(std::vector<unsigned char>& bytes, std::size_t offset, uint32_t value)
@@ -575,6 +665,524 @@ std::vector<unsigned char> MakeUsddStrongExecutionAnnex(
 }
 
 } // namespace
+
+BOOST_AUTO_TEST_CASE(usdd_haskell_proof_gate_matches_native)
+{
+    using I = usdd::Sp1ProofIdentityResult;
+    using G = usdd::Sp1ConsensusGateResult;
+    for (I identity : {I::MATCH, I::WRONG_CONTROLLER_CMR, I::WRONG_GUEST_PROGRAM_ID,
+            I::MALFORMED_PUBLIC_VALUES, I::DEPLOYMENT_UNCONFIGURED, I::WRONG_INBOUND_MINT_DOMAIN}) {
+        for (bool bmm : {false, true}) for (bool active : {false, true}) {
+            G expected;
+            switch (identity) {
+            case I::WRONG_CONTROLLER_CMR: expected = G::WRONG_CONTROLLER_CMR; break;
+            case I::WRONG_GUEST_PROGRAM_ID: expected = G::WRONG_GUEST_PROGRAM_ID; break;
+            case I::MALFORMED_PUBLIC_VALUES: expected = G::MALFORMED_PUBLIC_VALUES; break;
+            case I::DEPLOYMENT_UNCONFIGURED: expected = G::DEPLOYMENT_UNCONFIGURED; break;
+            case I::WRONG_INBOUND_MINT_DOMAIN: expected = G::WRONG_INBOUND_MINT_DOMAIN; break;
+            case I::MATCH: expected = !bmm ? G::BMM_CONTEXT_MISSING :
+                active ? G::READY_FOR_JET : G::VERIFIER_UNAVAILABLE; break;
+            }
+            auto annex = MakeUsddSp1Annex();
+            annex[55 + 10] = ElementsDrivechainIdentity::USDD_SP1_ANNEX_DIGEST_MODE;
+            annex[55 + 19] = ElementsDrivechainIdentity::USDD_SP1_ANNEX_STATEMENT_KIND;
+            auto controller = ElementsDrivechainIdentity::HISTORICAL_V8_CONTROLLER_CMR;
+            std::array<unsigned char,32> domain;
+            domain.fill(0x42);
+            uint32_t version{1};
+            switch (identity) {
+            case I::WRONG_CONTROLLER_CMR: controller[0] ^= 1; break;
+            case I::WRONG_GUEST_PROGRAM_ID: annex[23] ^= 1; break;
+            case I::MALFORMED_PUBLIC_VALUES: annex[55] ^= 1; break;
+            case I::DEPLOYMENT_UNCONFIGURED: version = 0; break;
+            case I::WRONG_INBOUND_MINT_DOMAIN: domain[0] ^= 1; break;
+            case I::MATCH: break;
+            }
+            BOOST_CHECK(usdd::GateUsddSp1ProofAnnexForDeployment(annex, controller,
+                bmm, version, domain, active) == expected);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_namespace_bounded_probe)
+{
+    const std::vector<unsigned char> prefix{0x50, 'U', 'S', 'D', 'D'};
+    for (size_t size = 0; size <= prefix.size(); ++size) {
+        std::vector<unsigned char> probe(prefix.begin(), prefix.begin() + size);
+        BOOST_CHECK_EQUAL(usdd::IsUsddSp1ProofAnnex(probe), size == prefix.size());
+        for (size_t offset = 0; offset < size; ++offset) {
+            for (unsigned byte = 0; byte <= 255; ++byte) {
+                probe[offset] = byte;
+                BOOST_CHECK_EQUAL(usdd::IsUsddSp1ProofAnnex(probe),
+                    usdd_reference::NativeAnnexNamespace(probe));
+            }
+            probe[offset] = prefix[offset];
+        }
+    }
+    for (size_t size : {size_t{55}, usdd::SP1_ANNEX_MAX_SIZE + 1}) {
+        auto probe = prefix;
+        probe.resize(size, 0xff);
+        BOOST_CHECK(usdd::IsUsddSp1ProofAnnex(probe));
+        probe[0] = 0;
+        BOOST_CHECK(!usdd::IsUsddSp1ProofAnnex(probe));
+    }
+}
+
+static usdd::Sp1AnnexError NativeUsddAnnex(Span<const unsigned char> annex, usdd::Sp1ProofAnnexView& result)
+{
+    using namespace usdd;
+    result = {};
+    if (!usdd_reference::NativeAnnexNamespace(annex)) return Sp1AnnexError::NOT_USDD;
+    if (annex.size() > SP1_ANNEX_MAX_SIZE) return Sp1AnnexError::TOO_LARGE;
+    if (annex.size() < SP1_ANNEX_HEADER_SIZE) return Sp1AnnexError::TRUNCATED;
+    if (!std::equal(SP1_ANNEX_MAGIC.begin(), SP1_ANNEX_MAGIC.end(), annex.begin() + 1)) {
+        return Sp1AnnexError::BAD_MAGIC;
+    }
+    if (annex[9] != ElementsDrivechainIdentity::USDD_SP1_ANNEX_ENVELOPE_VERSION) {
+        return Sp1AnnexError::BAD_VERSION;
+    }
+    if (annex[10] != ElementsDrivechainIdentity::USDD_SP1_ANNEX_PROOF_SYSTEM) {
+        return Sp1AnnexError::BAD_PROOF_SYSTEM;
+    }
+    const auto statement_kind = static_cast<Sp1StatementKind>(annex[11]);
+    if (statement_kind != Sp1StatementKind::ETH_STATE_V1 &&
+        statement_kind != Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2) {
+        return Sp1AnnexError::BAD_STATEMENT_KIND;
+    }
+    if (annex[12] != ElementsDrivechainIdentity::USDD_SP1_ANNEX_DIGEST_MODE) {
+        return Sp1AnnexError::BAD_DIGEST_MODE;
+    }
+    if (annex[13] != 0 || annex[14] != 0) return Sp1AnnexError::BAD_FLAGS;
+
+    const uint32_t public_values_size = ReadUint32BE(annex, 15);
+    const uint32_t proof_size = ReadUint32BE(annex, 19);
+    if (public_values_size == 0) return Sp1AnnexError::EMPTY_PUBLIC_VALUES;
+    if (public_values_size > SP1_PUBLIC_VALUES_MAX_SIZE) return Sp1AnnexError::PUBLIC_VALUES_TOO_LARGE;
+    if (statement_kind == Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2 &&
+        public_values_size != 32) {
+        return Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES;
+    }
+    if (proof_size == 0) return Sp1AnnexError::EMPTY_PROOF;
+
+    const Span<const unsigned char> guest_program_id = annex.subspan(23, 32);
+    if (std::all_of(guest_program_id.begin(), guest_program_id.end(), [](unsigned char byte) { return byte == 0; })) {
+        return Sp1AnnexError::ZERO_GUEST_PROGRAM_ID;
+    }
+
+    const uint64_t expected_size = uint64_t{SP1_ANNEX_HEADER_SIZE} + public_values_size + proof_size;
+    if (expected_size != annex.size()) return Sp1AnnexError::LENGTH_MISMATCH;
+
+    result.statement_kind = statement_kind;
+    result.guest_program_id = guest_program_id;
+    result.public_values = annex.subspan(SP1_ANNEX_HEADER_SIZE, public_values_size);
+    result.proof = annex.subspan(SP1_ANNEX_HEADER_SIZE + public_values_size, proof_size);
+    if (statement_kind == Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2 &&
+        std::all_of(result.public_values.begin(), result.public_values.end(),
+                    [](const unsigned char byte) { return byte == 0; })) {
+        result = {};
+        return Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES;
+    }
+    return Sp1AnnexError::OK;
+}
+
+BOOST_AUTO_TEST_CASE(usdd_workflow_preserves_native_order)
+{
+    std::vector<std::vector<unsigned char>> inputs{{}, {80,85,83,68,68}, MakeUsddSp1Annex(), MakeUsddStrongExecutionAnnex()};
+    for (const auto& valid : {MakeUsddSp1Annex(), MakeUsddStrongExecutionAnnex()}) {
+        for (size_t offset : {0U, 9U, 11U, 13U, 22U}) {
+            auto changed = valid;
+            changed[offset] ^= 0xff;
+            inputs.push_back(std::move(changed));
+        }
+    }
+    for (const auto& bytes : inputs) for (uint32_t lane = 1; lane < 3; ++lane) {
+        usdd::Sp1ProofAnnexView parsed;
+        const auto parse = NativeUsddAnnex(bytes, parsed);
+        const bool invoke = parse == usdd::Sp1AnnexError::OK && lane != 2 &&
+            static_cast<unsigned>(parsed.statement_kind) == 3U;
+        for (int32_t identity = 0; identity <= 4; ++identity) {
+            for (bool bmm : {false,true}) for (bool active : {false,true}) {
+                const uint32_t expected = parse == usdd::Sp1AnnexError::NOT_USDD ? 0 :
+                    parse != usdd::Sp1AnnexError::OK ? 1 :
+                    static_cast<unsigned>(parsed.statement_kind) != 3U ? 5 :
+                    invoke && identity != 0 ? identity + 1 : !bmm ? 7 : !active ? 8 : 9;
+                unsigned calls{0};
+                const auto result = usdd::AdmitSp1Annex(lane, bytes, bmm, active, [&](const auto& view) {
+                    ++calls;
+                    BOOST_CHECK(view.guest_program_id.data() == parsed.guest_program_id.data());
+                    BOOST_CHECK_EQUAL(view.public_values.size(), parsed.public_values.size());
+                    return std::array<int32_t,5>{0,2,4,8,1}[identity];
+                });
+                BOOST_CHECK_EQUAL(static_cast<uint32_t>(result), expected);
+                BOOST_CHECK_EQUAL(calls, invoke ? 1U : 0U);
+            }
+        }
+        const auto throwing = [&](const auto&) -> int32_t { throw std::runtime_error("identity callback"); };
+        if (invoke) BOOST_CHECK_THROW(usdd::AdmitSp1Annex(lane, bytes, true, true, throwing), std::runtime_error);
+        else BOOST_CHECK_NO_THROW(usdd::AdmitSp1Annex(lane, bytes, true, true, throwing));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_identity_adapter_lengths)
+{
+    const auto& cmr = ElementsDrivechainIdentity::HISTORICAL_V8_CONTROLLER_CMR;
+    const auto& guest = ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID;
+    std::array<unsigned char,32> digest{};
+    digest[0] = 1;
+    for (size_t size : {0U,1U,31U,32U,33U,64U}) for (bool mutate : {false,true}) {
+        std::vector<unsigned char> controller(cmr.begin(), cmr.end()), program(guest.begin(), guest.end());
+        controller.resize(size); program.resize(size);
+        if (mutate && size) { controller[0] ^= 1; program[0] ^= 1; }
+        const bool match = size == 32 && !mutate;
+        BOOST_CHECK_EQUAL(usdd::SameSp1Identity(controller, cmr), match);
+        BOOST_CHECK_EQUAL(usdd::SameSp1Identity(program, guest), match);
+        BOOST_CHECK_EQUAL(static_cast<unsigned>(usdd::CheckUsddSp1ProofIdentityForDeployment(controller, guest, {}, 1, {})), match ? 3 : 1);
+        BOOST_CHECK_EQUAL(static_cast<unsigned>(usdd::CheckUsddSp1ProofIdentityForDeployment(cmr, program, {}, 1, {})), match ? 3 : 2);
+        BOOST_CHECK_EQUAL(usdd::StrongExecutionIdentityFacts(controller, guest, digest, cmr, guest), match ? 0 : 2);
+        BOOST_CHECK_EQUAL(usdd::StrongExecutionIdentityFacts(cmr, program, digest, cmr, guest), match ? 0 : 4);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_raw_journal_matches_native)
+{
+    const auto annex = MakeUsddSp1Annex();
+    usdd::Sp1ProofAnnexView view;
+    BOOST_REQUIRE(NativeUsddAnnex(annex, view) == usdd::Sp1AnnexError::OK);
+    const auto& controller = ElementsDrivechainIdentity::HISTORICAL_V8_CONTROLLER_CMR;
+    std::vector<unsigned char> original(view.public_values.begin(), view.public_values.end());
+    original[10] = ElementsDrivechainIdentity::USDD_SP1_ANNEX_DIGEST_MODE;
+    original[19] = ElementsDrivechainIdentity::USDD_SP1_ANNEX_STATEMENT_KIND;
+    std::array<unsigned char,32> original_domain;
+    BOOST_REQUIRE(usdd_reference::NativeJournal(original, view.guest_program_id, original_domain) ==
+        usdd_reference::Sp1JournalIdentityError::OK);
+    const auto seal = [](auto& journal) {
+        WriteUint32BE(journal, 84, journal.size() - 88);
+        CSHA256().Write(journal.data() + 88, journal.size() - 88).Finalize(journal.data() + 52);
+    };
+    std::vector<std::vector<unsigned char>> journals{original};
+    for (size_t n = 0; n <= 124; ++n) journals.emplace_back(original.begin(), original.begin() + n);
+    for (size_t offset : {0U,8U,9U,10U,11U,19U,20U,51U,52U,83U,84U,87U,88U,89U,90U,91U,92U,123U}) {
+        auto changed = original;
+        changed[offset] ^= 1;
+        journals.push_back(changed);
+        if (offset >= 88) {
+            seal(changed);
+            journals.push_back(std::move(changed));
+        }
+    }
+    for (size_t size : {789U,790U,791U,891U,892U,13115U,13116U}) for (unsigned char tag : {1,4}) {
+        auto changed = original;
+        changed.resize(88 + size);
+        changed[91] = tag;
+        seal(changed);
+        journals.push_back(std::move(changed));
+    }
+    for (const auto& journal : journals) for (uint32_t version : {0U,1U,2U,3U}) {
+        std::array<unsigned char,32> parsed;
+        const auto error = usdd_reference::NativeJournal(journal, view.guest_program_id, parsed);
+        for (size_t width : {0U,31U,32U,33U}) for (bool zero : {false,true}) {
+            std::vector<unsigned char> domain(parsed.begin(), parsed.end());
+            domain.resize(width);
+            if (zero) std::fill(domain.begin(), domain.end(), 0);
+            const bool domain_zero = std::all_of(domain.begin(), domain.end(), [](auto b) { return b == 0; });
+            const bool parsed_zero = std::all_of(parsed.begin(), parsed.end(), [](auto b) { return b == 0; });
+            const unsigned expected = error != usdd_reference::Sp1JournalIdentityError::OK ? 3 : width != 32 ? 4 :
+                version == 1 ? (domain_zero ? 4 : std::equal(domain.begin(), domain.end(), parsed.begin()) ? 0 : 5) :
+                version == 2 ? (!domain_zero ? 4 : parsed_zero ? 5 : 0) : 4;
+            BOOST_CHECK_EQUAL(static_cast<unsigned>(usdd::CheckUsddSp1ProofIdentityForDeployment(
+                controller, view.guest_program_id, journal, version, domain)), expected);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_resource_ordinary_witness_scan)
+{
+    CMutableTransaction tx;
+    tx.vin.resize(2000);
+    tx.witness.vtxinwit.resize(2000);
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        auto& stack = tx.witness.vtxinwit[i].scriptWitness.stack;
+        stack.resize(i % 6);
+        if (!stack.empty()) stack.back() = {80,85,83,68,static_cast<unsigned char>(i % 2 ? 0 : 69)};
+    }
+    const CTransaction immutable(tx);
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) {
+        const auto usage = usdd::GetUsddSp1AnnexResourceUsage(immutable);
+        BOOST_REQUIRE_EQUAL(usage.namespace_annexes, 0U);
+        BOOST_REQUIRE(!usage.oversized && !usage.malformed && !usage.wrong_spend_shape &&
+            !usage.wrong_controller_cmr && !usage.wrong_guest_program_id &&
+            !usage.malformed_public_values && !usage.deployment_unconfigured && !usage.wrong_inbound_mint_domain);
+    }
+    BOOST_TEST_MESSAGE("200000 ordinary witness scans: " <<
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count() << " us");
+}
+
+BOOST_AUTO_TEST_CASE(usdd_resource_flag_mapping)
+{
+    for (uint32_t mask = 0; mask < 256; ++mask) {
+        usdd::Sp1AnnexResourceUsage usage{
+            0, bool(mask & 1), bool(mask & 2), bool(mask & 4), bool(mask & 8),
+            bool(mask & 16), bool(mask & 32), bool(mask & 64), bool(mask & 128)};
+        BOOST_CHECK_EQUAL(usage.Flags(), mask << 1);
+        usage.namespace_annexes = std::numeric_limits<size_t>::max();
+        BOOST_CHECK_EQUAL(usage.Flags(), mask << 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_resource_matches_native)
+{
+    const auto fields = [](const usdd::Sp1AnnexResourceUsage& u) {
+        return std::array<size_t,9>{u.namespace_annexes,u.oversized,u.malformed,u.wrong_spend_shape,
+            u.wrong_controller_cmr,u.wrong_guest_program_id,u.malformed_public_values,
+            u.deployment_unconfigured,u.wrong_inbound_mint_domain};
+    };
+    std::vector<std::vector<unsigned char>> annexes{{}, {80,85,83,68,68}, MakeUsddSp1Annex(), MakeUsddStrongExecutionAnnex()};
+    auto oversized = MakeUsddSp1Annex();
+    oversized.resize(usdd::SP1_ANNEX_MAX_SIZE + 1);
+    annexes.push_back(std::move(oversized));
+    auto bad_public = MakeUsddSp1Annex();
+    WriteUint32BE(bad_public,15,16385);
+    annexes.push_back(std::move(bad_public));
+    for (size_t count : {0U,1U,2U,4U,5U,6U}) for (size_t cmr : {0U,31U,32U,33U})
+    for (size_t control : {0U,32U,33U,34U,65U,4129U,4130U}) for (unsigned char leaf : {0,190,191})
+    for (const auto& annex : annexes) {
+        CMutableTransaction tx;
+        tx.vin.resize(2);
+        tx.witness.vtxinwit.resize(2);
+        for (auto& witness : tx.witness.vtxinwit) {
+            auto& stack = witness.scriptWitness.stack;
+            stack.resize(count);
+            if (count > 2) stack[2].resize(cmr,1);
+            if (count > 3) stack[3].resize(control,leaf);
+            if (count) stack.back() = annex;
+        }
+        const CTransaction immutable(tx);
+        BOOST_CHECK(fields(usdd::GetUsddSp1AnnexResourceUsage(immutable)) ==
+            fields(usdd_reference::NativeResourceUsage(immutable)));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_resource_selection_preserves_ordinary_rows)
+{
+    CMutableTransaction mutable_tx;
+    mutable_tx.vin.resize(3);
+    mutable_tx.witness.vtxinwit.resize(3);
+    mutable_tx.witness.vtxinwit[1].scriptWitness.stack = {{80,85,83,68,68}};
+    mutable_tx.witness.vtxinwit[2].scriptWitness.stack = {{1}, {80,85,83,68,69}};
+    const CTransaction tx(mutable_tx);
+    usdd::ResourceReader reader;
+    const auto source = reader.Source();
+    BOOST_CHECK_EQUAL(reader.Select(tx), 3U);
+    for (size_t index = 0; index < 3; ++index) {
+        const auto row = source.read(index);
+        BOOST_CHECK_EQUAL(row.items, index);
+    }
+    const auto usage = usdd::GetUsddSp1AnnexResourceUsage(tx);
+    BOOST_CHECK_EQUAL(usage.namespace_annexes, 0U);
+    BOOST_CHECK_EQUAL(usage.Flags(), 0U);
+    BOOST_CHECK_EQUAL(usdd_reference::NativeResourceUsage(tx).namespace_annexes, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(usdd_resource_scan_mixed_and_faults)
+{
+    using namespace ElementsDrivechainIdentity;
+    namespace hs = drivechain::haskell;
+    const std::array<std::span<const unsigned char>,7> fields{{
+        {},HISTORICAL_V8_CONTROLLER_CMR,{},USDD_SP1_GUEST_PROGRAM_ID,{},USDD_SP1_INBOUND_MINT_DOMAIN_ID,{}}};
+    auto malformed = MakeUsddSp1Annex();
+    malformed.resize(20);
+    const std::array<std::vector<unsigned char>,5> annexes{{{}, {80,85,83,68,69},
+        std::move(malformed),MakeUsddSp1Annex(),MakeUsddStrongExecutionAnnex()}};
+    const auto caller = std::this_thread::get_id();
+    for (bool parameterized : {false,true}) for (uint32_t version : {1U,2U,3U,USDD_SP1_DEPLOYMENT_BINDING_VERSION}) {
+        const std::array<uint32_t,5> profile{version,USDD_SP1_ANNEX_DIGEST_MODE,USDD_SP1_ANNEX_STATEMENT_KIND,
+            USDD_SP1_ANNEX_ENVELOPE_VERSION,USDD_SP1_ANNEX_PROOF_SYSTEM};
+        CMutableTransaction tx;
+        tx.vin.resize(annexes.size());
+        tx.witness.vtxinwit.resize(annexes.size());
+        std::array<hs::UsddWitness,5> rows;
+        uint32_t flags{0};
+        uint64_t count{0};
+        for (size_t i=0; i<rows.size(); ++i) {
+            auto& stack = tx.witness.vtxinwit[i].scriptWitness.stack;
+            stack = {{}, {}, std::vector<unsigned char>(HISTORICAL_V8_CONTROLLER_CMR.begin(),HISTORICAL_V8_CONTROLLER_CMR.end()),
+                std::vector<unsigned char>(33,190),annexes[i]};
+            rows[i] = {stack.back(),stack[2],stack[3],stack.size()};
+            auto single = fields;
+            single[0]=rows[i].cmr;
+            single[6]=rows[i].annex;
+            const auto result = hs::UsddLegacy(2,single,profile,usdd::SP1_ANNEX_MAX_SIZE,false,false,
+                {5,33,190,parameterized});
+            flags |= result;
+            count += result & 1;
+        }
+        std::vector<uint64_t> trace;
+        for (size_t fault=0; fault<=rows.size(); ++fault) {
+            trace.clear();
+            const auto run = [&] {
+                return hs::UsddResources(rows.size(),fields,profile,usdd::SP1_ANNEX_MAX_SIZE,parameterized,
+                    [&](uint64_t index) {
+                        BOOST_CHECK(std::this_thread::get_id()==caller);
+                        trace.push_back(index);
+                        if (fault && trace.size()==fault) throw std::runtime_error("resource read failure");
+                        return rows.at(index);
+                    });
+            };
+            if (fault) BOOST_CHECK_EXCEPTION(run(),std::runtime_error,[](const auto& error) {
+                return std::string{error.what()}=="resource read failure";
+            });
+            else {
+                const auto result = run();
+                BOOST_CHECK_EQUAL(result.first,flags);
+                BOOST_CHECK_EQUAL(result.second,count);
+            }
+            BOOST_REQUIRE_EQUAL(trace.size(),fault ? fault : rows.size());
+            for (size_t i=0; i<trace.size(); ++i) BOOST_CHECK_EQUAL(trace[i],i);
+        }
+        const CTransaction immutable(tx);
+        const auto actual = usdd::GetUsddSp1AnnexResourceUsage(immutable);
+        const auto expected = usdd_reference::NativeResourceUsage(immutable);
+        BOOST_CHECK_EQUAL(actual.Flags(),expected.Flags());
+        BOOST_CHECK_EQUAL(actual.namespace_annexes,expected.namespace_annexes);
+        const auto empty = hs::UsddResources(0,fields,profile,usdd::SP1_ANNEX_MAX_SIZE,parameterized,
+            [](uint64_t) -> hs::UsddWitness { throw std::runtime_error("unexpected empty read"); });
+        BOOST_CHECK_EQUAL(empty.first,0);
+        BOOST_CHECK_EQUAL(empty.second,0);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_policy_resource_composition)
+{
+    namespace hs = drivechain::haskell;
+    const std::array<std::vector<unsigned char>,4> annexes{{{}, {80,66}, {80,85,83,68,68},MakeUsddStrongExecutionAnnex()}};
+    const auto caller = std::this_thread::get_id();
+    for (bool enabled : {false,true}) for (unsigned pattern=0; pattern<16; ++pattern) {
+        CMutableTransaction mutable_tx;
+        mutable_tx.vin.resize(2);
+        mutable_tx.witness.vtxinwit.resize(2);
+        for (size_t i=0; i<2; ++i) {
+            mutable_tx.witness.vtxinwit[i].scriptWitness.stack = {{1},{1},std::vector<unsigned char>(32,1),
+                std::vector<unsigned char>(33,190),annexes[(pattern>>(2*i))&3]};
+        }
+        const CTransaction tx(mutable_tx);
+        const auto run = [&](bool composed,size_t fault) {
+            std::vector<std::pair<uint32_t,uint64_t>> trace;
+            uint64_t published{0};
+            usdd::ResourceReader reader;
+            auto source = reader.Source();
+            const auto witness = source.read;
+            const auto touch = [&](uint32_t step,uint64_t index) {
+                BOOST_CHECK(std::this_thread::get_id()==caller);
+                trace.emplace_back(step,index);
+                if (fault && trace.size()==fault) throw std::runtime_error("policy resource fault");
+            };
+            source.read = [&](uint64_t index) { touch(6,index); return witness(index); };
+            const auto action = [&](uint32_t step,uint64_t index) -> uint64_t {
+                touch(step,index);
+                if (step==7) return reader.Select(tx);
+                const auto& stack = tx.witness.vtxinwit.at(index).scriptWitness.stack;
+                switch (step) {
+                case 0: return !stack.back().empty() && stack.back()[0]==80;
+                case 17: return 0;
+                case 2: return enabled;
+                case 3: return usdd::IsUsddSp1ProofAnnex(stack.back());
+                case 4: published=17+index; return 1;
+                default: BOOST_FAIL("unexpected policy resource read"); return 0;
+                }
+            };
+            int result;
+            try {
+                uint32_t flags{0};
+                if (!composed) {
+                    flags = hs::UsddResources(action(7,0),source.fields,source.profile,
+                        source.limit,source.parameterized,source.read).first;
+                }
+                result=hs::UsddPolicyWeight(flags,2,action,true,composed ? &source : nullptr);
+            } catch (const std::runtime_error& error) {
+                BOOST_REQUIRE_EQUAL(error.what(),"policy resource fault");
+                result=-1;
+            }
+            return std::make_tuple(result,trace,published);
+        };
+        const auto baseline=run(false,0);
+        if (pattern==0 || pattern==5) {
+            BOOST_CHECK_EQUAL(std::get<0>(baseline),pattern==0 ? 0 : 1);
+            BOOST_CHECK_EQUAL(std::get<2>(baseline),0);
+        }
+        if (ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE && enabled && (pattern==7 || pattern==15)) {
+            BOOST_CHECK_EQUAL(std::get<0>(baseline),pattern==7 ? 1 : 8);
+            BOOST_CHECK_EQUAL(std::get<2>(baseline),17);
+        }
+        for (size_t fault=0; fault<=std::get<1>(baseline).size(); ++fault) {
+            BOOST_CHECK(run(true,fault)==run(false,fault));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_strong_facts_precedence)
+{
+    const auto annex = MakeUsddStrongExecutionAnnex();
+    for (int facts = 0; facts < 16; ++facts) for (bool bmm : {false,true}) for (bool active : {false,true}) {
+        const unsigned expected = facts & 1 ? 5 : facts & 2 ? 2 : facts & 4 ? 3 : facts & 8 ? 4 :
+            !bmm ? 7 : !active ? 8 : 9;
+        const auto result = usdd::AdmitSp1Annex(1, annex, bmm, active, [&](const auto&) { return facts; });
+        BOOST_CHECK_EQUAL(static_cast<unsigned>(result), expected);
+    }
+    for (int facts : {-1,16,INT_MAX}) {
+        BOOST_CHECK_THROW(usdd::AdmitSp1Annex(1, annex, true, true,
+            [&](const auto&) { return facts; }), std::runtime_error);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_retired_facts_rejected)
+{
+    unsigned calls{0};
+    for (uint32_t lane : {0U,3U,UINT32_MAX}) for (const auto& annex :
+        std::vector<std::vector<unsigned char>>{{}, {80,85,83,68,68}, MakeUsddSp1Annex()}) {
+        BOOST_CHECK_THROW(usdd::AdmitSp1Annex(lane, annex, true, true,
+            [&](const auto&) { ++calls; return 0; }), std::runtime_error);
+    }
+    BOOST_CHECK_EQUAL(calls, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(usdd_haskell_annex_matches_native)
+{
+    const auto check = [](const std::vector<unsigned char>& bytes) {
+        usdd::Sp1ProofAnnexView expected, actual;
+        expected.statement_kind = actual.statement_kind = usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2;
+        expected.proof = actual.proof = bytes;
+        BOOST_CHECK(NativeUsddAnnex(bytes, expected) == usdd::ParseUsddSp1ProofAnnex(bytes, actual));
+        BOOST_CHECK(expected.statement_kind == actual.statement_kind);
+        BOOST_CHECK(expected.guest_program_id.data() == actual.guest_program_id.data());
+        BOOST_CHECK_EQUAL(expected.guest_program_id.size(), actual.guest_program_id.size());
+        BOOST_CHECK(expected.public_values.data() == actual.public_values.data());
+        BOOST_CHECK_EQUAL(expected.public_values.size(), actual.public_values.size());
+        BOOST_CHECK(expected.proof.data() == actual.proof.data());
+        BOOST_CHECK_EQUAL(expected.proof.size(), actual.proof.size());
+    };
+    for (const auto& valid : {MakeUsddSp1Annex(), MakeUsddStrongExecutionAnnex()}) {
+        check(valid);
+        for (size_t size = 0; size < valid.size(); ++size) check({valid.begin(), valid.begin() + size});
+        for (size_t i = 0; i < 87; ++i) for (unsigned char value : {0, 1, 3, 255}) {
+            auto bytes = valid;
+            bytes[i] = value;
+            check(bytes);
+            bytes[(i + 17) % 87] ^= 0xff;
+            check(bytes);
+        }
+        auto bytes = valid;
+        std::fill(bytes.begin() + 23, bytes.begin() + 55, 0);
+        check(bytes);
+        bytes = valid;
+        std::fill(bytes.begin() + 55, bytes.begin() + 87, 0);
+        check(bytes);
+        bytes.resize(usdd::SP1_ANNEX_MAX_SIZE + 1);
+        check(bytes);
+        bytes[0] = 0;
+        check(bytes);
+    }
+}
 
 BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
 {
@@ -758,26 +1366,26 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
 
     int64_t credited_budget{-1};
     BOOST_CHECK_EQUAL(
-        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU,
+        usdd_reference::SP1_VERIFIER_BASE_BUDGET_MAX_WU,
         ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT);
     BOOST_CHECK_EQUAL(
-        usdd::SP1_CONTROLLER_PROGRAM_COST_MWU,
+        usdd_reference::SP1_CONTROLLER_PROGRAM_COST_MWU,
         3'532'580'406ULL);
     BOOST_CHECK_EQUAL(
-        usdd::SP1_CONTROLLER_PROGRAM_BUDGET_WU,
+        usdd_reference::SP1_CONTROLLER_PROGRAM_BUDGET_WU,
         3'532'581);
     BOOST_CHECK(
-        usdd::SP1_CONTROLLER_PROGRAM_BUDGET_WU <= BUDGET_MAX);
-    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(0, credited_budget));
+        usdd_reference::SP1_CONTROLLER_PROGRAM_BUDGET_WU <= BUDGET_MAX);
+    BOOST_CHECK(usdd_reference::ComputeUsddSp1VerifierBudget(0, credited_budget));
     BOOST_CHECK_EQUAL(credited_budget, 0);
-    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(
-        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU, credited_budget));
+    BOOST_CHECK(usdd_reference::ComputeUsddSp1VerifierBudget(
+        usdd_reference::SP1_VERIFIER_BASE_BUDGET_MAX_WU, credited_budget));
     BOOST_CHECK_EQUAL(
         credited_budget,
-        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU);
-    BOOST_CHECK(!usdd::ComputeUsddSp1VerifierBudget(
-        usdd::SP1_VERIFIER_BASE_BUDGET_MAX_WU + 1, credited_budget));
-    BOOST_CHECK(!usdd::ComputeUsddSp1VerifierBudget(-1, credited_budget));
+        usdd_reference::SP1_VERIFIER_BASE_BUDGET_MAX_WU);
+    BOOST_CHECK(!usdd_reference::ComputeUsddSp1VerifierBudget(
+        usdd_reference::SP1_VERIFIER_BASE_BUDGET_MAX_WU + 1, credited_budget));
+    BOOST_CHECK(!usdd_reference::ComputeUsddSp1VerifierBudget(-1, credited_budget));
 
     // V11 grants no annex- or mutable-manifest-triggered credit. The measured
     // stack retains its ordinary witness-derived budget; the configuration-
@@ -797,14 +1405,14 @@ BOOST_AUTO_TEST_CASE(usdd_sp1_annex_parser)
     BOOST_CHECK(
         measured_base_budget >
         static_cast<int64_t>(
-            (usdd::SP1_VERIFIER_JET_COST_MWU + 999U) / 1000U));
-    BOOST_CHECK(usdd::ComputeUsddSp1VerifierBudget(
+            (usdd_reference::SP1_VERIFIER_JET_COST_MWU + 999U) / 1000U));
+    BOOST_CHECK(usdd_reference::ComputeUsddSp1VerifierBudget(
         measured_base_budget, credited_budget));
     BOOST_CHECK_EQUAL(credited_budget, measured_base_budget);
     BOOST_CHECK(credited_budget <= BUDGET_MAX);
     BOOST_CHECK(
         static_cast<uint64_t>(credited_budget) * 1000U <
-        usdd::SP1_CONTROLLER_PROGRAM_COST_MWU);
+        usdd_reference::SP1_CONTROLLER_PROGRAM_COST_MWU);
 
     std::array<unsigned char, 32> wrong_program_id{};
     wrong_program_id.fill(0xa5);

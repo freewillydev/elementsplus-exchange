@@ -15,6 +15,7 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <haskell/bridge.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
@@ -56,9 +57,8 @@
 #include <script/generic.hpp> // combineblocksigs
 #include <blockencodings.h> // getcompactsketch
 #include <policy/settings.h> // IsStandardTx
-#include <primitives/bitcoin/merkleblock.h>
-#include <primitives/bitcoin/transaction.h>
 
+#include <array>
 #include <memory>
 #include <stdint.h>
 
@@ -155,13 +155,20 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
 {
     block_out.reset();
     block.hashMerkleRoot = BlockMerkleRoot(block);
+    if (chainman.GetConsensus().utreexo) {
+        LOCK(cs_main);
+        utreexo::Prepare(block, chainman.ActiveChain().Tip(), chainman.ActiveChainstate().CoinsTip(),
+            chainman.GetParams(), *chainman.m_blockman.m_block_tree_db);
+    }
 
     // CreateNewBlock deliberately leaves BMM proof fields incomplete so the
     // L1-sync producer can submit the critical hash, wait for its authentic
     // parent successor and attach the proof. Direct RPC mining cannot perform
     // that protocol. This helper changes the coinbase commitment and
     // cannot safely accept a pre-attached proof.
-    if (Params().GetConsensus().elements_mode && block.HasBmmProof()) {
+    if (drivechain::haskell::ParentReplayEach(std::array{0,1}, [&](int step) {
+        return step == 0 ? Params().GetConsensus().elements_mode : block.HasBmmProof();
+    })) {
         throw JSONRPCError(
             RPC_MISC_ERROR,
             "Direct RPC block generation is unavailable after deterministic "
@@ -171,24 +178,13 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
 
     // Signed blocks have no PoW requirements, but merkle root computed above
     if (!g_signed_blocks) {
-        while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() && !CheckProofOfWork(block.GetHash(), block.nBits, chainman.GetConsensus()) && !chainman.m_interrupt) {
-            ++block.nNonce;
-            --max_tries;
-        }
-        if (max_tries == 0 || chainman.m_interrupt) {
-            return false;
-        }
+        if (!node::SearchBlockNonce(block, max_tries, chainman.GetConsensus(), chainman.m_interrupt)) return false;
         if (block.nNonce == std::numeric_limits<uint32_t>::max()) {
             return true;
         }
     }
 
-    // Handle OP_TRUE m_signblockscript case
-    CScript op_true(OP_TRUE);
-    if (block.m_dynafed_params.m_current.m_signblockscript ==
-            GetScriptForDestination(WitnessV0ScriptHash(op_true))) {
-        block.m_signblock_witness.stack.emplace_back(op_true.begin(), op_true.end());
-    } else if (!block.m_dynafed_params.IsNull()) {
+    if (!node::AppendOpTrueBlockWitness(block) && !block.m_dynafed_params.IsNull()) {
         throw JSONRPCError(RPC_MISC_ERROR, "Unable to fill out dynamic federation signblockscript witness, are you sure it's WSH(OP_TRUE)?");
     }
 
@@ -434,44 +430,30 @@ static RPCHelpMan generateblock()
         // generateblock appends raw transactions afterwards, so recompute the
         // additive ECX commitment before validation while retaining the exact
         // authenticated parent height selected by the block assembler.
-        CBlockIndex* previous =
-            chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
-        if (!previous) {
-            throw JSONRPCError(
-                RPC_INTERNAL_ERROR,
-                "generated block's previous index is unavailable");
-        }
-        if (Params().GetConsensus().elements_mode) {
-            const std::optional<uint64_t> authenticated_parent_height =
-                block.ecxParentHeight == 0
-                    ? std::nullopt
-                    : std::optional<uint64_t>{block.ecxParentHeight};
-            std::string exchange_error;
-            if (!ecx::PrepareExchangeStateHeader(
-                    block,
-                    previous,
-                    chainman.ActiveChainstate().CoinsTip(),
-                    previous->nHeight + 1,
-                    exchange_error,
-                    ecx::LayerTwoLabsExchangeConsensus(),
-                    authenticated_parent_height)) {
-                throw JSONRPCError(
-                    RPC_VERIFY_ERROR,
-                    strprintf("ECX header preparation failed: %s", exchange_error));
-            }
-        }
-
+        CBlockIndex* previous = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        std::string exchange_error;
         BlockValidationState state;
-        if (!TestBlockValidity(
-                state,
-                chainman.GetParams(),
-                chainman.ActiveChainstate(),
-                block,
-                previous,
-                false,
-                false,
-                true)) {
-            throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("TestBlockValidity failed: %s", state.ToString()));
+        const auto status = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::RPC_BLOCK_PREPARATION,
+            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+            switch (step) {
+            case 1: return previous != nullptr;
+            case 2: return Params().GetConsensus().elements_mode;
+            case 3:
+                return ecx::PrepareExchangeStateHeader(block, previous, chainman.ActiveChainstate().CoinsTip(),
+                    previous->nHeight + 1, exchange_error, ecx::LayerTwoLabsExchangeConsensus(),
+                    block.ecxParentHeight == 0 ? std::nullopt : std::optional<uint64_t>{block.ecxParentHeight});
+            case 4:
+                return TestBlockValidity(state, chainman.GetParams(), chainman.ActiveChainstate(),
+                    block, previous, /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false, /*allow_incomplete_candidate=*/true);
+            default: throw std::logic_error("invalid generated-block preparation action");
+            }
+        });
+        switch (status) {
+        case 0: break;
+        case 1: throw JSONRPCError(RPC_INTERNAL_ERROR, "generated block's previous index is unavailable");
+        case 2: throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("ECX header preparation failed: %s", exchange_error));
+        case 3: throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("TestBlockValidity failed: %s", state.ToString()));
         }
     }
 
@@ -955,8 +937,8 @@ static RPCHelpMan getblocktemplate()
     UniValue transactions(UniValue::VARR);
     std::map<uint256, int64_t> setTxIndex;
     uint64_t total_simplicity_milliweight{0};
-    CAmount producer_fee_revenue{0};
     std::vector<CAmount> tx_fees{block_template->getTxFees()};
+    const CAmount producer_fee_revenue{-tx_fees.at(0)};
     std::vector<CAmount> tx_sigops{block_template->getTxSigops()};
 
     int i = 0;
@@ -985,7 +967,6 @@ static RPCHelpMan getblocktemplate()
         int index_in_template = i - 1;
         entry.pushKV("fee", tx_fees.at(index_in_template));
         int64_t nTxSigOps{tx_sigops.at(index_in_template)};
-        producer_fee_revenue += tx_fees.at(index_in_template);
         if (fPreSegWit) {
             CHECK_NONFATAL(nTxSigOps % WITNESS_SCALE_FACTOR == 0);
             nTxSigOps /= WITNESS_SCALE_FACTOR;
@@ -994,12 +975,8 @@ static RPCHelpMan getblocktemplate()
         entry.pushKV("weight", GetTransactionWeight(tx));
         const uint64_t simplicity_milliweight{GetSimplicityValidationMilliweight(tx)};
         entry.pushKV("simplicityworkmilliweight", simplicity_milliweight);
-        if (total_simplicity_milliweight <=
-            std::numeric_limits<uint64_t>::max() - simplicity_milliweight) {
-            total_simplicity_milliweight += simplicity_milliweight;
-        } else {
-            total_simplicity_milliweight = std::numeric_limits<uint64_t>::max();
-        }
+        drivechain::haskell::BmmWorkTotal(true,1,
+            [&](uint64_t) { return simplicity_milliweight; },total_simplicity_milliweight);
 
         transactions.push_back(std::move(entry));
     }
@@ -1017,19 +994,19 @@ static RPCHelpMan getblocktemplate()
     result.pushKV("capabilities", std::move(aCaps));
     result.pushKV("producerfeerevenuesats", producer_fee_revenue);
     result.pushKV("simplicityworkmilliweight", total_simplicity_milliweight);
-    BmmWorkFeeQuote work_quote;
-    const bool quote_valid{CalculateBmmWorkFeeQuote(
+    std::array<int64_t,3> work_quote{};
+    const bool quote_funded{drivechain::haskell::BmmWorkQuoteDisplay(
         producer_fee_revenue,
         total_simplicity_milliweight,
-        gArgs.GetIntArg("-drivechainbmmworksatsperkwu", 1000),
-        gArgs.GetIntArg("-drivechainbmmproducerreserve", 0),
+        gArgs.GetIntArg("-drivechainbmmworksatsperkwu", drivechain::DEFAULT_BMM_WORK_SATS_PER_KWU),
+        gArgs.GetIntArg("-drivechainbmmproducerreserve", drivechain::DEFAULT_BMM_PRODUCER_RESERVE),
         work_quote)};
     UniValue bmm_quote(UniValue::VOBJ);
-    bmm_quote.pushKV("funded", quote_valid && work_quote.bid > 0);
-    bmm_quote.pushKV("verificationfeesats", quote_valid ? work_quote.verification_fee : 0);
-    bmm_quote.pushKV("producerreservesats", quote_valid ? work_quote.producer_reserve : 0);
-    bmm_quote.pushKV("maxbidsats", quote_valid ? work_quote.bid : 0);
-    bmm_quote.pushKV("worksatsperkwu", gArgs.GetIntArg("-drivechainbmmworksatsperkwu", 1000));
+    bmm_quote.pushKV("funded", quote_funded);
+    bmm_quote.pushKV("verificationfeesats", work_quote[0]);
+    bmm_quote.pushKV("producerreservesats", work_quote[1]);
+    bmm_quote.pushKV("maxbidsats", work_quote[2]);
+    bmm_quote.pushKV("worksatsperkwu", gArgs.GetIntArg("-drivechainbmmworksatsperkwu", drivechain::DEFAULT_BMM_WORK_SATS_PER_KWU));
     result.pushKV("bmmworkfeequote", bmm_quote);
 
     UniValue aRules(UniValue::VARR);
@@ -1368,12 +1345,13 @@ static RPCHelpMan getnewblockhex()
         pblocktemplate->block.hashMerkleRoot = BlockMerkleRoot(pblocktemplate->block);
     }
 
-    // If WSH(OP_TRUE) block, fill in witness
-    CScript op_true(OP_TRUE);
-    if (pblocktemplate->block.m_dynafed_params.m_current.m_signblockscript ==
-            GetScriptForDestination(WitnessV0ScriptHash(op_true))) {
-        pblocktemplate->block.m_signblock_witness.stack.emplace_back(op_true.begin(), op_true.end());
+    if (chainman.GetConsensus().utreexo) {
+        LOCK(cs_main);
+        utreexo::Prepare(pblocktemplate->block, chainman.ActiveChain().Tip(),
+            chainman.ActiveChainstate().CoinsTip(), chainman.GetParams(), *chainman.m_blockman.m_block_tree_db);
     }
+
+    node::AppendOpTrueBlockWitness(pblocktemplate->block);
 
     DataStream ssBlock{};
     ssBlock << TX_WITH_WITNESS(pblocktemplate->block);
@@ -1415,19 +1393,25 @@ static RPCHelpMan getsimplicityinfo()
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
             private_catalogue = true;
 #endif
-            if (private_catalogue && !frozen) {
-                catalogue = gArgs.GetArg("-ecxprivatesimplicitycataloguesha256", "");
-                program_cmr = gArgs.GetArg("-ecxprivatesimplicityprogramcmr", "");
-            }
-            const bool identities_valid{
-                catalogue.size() == 64 && IsHex(catalogue) &&
-                program_cmr.size() == 64 && IsHex(program_cmr)};
+            drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EVALUATOR_SOURCE,
+                [&](uint32_t step) -> uint32_t {
+                    switch (step) {
+                    case 1: return private_catalogue;
+                    case 2: return frozen;
+                    case 3:
+                        catalogue = gArgs.GetArg("-ecxprivatesimplicitycataloguesha256", "");
+                        program_cmr = gArgs.GetArg("-ecxprivatesimplicityprogramcmr", "");
+                        return 1;
+                    default: throw std::logic_error("invalid evaluator source action");
+                    }
+                });
+            const int identity{drivechain::haskell::EvaluatorIdentity(frozen, private_catalogue, catalogue, program_cmr)};
             UniValue result(UniValue::VOBJ);
-            result.pushKV("active", identities_valid && (frozen || private_catalogue));
+            result.pushKV("active", identity == 3);
             result.pushKV("catalogueFrozen", frozen);
             result.pushKV("privateCatalogue", private_catalogue);
-            result.pushKV("catalogueSha256", identities_valid ? catalogue : "");
-            result.pushKV("programCmr", identities_valid ? program_cmr : "");
+            result.pushKV("catalogueSha256", identity ? catalogue : "");
+            result.pushKV("programCmr", identity ? program_cmr : "");
             return result;
         }};
 }
@@ -1464,51 +1448,70 @@ static RPCHelpMan getbmmconsensuscontext()
     {
         LOCK(cs_main);
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-        if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
-        sidechain_hash = tip->GetBlockHash();
-        sidechain_height = tip->nHeight;
-        if (consensus.drivechain_slot.has_value()) {
-            // This projection rejects genesis, header-only, failed and malformed
-            // indexes. The persisted anchor is not by itself a current-chain
-            // authentication: recheck its P -> Q edge below, without cs_main.
-            if (!GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value()) {
-                throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip has no authenticated native BMM anchor");
+        drivechain::BmmL1State state;
+        const auto status = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::RPC_BMM_SOURCE,
+            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+            AssertLockHeld(cs_main);
+            switch (step) {
+            case 1: return tip != nullptr;
+            case 2: sidechain_hash = tip->GetBlockHash(); sidechain_height = tip->nHeight; return 1;
+            case 3: return consensus.drivechain_slot.has_value();
+            // A usable native checkpoint still needs P -> Q authentication below,
+            // outside cs_main; a persisted anchor alone is not sufficient.
+            case 4: return GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value();
+            case 5: native_anchor = tip->m_drivechain_anchor; return 1;
+            case 6: return drivechain::GetEffectiveBmmState(chainman.ActiveChainstate().CoinsTip(), tip, state, error);
+            case 7: return drivechain::GetBmmParentContext(state, parent_context, error);
+            default: throw std::logic_error("invalid BMM RPC source action");
             }
-            native_anchor = tip->m_drivechain_anchor;
-        } else {
-            drivechain::BmmL1State state;
-            if (!drivechain::GetEffectiveBmmState(
-                    chainman.ActiveChainstate().CoinsTip(), tip, state, error) ||
-                !drivechain::GetBmmParentContext(state, parent_context, error)) {
-                throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "authenticated BMM context is unavailable" : error);
-            }
+        });
+        if (status) {
+            static constexpr const char* failures[]{"active sidechain tip is unavailable",
+                "active sidechain tip has no authenticated native BMM anchor", "authenticated BMM context is unavailable"};
+            throw JSONRPCError(RPC_MISC_ERROR, status == 3 && !error.empty() ? error : failures[status-1]);
         }
     }
-    if (native_anchor) {
+    {
         // Parent RPC/replay must never run while holding a sidechain consensus
         // lock. Fail closed on unavailable/orphaned anchors, replay-generation
         // changes, or a sidechain reorg racing this read-only RPC.
-        if (!WarmDrivechainParentState(&error)) {
-            throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "native BMM parent replay is unavailable" : error);
-        }
-        const uint64_t epoch = GetDrivechainParentReplayEpoch();
-        if (epoch == 0 || IsDrivechainAnchorActive(
-                *native_anchor, *consensus.drivechain_slot, &error) != DrivechainAnchorStatus::ACTIVE) {
-            throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "native BMM anchor is not active" : error);
-        }
-        {
-            LOCK(cs_main);
-            const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-            if (GetDrivechainParentReplayEpoch() != epoch || tip == nullptr ||
-                tip->GetBlockHash() != sidechain_hash ||
-                tip->m_drivechain_anchor != native_anchor ||
-                !GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value()) {
-                throw JSONRPCError(RPC_MISC_ERROR, "BMM context changed during authentication; retry");
+        uint64_t epoch{0};
+        const auto status = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::RPC_BMM_AUTHENTICATION, [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return native_anchor.has_value();
+            case 2: return WarmDrivechainParentState(&error);
+            case 3: epoch = GetDrivechainParentReplayEpoch(); return epoch != 0;
+            case 4: return IsDrivechainAnchorActive(*native_anchor, *consensus.drivechain_slot, &error) == DrivechainAnchorStatus::ACTIVE;
+            case 5: {
+                LOCK(cs_main);
+                const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+                return drivechain::haskell::ParentReplayEach(std::array{0,1,2,3,4}, std::function<bool(int)>{[&](int fact) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+                    AssertLockHeld(cs_main);
+                    switch (fact) {
+                    case 0: return GetDrivechainParentReplayEpoch() == epoch;
+                    case 1: return tip != nullptr;
+                    case 2: return tip->GetBlockHash() == sidechain_hash;
+                    case 3: return tip->m_drivechain_anchor == native_anchor;
+                    case 4: return GetPriorActiveBmmParentCheckpoint(tip, consensus).has_value();
+                    default: throw std::logic_error("invalid BMM RPC snapshot fact");
+                    }
+                }});
             }
+            case 6:
+                parent_context.block_hash = native_anchor->parent_block_hash;
+                parent_context.height = native_anchor->parent_height;
+                parent_context.median_time_past = native_anchor->parent_median_time_past;
+                return 1;
+            default: throw std::logic_error("invalid BMM RPC authentication action");
+            }
+        });
+        if (status) {
+            static constexpr const char* failures[]{"native BMM parent replay is unavailable",
+                "native BMM anchor is not active", "BMM context changed during authentication; retry"};
+            throw JSONRPCError(RPC_MISC_ERROR, status == 3 || error.empty() ? failures[status-1] : error);
         }
-        parent_context.block_hash = native_anchor->parent_block_hash;
-        parent_context.height = native_anchor->parent_height;
-        parent_context.median_time_past = native_anchor->parent_median_time_past;
     }
     UniValue parent(UniValue::VOBJ);
     parent.pushKV("authenticated", true);
@@ -1558,33 +1561,24 @@ static RPCHelpMan submitbmmworkbid()
             const int64_t simplicity_milliweight_signed{request.params[4].getInt<int64_t>()};
             const CAmount reserve{request.params[5].getInt<int64_t>()};
             const CAmount requested{request.params[6].getInt<int64_t>()};
-            if (critical_hash.IsNull() || previous_hash.IsNull()) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "BMM hashes must be nonzero");
-            }
-            if (height <= 0 || height > std::numeric_limits<uint32_t>::max()) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "sidechain height is outside uint32 range");
-            }
-            if (collected <= 0 || simplicity_milliweight_signed < 0 || reserve < 0 || requested <= 0) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "invalid work-fee allocation");
-            }
-            BmmWorkFeeQuote work_quote;
-            if (!CalculateBmmWorkFeeQuote(
-                    collected,
-                    static_cast<uint64_t>(simplicity_milliweight_signed),
-                    gArgs.GetIntArg("-drivechainbmmworksatsperkwu", 1000),
-                    reserve,
-                    work_quote)) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "candidate fees do not fund its priced verification work and reserve");
-            }
-            if (requested > work_quote.bid) {
+            std::array<int64_t,4> quote{}; // verification fee, retained, maximum bid, surplus
+            const int admission = drivechain::haskell::BmmWorkBid(
+                uint32_t(!critical_hash.IsNull()) | (uint32_t(!previous_hash.IsNull()) << 1),
+                height,collected,simplicity_milliweight_signed,reserve,requested,
+                [&](uint32_t) { return gArgs.GetIntArg("-drivechainbmmworksatsperkwu",drivechain::DEFAULT_BMM_WORK_SATS_PER_KWU); },quote);
+            static constexpr const char* errors[]{"BMM hashes must be nonzero",
+                "sidechain height is outside uint32 range", "invalid work-fee allocation",
+                "candidate fees do not fund its priced verification work and reserve"};
+            if (admission > 0 && admission < 5) throw JSONRPCError(RPC_INVALID_PARAMETER,errors[admission-1]);
+            if (admission == 5) {
                 throw JSONRPCError(
                     RPC_INVALID_PARAMETER,
-                    strprintf("BMM bid exceeds work-fee revenue available after costs: %d > %d", requested, work_quote.bid));
+                    strprintf("BMM bid exceeds work-fee revenue available after costs: %d > %d", requested, quote[2]));
             }
             uint256 request_txid;
             std::string error;
             if (!SubmitDrivechainBmmBid(
-                    gArgs.GetIntArg("-drivechainbmmslot", 24),
+                    gArgs.GetIntArg("-drivechainbmmslot", drivechain::BMM_SIDECHAIN_SLOT),
                     static_cast<uint64_t>(requested),
                     static_cast<uint32_t>(height),
                     critical_hash,
@@ -1596,9 +1590,9 @@ static RPCHelpMan submitbmmworkbid()
             UniValue result(UniValue::VOBJ);
             result.pushKV("txid", request_txid.GetHex());
             result.pushKV("bid_sats", requested);
-            result.pushKV("verification_fee_sats", work_quote.verification_fee);
-            result.pushKV("producer_retained_sats", work_quote.verification_fee + reserve);
-            result.pushKV("producer_surplus_sats", work_quote.bid - requested);
+            result.pushKV("verification_fee_sats", quote[0]);
+            result.pushKV("producer_retained_sats", quote[1]);
+            result.pushKV("producer_surplus_sats", quote[3]);
             return result;
         }};
 }
@@ -1612,71 +1606,70 @@ static RPCHelpMan generateprivatebmmblock()
         RPCResult{RPCResult::Type::STR_HEX, "blockhash", "accepted sidechain block hash"},
         RPCExamples{HelpExampleCli("generateprivatebmmblock", "")},
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
-            if (!gArgs.GetBoolArg("-ecxprivatebmmcheckpoint", false)) {
-                throw JSONRPCError(RPC_MISC_ERROR, "private BMM checkpoint mode is disabled");
-            }
-            ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const NodeContext& node = EnsureAnyNodeContext(request.context);
+            ChainstateManager* chainman{nullptr};
+            const NodeContext* node{nullptr};
             drivechain::BmmL1State previous;
-            {
-                LOCK(cs_main);
-                std::string state_error;
-                if (!drivechain::GetEffectiveBmmState(
-                        chainman.ActiveChainstate().CoinsTip(),
-                        chainman.ActiveChain().Tip(),
-                        previous,
-                        state_error)) {
-                    throw JSONRPCError(RPC_MISC_ERROR, "cannot obtain private BMM state: " + state_error);
-                }
-            }
-            const std::vector<unsigned char> parent_bytes(
-                previous.block_hash.begin(), previous.block_hash.end());
-            const std::vector<CScript> commitments{
-                CScript() << OP_RETURN << parent_bytes};
-            CScript destination(OP_TRUE);
-            BlockAssembler::Options options;
-            ApplyArgsManOptions(gArgs, options);
-            options.coinbase_output_script = destination;
-            options.commit_scripts = commitments;
-            options.authenticated_parent_height = static_cast<uint64_t>(previous.height) + 1;
-            std::unique_ptr<CBlockTemplate> block_template(
-                BlockAssembler(chainman.ActiveChainstate(), node.mempool.get(), options).CreateNewBlock());
-            if (!block_template || !block_template->block.HasBmmProof()) {
-                throw JSONRPCError(RPC_MISC_ERROR, "private BMM block template is unavailable");
-            }
-            {
-                LOCK(cs_main);
-                unsigned int extra_nonce = 0;
-                IncrementExtraNonce(
-                    &block_template->block,
-                    chainman.ActiveChain().Tip(),
-                    extra_nonce);
-            }
-            CScript op_true(OP_TRUE);
-            if (block_template->block.m_dynafed_params.m_current.m_signblockscript ==
-                    GetScriptForDestination(WitnessV0ScriptHash(op_true))) {
-                block_template->block.m_signblock_witness.stack.push_back(
-                    std::vector<unsigned char>(op_true.begin(), op_true.end()));
-            }
+            std::unique_ptr<CBlockTemplate> block_template;
             drivechain::BmmProof proof;
             std::string proof_error;
-            if (!drivechain::BuildPrivateE2eBmmProof(
-                    previous,
-                    block_template->block.GetBmmCriticalHash(),
-                    proof,
-                    proof_error) ||
-                !drivechain::AttachBmmProof(block_template->block, proof, proof_error)) {
-                throw JSONRPCError(RPC_MISC_ERROR, "cannot build private BMM proof: " + proof_error);
-            }
-            const uint256 block_hash{block_template->block.GetHash()};
-            if (!chainman.ProcessNewBlock(
-                    std::make_shared<const CBlock>(block_template->block),
-                    /*force_processing=*/true,
-                    /*min_pow_checked=*/true,
-                    nullptr)) {
-                throw JSONRPCError(RPC_MISC_ERROR, "private BMM block was rejected");
-            }
-            return block_hash.GetHex();
+            std::string error;
+            const bool accepted = drivechain::haskell::ParentReplayEach(std::array{1, 2, 3, 4, 5, 6, 7}, [&](int step) {
+                switch (step) {
+                case 1:
+                    error = "private BMM checkpoint mode is disabled";
+                    return gArgs.GetBoolArg("-ecxprivatebmmcheckpoint", false);
+                case 2: {
+                    chainman = &EnsureAnyChainman(request.context);
+                    node = &EnsureAnyNodeContext(request.context);
+                    LOCK(cs_main);
+                    std::string state_error;
+                    const bool valid = drivechain::GetEffectiveBmmState(
+                        chainman->ActiveChainstate().CoinsTip(), chainman->ActiveChain().Tip(), previous, state_error);
+                    error = "cannot obtain private BMM state: " + state_error;
+                    return valid;
+                }
+                case 3: {
+                    BlockAssembler::Options options;
+                    ApplyArgsManOptions(gArgs, options);
+                    options.coinbase_output_script = CScript() << OP_TRUE;
+                    options.commit_scripts = {CScript() << OP_RETURN << std::vector<unsigned char>(previous.block_hash.begin(), previous.block_hash.end())};
+                    options.authenticated_parent_height = static_cast<uint64_t>(previous.height) + 1;
+                    block_template = BlockAssembler(chainman->ActiveChainstate(), node->mempool.get(), options).CreateNewBlock();
+                    error = "private BMM block template is unavailable";
+                    return drivechain::haskell::ParentReplayAll<2>({
+                        [&] { return bool(block_template); },
+                        [&] { return block_template->block.HasBmmProof(); },
+                    });
+                }
+                case 4: {
+                    LOCK(cs_main);
+                    unsigned int extra_nonce = 0;
+                    IncrementExtraNonce(&block_template->block, chainman->ActiveChain().Tip(), extra_nonce);
+                    utreexo::Prepare(block_template->block, chainman->ActiveChain().Tip(),
+                        chainman->ActiveChainstate().CoinsTip(), chainman->GetParams(),
+                        *chainman->m_blockman.m_block_tree_db);
+                    return true;
+                }
+                case 5: {
+                    node::AppendOpTrueBlockWitness(block_template->block);
+                    const bool valid = drivechain::BuildPrivateE2eBmmProof(previous, block_template->block.GetBmmCriticalHash(), proof, proof_error);
+                    error = "cannot build private BMM proof: " + proof_error;
+                    return valid;
+                }
+                case 6: {
+                    const bool valid = drivechain::AttachBmmProof(block_template->block, proof, proof_error);
+                    error = "cannot build private BMM proof: " + proof_error;
+                    return valid;
+                }
+                case 7:
+                    error = "private BMM block was rejected";
+                    return chainman->ProcessNewBlock(std::make_shared<const CBlock>(block_template->block),
+                        /*force_processing=*/true, /*min_pow_checked=*/true, nullptr);
+                default: throw std::logic_error("invalid private BMM generation action");
+                }
+            });
+            if (!accepted) throw JSONRPCError(RPC_MISC_ERROR, error);
+            return block_template->block.GetHash().GetHex();
         }};
 }
 #endif

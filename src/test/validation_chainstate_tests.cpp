@@ -5,6 +5,7 @@
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <node/kernel_notifications.h>
+#include <node/blockstorage.h>
 #include <node/utxo_snapshot.h>
 #include <random.h>
 #include <rpc/blockchain.h>
@@ -17,6 +18,7 @@
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/strencodings.h>
 #include <validation.h>
 
 #include <vector>
@@ -46,6 +48,43 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_rpc_exports_source_blocks, TestChain100
     BOOST_CHECK(result["coins"].size() > 0);
     BOOST_CHECK(result["coin_source_blocks"].size() > 0);
     BOOST_CHECK_EQUAL(result["withdrawals"]["frontier"].size(), 64U);
+    {
+        LOCK(cs_main);
+        auto& manager = *m_node.chainman;
+        const auto encode = [](const auto& value) {
+            DataStream bytes;
+            bytes << value;
+            return HexStr(bytes);
+        };
+        auto sources = node::PrepareChildCheckpointSources(manager);
+        BOOST_CHECK_EQUAL(result["withdrawals"]["count"].getInt<uint64_t>(), sources.withdrawals.count);
+        BOOST_CHECK_EQUAL(result["withdrawals"]["root"].get_str(), HexStr(sources.withdrawals.root));
+        for (size_t i = 0; i < sources.withdrawals.frontier.size(); ++i)
+            BOOST_CHECK_EQUAL(result["withdrawals"]["frontier"][i].get_str(), HexStr(sources.withdrawals.frontier[i]));
+        for (int height = 0; height <= sources.height; ++height) {
+            CBlock block;
+            BOOST_REQUIRE(manager.m_blockman.ReadBlock(block, *manager.ActiveChain()[height]));
+            BOOST_CHECK_EQUAL(result["headers"][height].get_str(), encode(TX_WITH_WITNESS(block.GetBlockHeader())));
+        }
+        std::map<std::string, UniValue> exported_coins;
+        for (const auto& item : result["coins"].getValues())
+            BOOST_REQUIRE(exported_coins.emplace(item["outpoint"].get_str(), item).second);
+        size_t count{0};
+        for (auto& cursor = sources.coins; cursor->Valid(); cursor->Next()) {
+            COutPoint outpoint;
+            Coin coin;
+            BOOST_REQUIRE(cursor->GetKey(outpoint));
+            BOOST_REQUIRE(cursor->GetValue(coin));
+            const auto found = exported_coins.find(encode(outpoint));
+            BOOST_REQUIRE(found != exported_coins.end());
+            const auto& item = found->second;
+            BOOST_CHECK_EQUAL(item["height"].getInt<uint32_t>(), static_cast<uint32_t>(coin.nHeight));
+            BOOST_CHECK_EQUAL(item["coinbase"].get_bool(), coin.IsCoinBase());
+            BOOST_CHECK_EQUAL(item["output"].get_str(), encode(coin.out));
+            ++count;
+        }
+        BOOST_CHECK_EQUAL(exported_coins.size(), count);
+    }
     mineBlocks(1);
     BOOST_CHECK_THROW(tableRPC.execute(request), UniValue); // exact tip required
 }
@@ -98,17 +137,27 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_sources_stay_at_one_tip, TestChain100Se
     LOCK(cs_main);
     auto& state = manager.ActiveChainstate();
     auto* tip = state.m_chain.Tip();
+    state.CoinsTip().SetPeginSpent(claim, true);
+    const auto rejects_without_flush = [&](const char* message) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        BOOST_CHECK_EXCEPTION(node::PrepareChildCheckpointSources(manager), std::runtime_error,
+            [&](const auto& error) { return error.what() == std::string(message); });
+        BOOST_CHECK(!state.CoinsDB().IsPeginSpent(claim));
+        BOOST_CHECK(state.CoinsTip().IsPeginSpent(claim));
+    };
     auto saved_frontier = tip->m_usdd_withdrawal_accumulator;
     tip->m_usdd_withdrawal_accumulator.reset();
-    BOOST_CHECK_THROW(node::PrepareChildCheckpointSources(manager), std::runtime_error);
+    rejects_without_flush("Child checkpoint withdrawal frontier unavailable or malformed");
     tip->m_usdd_withdrawal_accumulator = saved_frontier;
     tip->m_usdd_withdrawal_accumulator->root[0] ^= 1;
-    BOOST_CHECK_THROW(node::PrepareChildCheckpointSources(manager), std::runtime_error);
+    rejects_without_flush("Child checkpoint withdrawal frontier unavailable or malformed");
     BOOST_CHECK(sources.withdrawals == baseline.withdrawals);
     tip->m_usdd_withdrawal_accumulator = saved_frontier;
     state.CoinsTip().SetBestBlock(uint256::ONE);
-    BOOST_CHECK_THROW(node::PrepareChildCheckpointSources(manager), std::runtime_error);
+    rejects_without_flush("Child checkpoint cache/active tip mismatch");
     state.CoinsTip().SetBestBlock(tip->GetBlockHash());
+    const auto final = node::PrepareChildCheckpointSources(manager);
+    BOOST_CHECK(state.CoinsDB().IsPeginSpent(claim));
+    BOOST_CHECK(final.block_hash == tip->GetBlockHash());
 }
 
 //! Test resizing coins-related Chainstate caches during runtime.

@@ -6,6 +6,7 @@
 #define BITCOIN_DRIVECHAIN_WITHDRAWAL_H
 
 #include <consensus/amount.h>
+#include <haskell/bmm_constants.h>
 #include <primitives/bitcoin/transaction.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -21,11 +22,6 @@ class CTxOutWitness;
 
 namespace drivechain {
 
-static constexpr size_t NATIVE_WITHDRAWAL_MAX_DESTINATION_SIZE{128};
-static constexpr size_t NATIVE_WITHDRAWAL_M6_REFERENCE_SIZE{74};
-// Version, zero vin, three bounded outputs, and locktime. The longest form
-// carries a 128-byte payout script and is exactly 251 bytes.
-static constexpr size_t NATIVE_WITHDRAWAL_MAX_M6_LEGACY_SIZE{251};
 using NativeWithdrawalCommitment =
     std::array<unsigned char, NATIVE_WITHDRAWAL_M6_REFERENCE_SIZE>;
 

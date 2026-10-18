@@ -1,0 +1,16 @@
+[package]
+name = "elements-utreexo-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rustreexo = { git = "https://github.com/mit-dci/rustreexo", rev = "b73cbac1f425f0e849faa279982ef4f5ec9f3754" }
+
+[profile.release]
+panic = "unwind"
+
+[workspace]

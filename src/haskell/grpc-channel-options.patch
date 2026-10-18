@@ -1,0 +1,49 @@
+diff --git a/core/cbits/grpc_haskell.c b/core/cbits/grpc_haskell.c
+--- a/core/cbits/grpc_haskell.c
++++ b/core/cbits/grpc_haskell.c
+@@ -411,6 +411,10 @@
+       return GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH;
+     case max_metadata_size_key:
+       return GRPC_ARG_MAX_METADATA_SIZE;
++    case ssl_target_name_override_key:
++      return GRPC_SSL_TARGET_NAME_OVERRIDE_ARG;
++    case enable_retries_key:
++      return GRPC_ARG_ENABLE_RETRIES;
+     default:
+       return "unknown_arg_key";
+   }
+diff --git a/core/include/grpc_haskell.h b/core/include/grpc_haskell.h
+--- a/core/include/grpc_haskell.h
++++ b/core/include/grpc_haskell.h
+@@ -165,6 +165,8 @@
+   user_agent_suffix_key,
+   max_receive_message_length_key,
+   max_metadata_size_key,
++  ssl_target_name_override_key,
++  enable_retries_key,
+ };
+ 
+ grpc_arg* create_arg_array(size_t n);
+diff --git a/core/src/Network/GRPC/Unsafe/ChannelArgs.chs b/core/src/Network/GRPC/Unsafe/ChannelArgs.chs
+--- a/core/src/Network/GRPC/Unsafe/ChannelArgs.chs
++++ b/core/src/Network/GRPC/Unsafe/ChannelArgs.chs
+@@ -53,6 +53,8 @@
+          | UserAgentSuffix String
+          | MaxReceiveMessageLength Natural
+          | MaxMetadataSize Natural
++         | SslTargetNameOverride String
++         | EnableRetries Bool
+   deriving (Show, Eq)
+ 
+ {#fun create_string_arg as ^ {`GrpcArg', `Int', `ArgKey', `String'} -> `()'#}
+@@ -76,6 +78,10 @@
+ createArg array (MaxMetadataSize n) i =
+   createIntArg array i MaxMetadataSizeKey $
+     fromIntegral (min n (fromIntegral (maxBound :: Int)))
++createArg array (SslTargetNameOverride name) i =
++  createStringArg array i SslTargetNameOverrideKey name
++createArg array (EnableRetries enabled) i =
++  createIntArg array i EnableRetriesKey (fromEnum enabled)
+ 
+ createChannelArgs :: [Arg] -> IO GrpcChannelArgs
+ createChannelArgs args = do

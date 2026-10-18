@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <stdexcept>
 #include <chrono>
@@ -32,9 +33,82 @@
 #include <univalue.h>
 
 class CBlock;
+class arith_uint256;
+
+class DrivechainParentRecoveryDeadline {
+    std::optional<std::chrono::steady_clock::time_point>& m_current;
+    const std::optional<std::chrono::steady_clock::time_point> m_previous;
+public:
+    DrivechainParentRecoveryDeadline(std::optional<std::chrono::steady_clock::time_point>& current,
+        const std::function<std::chrono::steady_clock::time_point()>& now);
+    ~DrivechainParentRecoveryDeadline() noexcept;
+    DrivechainParentRecoveryDeadline(const DrivechainParentRecoveryDeadline&) = delete;
+    DrivechainParentRecoveryDeadline& operator=(const DrivechainParentRecoveryDeadline&) = delete;
+};
+
+struct VerifiedMainchainHeader {
+    Sidechain::Bitcoin::CBlockHeader header;
+    uint256 chainwork;
+    uint32_t height{0};
+    int64_t confirmations{0};
+    uint64_t median_time_past{0};
+};
+
+struct DrivechainParentHeaderSource {
+    std::function<const uint256&()> genesis;
+    std::function<UniValue(const std::string&, const UniValue&)> request;
+    std::function<bool(const uint256&, Sidechain::Bitcoin::CBlockHeader&, std::string*)> raw_header;
+    std::function<bool(const uint256&, uint32_t, uint64_t&, std::string*)> median_time;
+    std::function<void()> deadline;
+};
+
+bool VerifyDrivechainParentHeader(const uint256& expected_hash, int min_confirmations,
+    VerifiedMainchainHeader& verified, std::string* error, const DrivechainParentHeaderSource& source);
+
+bool CheckDrivechainParentProofOfWork(const uint256& hash, uint32_t bits, std::string* error);
+arith_uint256 GetDrivechainParentBlockProof(uint32_t bits);
+bool DecodeDrivechainRawParentHeader(const UniValue& raw, const uint256& hash,
+    Sidechain::Bitcoin::CBlockHeader& header, std::string* error);
+bool DecodeDrivechainRawParentBlock(const UniValue& raw, const uint256& hash,
+    Sidechain::Bitcoin::CBlock& block, std::string* error, const std::function<void()>& deadline);
+bool CheckDrivechainParentBlockTransactions(const Sidechain::Bitcoin::CBlock& block,
+    std::string* error, const std::function<void()>& deadline);
+/** Transaction shape must already have passed CheckDrivechainParentBlockTransactions. */
+bool CheckDrivechainParentBlockSignet(const Sidechain::Bitcoin::CBlock& block, std::string* error,
+    const std::function<const std::vector<uint8_t>&()>& challenge,
+    const std::function<const uint256&()>& genesis, const std::function<void()>& deadline);
+bool VerifyDrivechainParentBlock(const uint256& hash, int min_confirmations,
+    Sidechain::Bitcoin::CBlock& block, VerifiedMainchainHeader& verified, std::string* error,
+    const std::function<bool(const uint256&, int, VerifiedMainchainHeader&, std::string*)>& read_header,
+    const std::function<bool(const uint256&, Sidechain::Bitcoin::CBlock&, std::string*)>& read_block);
+bool ComputeDrivechainParentMedianTimePast(const uint256& start_hash, uint32_t start_height,
+    uint64_t& median_time_past,
+    const std::function<bool(const uint256&, Sidechain::Bitcoin::CBlockHeader&)>& read_header,
+    const std::function<void()>& check_deadline);
+bool CheckDrivechainParentChainwork(const uint256& parent_work, const uint256& successor_work,
+    uint32_t successor_bits, std::string* error);
+
+/** Pure parent-RPC parsing helpers; rejected canonical hashes may be decoded. */
+bool ParseDrivechainCanonicalHash(const UniValue& value, uint256& hash);
+bool ParseDrivechainParentHeight(const UniValue& value, uint32_t& height, std::string* error);
+bool ParseDrivechainParentHeaderMetadata(const UniValue& metadata, const uint256& expected_hash,
+    int min_confirmations, uint256& chainwork, int64_t& height, int64_t& confirmations, std::string* error);
+/** Height must already have passed ParseDrivechainParentHeaderMetadata. */
+bool CheckDrivechainParentPredecessor(const UniValue& previous, int64_t height,
+    const Sidechain::Bitcoin::CBlockHeader& raw_header, const uint256& chainwork, std::string* error,
+    const std::function<UniValue(const std::string&, const UniValue&)>& request);
+bool IsExactDrivechainOpReturnAddress(const Sidechain::Bitcoin::CTxOut& output,
+    const std::vector<unsigned char>& address);
 class CTransaction;
 class ArgsManager;
+class HashWriter;
+namespace ElementsDrivechainBootstrap {
+struct Slot;
+}
 struct DrivechainDepositEvidence;
+namespace Consensus {
+struct Params;
+}
 namespace drivechain {
 struct AuthenticatedDeposit;
 struct BmmL1State;
@@ -111,16 +185,9 @@ enum class DrivechainDepositStatus {
  * zero value) or binds one complete positive-valued CTIP. Partial tuples are
  * invalid and must fail closed.
  */
-inline bool IsCanonicalDrivechainParentCheckpointCtip(const uint256& txid,
+bool IsCanonicalDrivechainParentCheckpointCtip(const uint256& txid,
                                                       const uint32_t vout,
-                                                      const CAmount value)
-{
-    const bool empty = txid.IsNull() &&
-        vout == std::numeric_limits<uint32_t>::max() && value == 0;
-    const bool populated = !txid.IsNull() &&
-        vout != std::numeric_limits<uint32_t>::max() && value > 0 && MoneyRange(value);
-    return empty || populated;
-}
+                                                      const CAmount value);
 
 bool IsCanonicalDrivechainParentCheckpointIdentity(
     const std::vector<unsigned char>& active_proposal_description,
@@ -329,6 +396,11 @@ struct BoundedCommandResult {
     std::string error;
 };
 
+/** Classify process failures before exit status or caller-authorized duplicate handling. */
+enum class DrivechainGrpcStatus { SUCCESS, PROCESS_FAILURE, NONZERO_EXIT };
+DrivechainGrpcStatus ClassifyDrivechainGrpcResult(const BoundedCommandResult& child,
+    bool accept_duplicate, std::string& error);
+
 /** Execute argv directly, never through a shell, and always reap the child. */
 BoundedCommandResult RunBoundedCommand(
     const std::vector<std::string>& argv,
@@ -341,12 +413,7 @@ bool ValidateDrivechainGrpcTLSConfig(
     const ArgsManager& args,
     std::string* error = nullptr);
 
-/** Validate the explicitly configured, private, non-symlink grpcurl executable. */
-bool ValidateDrivechainGrpcExecutable(
-    const ArgsManager& args,
-    std::string* error = nullptr);
-
-/** Call an allowlisted enforcer method using mutual TLS and direct argv. */
+/** Call an allowlisted enforcer method through the linked Haskell mTLS client. */
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     const ArgsManager& args,
     const std::string& method,
@@ -400,12 +467,15 @@ private:
 };
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
+/** Validate an RPC envelope and copy its result; errors take precedence even when null is allowed. */
+UniValue CheckDrivechainRPCReply(const std::string& method, const UniValue& reply, bool require_result = true);
+UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params);
 /**
  * Call an allowlisted unary CUSF RPC through the bounded, authenticated gRPC transport.
  *
  * The endpoint must exactly match the configured loopback host:port (no URL
  * scheme); method is the fully-qualified service/method path without a leading
- * slash. Invokes the explicitly configured grpcurl executable without a shell.
+ * slash. Uses the linked Haskell gRPC client without a subprocess.
  */
 bool CallAuthenticatedDrivechainJSON(
     const std::string& endpoint,
@@ -413,6 +483,9 @@ bool CallAuthenticatedDrivechainJSON(
     const UniValue& request,
     UniValue& response,
     std::string* error = nullptr);
+/** Encode the shared protobuf JSON request; callers retain admission checks. */
+UniValue BuildDrivechainBmmRequest(int sidechain_slot, uint64_t bid_sats, int64_t parent_height,
+    const uint256& critical_hash, const uint256& previous_parent_hash);
 /**
  * Submit a BIP301 M8 bid through the BitWindow/CUSF enforcer wallet.
  *
@@ -461,6 +534,17 @@ bool WarmDrivechainParentState(std::string* error = nullptr);
  * whenever a parent reorganization forces a genesis replay rebuild.
  */
 uint64_t GetDrivechainParentReplayEpoch();
+
+/** Immutable derived-store identity; requires configured slot and proposal hash. */
+uint256 DrivechainParentReplayStoreIdentity(const Consensus::Params& consensus);
+
+/** Validate proposal, activation and checkpoint milestones without network reads. */
+bool CheckDrivechainParentReplayMilestone(const Consensus::Params& consensus, uint32_t height,
+    const Sidechain::Bitcoin::CBlock& block, const DrivechainParentReplayState& state, std::string* error);
+
+/** Append the canonical bootstrap preimage using upstream typed serialization. */
+void WriteDrivechainBootstrapPreimage(HashWriter& writer, const Consensus::Params& consensus,
+    std::span<const ElementsDrivechainBootstrap::Slot> slots);
 
 /**
  * Query the authenticated active-parent replay for a previously successful M6.

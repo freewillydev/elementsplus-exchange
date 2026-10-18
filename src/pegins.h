@@ -48,6 +48,12 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
                          bool* parent_unavailable = nullptr,
                          int child_height = -1);
 /** Parse a BIP300 deposit witness. This does not by itself authorize minting. */
+/** Haskell codec classification: 0 invalid, 1 legacy, 2 native, 3 deterministic.
+ * Modes: 0 any, 1 ECX only, 2 native only. Value is written only on success.
+ * Recognition does not authenticate parent evidence or authorize minting.
+ */
+int32_t DepositWitnessKind(const CScriptWitness& witness, const COutPoint& prevout,
+                          uint32_t mode, CAmount& value);
 bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
                                      const COutPoint& prevout,
                                      CAmount* value = nullptr,

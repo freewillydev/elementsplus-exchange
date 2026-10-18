@@ -60,22 +60,52 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
         legacy_node = self.nodes[1]
         collision_node = self.nodes[2]
         audit_node = self.nodes[3]
-        identity_path = os.path.join(
-            node.datadir, self.chain, "ecx_consensus.dat")
+        identity_path = node.chain_path / "ecx_consensus.dat"
         assert os.path.isfile(identity_path)
         pegged_asset = node.getsidechaininfo()["pegged_asset"]
         other_asset = f"{int(pegged_asset, 16) ^ 1:064x}"
+
+        for target, message in [
+            (legacy_node, "private BMM checkpoint mode is disabled"),
+            (node, "private BMM block template is unavailable"),
+        ]:
+            before = target.getbestblockhash()
+            assert_raises_rpc_error(-1, message, target.generateprivatebmmblock)
+            assert_equal(target.getblockcount(), 0)
+            assert_equal(target.getbestblockhash(), before)
 
         # An invalid reserved genesis outpoint must be rejected before a fresh
         # data directory is bound or any chain database is created.  Exercise
         # every synthetic record namespace, not just the ECX trackers.
         self.stop_node(2)
-        collision_chain_dir = os.path.join(
-            collision_node.datadir, self.chain)
+        collision_chain_dir = collision_node.chain_path
         shutil.rmtree(collision_chain_dir)
         os.makedirs(collision_chain_dir)
         collision_identity_path = os.path.join(
             collision_chain_dir, "ecx_consensus.dat")
+        # Reject migrated configuration rules before binding a fresh identity.
+        # Combined failures also pin validation order: height, domains, digest.
+        digest_error = "-ecxcollateralvaultscripthash does not match the frozen raw script bytes"
+        invalid_configurations = [
+            ({"ecxactivationheight": str(height)}, "invalid -ecxactivationheight")
+            for height in (-9223372036854775808, -1, 0, 2147483647, 9223372036854775807)
+        ] + [
+            ({"ecxdepositinboxdomain": "45" * 32}, "ECX forced-action and deposit inbox domains must differ"),
+            ({"ecxcollateralvaultscripthash": "00" * 32}, digest_error),
+            ({"ecxcollateralvaultscripthash": "01" * 32}, digest_error),
+            ({"ecxactivationheight": "0", "ecxdepositinboxdomain": "45" * 32,
+              "ecxcollateralvaultscripthash": "00" * 32}, "invalid -ecxactivationheight"),
+            ({"ecxdepositinboxdomain": "45" * 32, "ecxcollateralvaultscripthash": "00" * 32},
+             "ECX forced-action and deposit inbox domains must differ"),
+        ]
+        for overrides, message in invalid_configurations:
+            options = [arg for arg in self.audit_args if arg[1:].split("=", 1)[0] not in overrides]
+            options += [f"-{name}={value}" for name, value in overrides.items()]
+            collision_node.assert_start_raises_init_error(
+                extra_args=options, expected_msg=message, match=ErrorMatch.PARTIAL_REGEX)
+            assert not os.path.exists(collision_identity_path)
+            assert not os.path.exists(os.path.join(collision_chain_dir, "chainstate"))
+
         reserved_outpoints = [
             "e31f7fb1e9489bfb9f6a73c10f80ecdcce1f276fbdf0cf85c02e3bcf174dc041:0",
             "c3fd019db845c81a68a561f5ab67d92c3ab2505cb2c8212f02511e07e8c2f2a1:0",
@@ -110,8 +140,7 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
             audit_node, 3, audit_node.getnewaddress(), sync_fun=self.no_op)
         assert_equal(audit_node.getblockcount(), 3)
         self.stop_node(3)
-        audit_identity_path = os.path.join(
-            audit_node.datadir, self.chain, "ecx_consensus.dat")
+        audit_identity_path = audit_node.chain_path / "ecx_consensus.dat"
 
         shutil.rmtree(collision_chain_dir)
         os.makedirs(collision_chain_dir)
@@ -122,7 +151,7 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
 
         audit_node.assert_start_raises_init_error(
             extra_args=self.audit_args + ["-trim_headers=1"],
-            expected_msg="ECX consensus configuration cannot be bound to this data directory",
+            expected_msg="ECX consensus identity: persisted block-index header [0-9a-f]{64} at height 3 violates ECX rules: .*restart with -reindex",
             match=ErrorMatch.PARTIAL_REGEX,
         )
         with open(audit_node.debug_log_path, encoding="utf-8") as debug_log:
@@ -147,8 +176,7 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
         # Reproduce the original defect boundary: a legacy datadir that has
         # already crossed the requested activation height must not be silently
         # adopted and have its stored headers reinterpreted as ECX/BMM blocks.
-        legacy_identity_path = os.path.join(
-            legacy_node.datadir, self.chain, "ecx_consensus.dat")
+        legacy_identity_path = legacy_node.chain_path / "ecx_consensus.dat"
         assert os.path.isfile(legacy_identity_path)
         self.generatetoaddress(
             legacy_node, 3, legacy_node.getnewaddress(), sync_fun=self.no_op)
@@ -165,7 +193,7 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
         )
         legacy_node.assert_start_raises_init_error(
             extra_args=self.correct_args,
-            expected_msg="ECX consensus configuration cannot be bound to this data directory",
+            expected_msg="ECX consensus identity: .*block-index branch already reaches header",
             match=ErrorMatch.PARTIAL_REGEX,
         )
         with open(legacy_node.debug_log_path, encoding="utf-8") as debug_log:
@@ -278,6 +306,73 @@ class EcxConsensusIdentityTest(BitcoinTestFramework):
 
         self.start_node(0, extra_args=self.correct_args)
         assert node.verifychain(4, 0)
+
+        # The private proof producer must cross activation and extend its own
+        # authenticated successor, unlike the direct mining RPCs rejected above.
+        previous_hash = node.getbestblockhash()
+        private_blocks = []
+        for height in (3, 4):
+            block_hash = node.generateprivatebmmblock()
+            private_blocks.append(block_hash)
+            assert_equal(node.getblockcount(), height)
+            assert_equal(node.getbestblockhash(), block_hash)
+            block = node.getblock(block_hash)
+            assert_equal(block["previousblockhash"], previous_hash)
+            assert_equal(block["height"], height)
+            assert len(block["bmmproofhash"]) == 64
+            assert block["bmmproofhash"] != "0" * 64
+            assert node.verifychain(4, 0)
+            previous_hash = block_hash
+        header_before_restart = node.getblockheader(previous_hash, False)
+        proof_before_restart = node.getblockheader(previous_hash)["bmmproofhash"]
+        self.restart_node(0, extra_args=self.correct_args)
+        assert_equal(node.getblockcount(), 4)
+        assert_equal(node.getbestblockhash(), previous_hash)
+        assert_equal(node.getblockheader(previous_hash, False), header_before_restart)
+        assert_equal(node.getblockheader(previous_hash)["bmmproofhash"], proof_before_restart)
+        assert node.verifychain(4, 0)
+
+        # Replay both directions across the private BMM activation boundary,
+        # using only persisted proof data and this test's isolated chain.
+        node.invalidateblock(private_blocks[0])
+        assert_equal(node.getblockcount(), 2)
+        assert_equal(node.getbestblockhash(), best_before)
+        assert node.verifychain(4, 0)
+        node.reconsiderblock(private_blocks[0])
+        assert_equal(node.getblockcount(), 4)
+        assert_equal(node.getbestblockhash(), previous_hash)
+        assert_equal(node.getblockheader(previous_hash, False), header_before_restart)
+        assert_equal(node.getblockheader(previous_hash)["bmmproofhash"], proof_before_restart)
+        assert node.verifychain(4, 0)
+        self.restart_node(0, extra_args=self.correct_args)
+        assert_equal(node.getbestblockhash(), previous_hash)
+        assert_equal(node.getblockheader(previous_hash, False), header_before_restart)
+        assert node.verifychain(4, 0)
+
+        # Both rebuild paths must recover the valid private proof history,
+        # not merely reject the incompatible legacy history tested above.
+        persisted_blocks = {
+            block_hash: (node.getblockheader(block_hash, False),
+                         node.getblockheader(block_hash)["bmmproofhash"],
+                         node.getblock(block_hash, 0))
+            for block_hash in private_blocks
+        }
+        for rebuild in ("-reindex-chainstate", "-reindex"):
+            self.restart_node(0, extra_args=self.correct_args + [rebuild])
+            self.wait_until(lambda: node.getblockcount() == 4)
+            assert_equal(node.getbestblockhash(), previous_hash)
+            for block_hash, (header, proof_hash, block_bytes) in persisted_blocks.items():
+                assert_equal(node.getblockheader(block_hash, False), header)
+                assert_equal(node.getblockheader(block_hash)["bmmproofhash"], proof_hash)
+                assert_equal(node.getblock(block_hash, 0), block_bytes)
+            assert node.verifychain(4, 0)
+            with open(identity_path, "rb") as identity_file:
+                assert_equal(identity_file.read(), original_identity)
+            self.restart_node(0, extra_args=self.correct_args)
+            assert_equal(node.getbestblockhash(), previous_hash)
+            for block_hash, (_, _, block_bytes) in persisted_blocks.items():
+                assert_equal(node.getblock(block_hash, 0), block_bytes)
+            assert node.verifychain(4, 0)
 
 
 if __name__ == "__main__":

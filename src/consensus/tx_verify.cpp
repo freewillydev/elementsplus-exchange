@@ -12,6 +12,7 @@
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
 #include <ecx_exchange_state.h>
+#include <haskell/bridge.h>
 #include <pegins.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -21,23 +22,31 @@
 
 bool Consensus::HasOnlyExplicitCreations(const CTransaction& tx)
 {
-    for (const auto& output : tx.vout) {
-        if (!output.nAsset.IsExplicit() || !output.nValue.IsExplicit() ||
-            !output.nNonce.IsNull()) return false;
-    }
-    for (const auto& input : tx.vin) {
-        const auto& issuance = input.assetIssuance;
-        if ((!issuance.nAmount.IsNull() && !issuance.nAmount.IsExplicit()) ||
-            (!issuance.nInflationKeys.IsNull() && !issuance.nInflationKeys.IsExplicit())) return false;
-    }
-    for (const auto& witness : tx.witness.vtxoutwit) {
-        if (!witness.vchRangeproof.empty() || !witness.vchSurjectionproof.empty()) return false;
-    }
-    for (const auto& witness : tx.witness.vtxinwit) {
-        if (!witness.vchIssuanceAmountRangeproof.empty() ||
-            !witness.vchInflationKeysRangeproof.empty()) return false;
-    }
-    return true;
+    size_t output=0,input=0,output_witness=0,input_witness=0;
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPLICIT_CREATIONS,
+        [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return output < tx.vout.size();
+            case 2: return tx.vout[output].nAsset.IsExplicit();
+            case 3: return tx.vout[output].nValue.IsExplicit();
+            case 4: return tx.vout[output].nNonce.IsNull();
+            case 5: ++output; return 1;
+            case 6: return input < tx.vin.size();
+            case 7: return tx.vin[input].assetIssuance.nAmount.IsNull();
+            case 8: return tx.vin[input].assetIssuance.nAmount.IsExplicit();
+            case 9: return tx.vin[input].assetIssuance.nInflationKeys.IsNull();
+            case 10: return tx.vin[input].assetIssuance.nInflationKeys.IsExplicit();
+            case 11: ++input; return 1;
+            case 12: return output_witness < tx.witness.vtxoutwit.size();
+            case 13: return tx.witness.vtxoutwit[output_witness].vchRangeproof.empty();
+            case 14: return tx.witness.vtxoutwit[output_witness].vchSurjectionproof.empty();
+            case 15: ++output_witness; return 1;
+            case 16: return input_witness < tx.witness.vtxinwit.size();
+            case 17: return tx.witness.vtxinwit[input_witness].vchIssuanceAmountRangeproof.empty();
+            case 18: return tx.witness.vtxinwit[input_witness].vchInflationKeysRangeproof.empty();
+            default: ++input_witness; return 1;
+            }
+        })==0;
 }
 
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
@@ -215,24 +224,24 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
 
 bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, CAmountMap& fee_map, std::set<std::pair<uint256, COutPoint>>& setPeginsSpent, std::vector<CCheck*> *pvChecks, const bool cacheStore, bool fScriptChecks, const std::vector<std::pair<CScript, CScript>>& fedpegscripts)
 {
-    if (g_con_elementsmode) {
-        for (const CTxIn& input : tx.vin) {
-            if (!input.m_is_pegin && ecx::IsExchangeStateInternalOutpoint(input.prevout)) {
-                return state.Invalid(
-                    TxValidationResult::TX_CONSENSUS,
-                    "bad-ecx-internal-state-spend",
-                    "transaction attempted to spend the reserved ECX chainstate record");
-            }
-            if (!input.m_is_pegin &&
-                (drivechain::IsBmmStateInternalOutpoint(input.prevout) ||
-                 drivechain::IsCtipStateInternalOutpoint(input.prevout))) {
-                return state.Invalid(
-                    TxValidationResult::TX_CONSENSUS,
-                    "bad-drivechain-internal-state-spend",
-                    "transaction attempted to spend a reserved drivechain chainstate record");
-            }
+    size_t reserved_input{0};
+    const auto reserved = drivechain::haskell::ParentReplayStore(
+        drivechain::haskell::ReplayStoreFlow::RESERVED_INPUTS, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return g_con_elementsmode;
+        case 2: return reserved_input < tx.vin.size();
+        case 3: return tx.vin[reserved_input].m_is_pegin;
+        case 4: return ecx::IsExchangeStateInternalOutpoint(tx.vin[reserved_input].prevout);
+        case 5: return drivechain::IsBmmStateInternalOutpoint(tx.vin[reserved_input].prevout);
+        case 6: return drivechain::IsCtipStateInternalOutpoint(tx.vin[reserved_input].prevout);
+        case 7: ++reserved_input; return 1;
+        default: throw std::logic_error("Invalid Haskell reserved-input step");
         }
-    }
+    });
+    if (reserved == 1) return state.Invalid(TxValidationResult::TX_CONSENSUS,
+        "bad-ecx-internal-state-spend", "transaction attempted to spend the reserved ECX chainstate record");
+    if (reserved == 2) return state.Invalid(TxValidationResult::TX_CONSENSUS,
+        "bad-drivechain-internal-state-spend", "transaction attempted to spend a reserved drivechain chainstate record");
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
         return state.Invalid(TxValidationResult::TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent",
@@ -256,9 +265,9 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                 }
                 return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-pegin-witness", err);
             }
-            if (IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, prevout)) {
-                const bool native_deposit = tx.witness.vtxinwit[i].m_pegin_witness.stack.size() == 8;
-                if (native_deposit ? !CheckDrivechainDepositOutputs(tx, i, err)
+            CAmount deposit_value;
+            if (const auto kind = DepositWitnessKind(tx.witness.vtxinwit[i].m_pegin_witness, prevout, 0, deposit_value)) {
+                if (kind == 2 ? !CheckDrivechainDepositOutputs(tx, i, err)
                                    : !drivechain::VerifyDeterministicDeposit(tx, i, inputs, err)) {
                     return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-drivechain-deposit", err);
                 }

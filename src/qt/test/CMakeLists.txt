@@ -26,6 +26,13 @@ target_link_libraries(test_elements-qt
 import_plugins(test_elements-qt)
 
 if(ENABLE_WALLET)
+  add_executable(test_issue_dialog issueassetdialogtests.cpp)
+  target_link_libraries(test_issue_dialog
+    core_interface bitcoinqt test_util bitcoin_node Boost::headers Qt5::Test)
+  import_plugins(test_issue_dialog)
+  add_test(NAME test_issue_dialog COMMAND test_issue_dialog)
+  set_tests_properties(test_issue_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=minimal" TIMEOUT 30)
   target_sources(test_elements-qt
     PRIVATE
       addressbooktests.cpp
@@ -43,6 +50,10 @@ if(WIN32 AND VCPKG_TARGET_TRIPLET)
   set_tests_properties(test_elements-qt PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=windows"
   )
+  if(TARGET test_issue_dialog)
+    set_tests_properties(test_issue_dialog PROPERTIES
+      ENVIRONMENT "QT_QPA_PLATFORM=windows")
+  endif()
 endif()
 
 install_binary_component(test_elements-qt)

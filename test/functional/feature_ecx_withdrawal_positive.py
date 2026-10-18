@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Elements Core developers
 # Distributed under the MIT software license.
-"""Bind a real drivechain withdrawal to an activated ECX header checkpoint."""
+"""Bind a real drivechain withdrawal to an activated ECX header checkpoint.
+
+Requires grpcio, protobuf, protoc, bash, and openssl. The local mTLS server uses
+the pinned enforcer schema but mocks L1 acceptance, not real miner votes or payout.
+"""
 
 import base64
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import threading
 
 from feature_fedpeg import FedPegTest, get_new_unconfidential_address
+from test_framework.test_framework import SkipTest
 from test_framework.util import assert_equal
+from test_framework.enforcer_protocol import load_protocol
 
 
 STATE_ADDRESS = "ert1p2zffkaxp5py4fdutfdsrt6t6tcrc5ks09rkfd428hlhf4n5q8tqq9w2238"
@@ -59,25 +68,34 @@ class EcxWithdrawalPositiveTest(FedPegTest):
     def set_test_params(self):
         super().set_test_params()
 
+    def skip_test_if_missing_module(self):
+        super().skip_test_if_missing_module()
+        if not all(shutil.which(tool) for tool in ("bash", "openssl", "protoc")):
+            raise SkipTest("Mutual-TLS fixture requires bash, openssl, and protoc")
+        # Children exec node binaries; none may use the parent's gRPC runtime.
+        os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
+        try:
+            import grpc
+            import google.protobuf
+        except ImportError as error:
+            raise SkipTest("Mutual-TLS fixture requires grpcio and protobuf") from error
+
     def setup_network(self, split=False):
+        import grpc
+        from google.protobuf import json_format
+
+        self.tls_dir = Path(self.options.tmpdir) / "enforcer-tls"
+        generator = Path(__file__).resolve().parents[2] / "contrib/drivechain-mtls/generate-certs.sh"
+        subprocess.run(["bash", str(generator), str(self.tls_dir)], check=True, capture_output=True)
+        messages = load_protocol(self.tls_dir)
         self.mock_state_path = os.path.join(self.options.tmpdir, "mock-enforcer-state.json")
         state_path = self.mock_state_path
         state_lock = threading.Lock()
 
-        class MockConnectHandler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def do_POST(self):
-                assert_equal(self.headers.get("Content-Type"), "application/json")
-                assert_equal(self.headers.get("Accept"), "application/json")
-                assert_equal(self.headers.get("Connect-Protocol-Version"), "1")
-                content_length = int(self.headers.get("Content-Length", "0"))
-                if content_length <= 0 or content_length > 1024 * 1024:
-                    self.send_error(413)
-                    return
-                payload = json.loads(self.rfile.read(content_length))
-                method = self.path.lstrip("/")
-
+        def handler(method, request_type, response_type):
+            def invoke(request, context):
+                assert_equal(context.auth_context()["x509_common_name"], [b"elements-client"])
+                payload = json_format.MessageToDict(request)
                 with state_lock:
                     state = {"calls": []}
                     if os.path.exists(state_path):
@@ -90,11 +108,10 @@ class EcxWithdrawalPositiveTest(FedPegTest):
                         assert_equal(wire[4:6], b"\x00\x01")
                         no_witness = wire[:4] + wire[6:]
                         state["m6_consensus_hex"] = sha256d(no_witness).hex()
-                        response = {"accepted": True, "mock_scope": "l1-acceptance-only"}
+                        response = {}
                     elif method.endswith("/GetTwoWayPegData"):
                         if "m6_consensus_hex" not in state:
-                            self.send_error(409)
-                            return
+                            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "No submitted bundle")
                         response = {
                             "blocks": [{
                                 "blockInfo": {
@@ -108,31 +125,39 @@ class EcxWithdrawalPositiveTest(FedPegTest):
                             }]
                         }
                     else:
-                        self.send_error(404)
-                        return
+                        context.abort(grpc.StatusCode.UNIMPLEMENTED, method)
 
                     with open(state_path, "w", encoding="utf-8") as state_file:
                         json.dump(state, state_file, sort_keys=True)
 
-                response_bytes = json.dumps(response, sort_keys=True).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(response_bytes)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(response_bytes)
+                return json_format.ParseDict(response, response_type())
+            return grpc.unary_unary_rpc_method_handler(
+                invoke, request_deserializer=request_type.FromString,
+                response_serializer=response_type.SerializeToString)
 
-            def log_message(self, _format, *_args):
+        self.mock_executor = ThreadPoolExecutor(max_workers=2)
+        self.mock_enforcer = grpc.server(self.mock_executor, options=[
+            ("grpc.max_receive_message_length", 1024 * 1024)])
+        for service, method in (("WalletService", "BroadcastWithdrawalBundle"),
+                                ("ValidatorService", "GetTwoWayPegData")):
+            full_name = "cusf.mainchain.v1." + service
+            self.mock_enforcer.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+                full_name, {method: handler(full_name + "/" + method, *messages(service, method))}),))
+        credentials = grpc.ssl_server_credentials(
+            [((self.tls_dir / "server-key.pem").read_bytes(), (self.tls_dir / "server.pem").read_bytes())],
+            root_certificates=(self.tls_dir / "ca.pem").read_bytes(), require_client_auth=True)
+        port = self.mock_enforcer.add_secure_port("127.0.0.1:0", credentials)
+        assert port > 0
+        self.mock_enforcer_address = f"127.0.0.1:{port}"
+        self.mock_enforcer.start()
+        with grpc.secure_channel(self.mock_enforcer_address, grpc.ssl_channel_credentials(
+                root_certificates=(self.tls_dir / "ca.pem").read_bytes())) as channel:
+            try:
+                channel.unary_unary("/cusf.mainchain.v1.ValidatorService/GetTwoWayPegData")(b"", timeout=1)
+            except grpc.RpcError:
                 pass
-
-        self.mock_enforcer = ThreadingHTTPServer(("127.0.0.1", 0), MockConnectHandler)
-        self.mock_enforcer_thread = threading.Thread(
-            target=self.mock_enforcer.serve_forever,
-            name="mock-connect-enforcer",
-            daemon=True,
-        )
-        self.mock_enforcer_thread.start()
-        self.mock_enforcer_address = "%s:%d" % self.mock_enforcer.server_address
+            else:
+                raise AssertionError("enforcer accepted a client without an mTLS certificate")
         super().setup_network(split)
 
     def shutdown(self):
@@ -140,9 +165,9 @@ class EcxWithdrawalPositiveTest(FedPegTest):
             return super().shutdown()
         finally:
             if hasattr(self, "mock_enforcer"):
-                self.mock_enforcer.shutdown()
-                self.mock_enforcer.server_close()
-                self.mock_enforcer_thread.join(timeout=5)
+                self.mock_enforcer.stop(0).wait()
+            if hasattr(self, "mock_executor"):
+                self.mock_executor.shutdown(wait=True)
 
     def sidechain_extra_args(self, node_index):
         return [
@@ -157,6 +182,9 @@ class EcxWithdrawalPositiveTest(FedPegTest):
             "-ecxcollateralvaultscripthash=fe71d55db3b84e12e09fec4a925b73bd98465de02a2ecc58bc4c6596f36ac126",
             "-drivechainl1blocksync=0",
             f"-drivechainbmmgrpcaddr={self.mock_enforcer_address}",
+            f"-drivechainbmmgrpcca={self.tls_dir / 'ca.pem'}",
+            f"-drivechainbmmgrpccert={self.tls_dir / 'elements-client.pem'}",
+            f"-drivechainbmmgrpckey={self.tls_dir / 'elements-client-key.pem'}",
         ]
 
     def sidechain_initial_free_coins(self, node_index):
@@ -191,11 +219,7 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         assert_equal(sidechain.getrawmempool(), [state_txid])
         assert_equal(sidechain.getblockcount(), 0)
         self.stop_node(2)
-        os.remove(os.path.join(
-            self.nodes[2].datadir,
-            self.chain,
-            "ecx_consensus.dat",
-        ))
+        (sidechain.chain_path / "ecx_consensus.dat").unlink()
         replacement_args = []
         for argument in self.nodes[2].extra_args:
             if argument.startswith((
@@ -246,7 +270,7 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         assert_equal(pegout["l1_event_verification"]["event_status"], "submitted")
         assert_equal(
             pegout["broadcast_response"],
-            {"accepted": True, "mock_scope": "l1-acceptance-only"},
+            {},  # The official BroadcastWithdrawalBundleResponse is empty.
         )
 
         wire = bytes.fromhex(pegout["withdrawal_bundle_hex"])
@@ -293,6 +317,22 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         assert_equal(committed["withdrawalbundlehash"], pegout["m6id"])
         assert_equal(committed["exchangestateroot"], state_root)
         assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 1)
+        committed_hash = sidechain.getbestblockhash()
+        self.restart_node(2, extra_args=replacement_args)
+        sidechain = self.nodes[2]
+        assert_equal(sidechain.getbestblockhash(), committed_hash)
+        restored = sidechain.getblock(committed_hash)
+        assert_equal(restored["withdrawalbundlehash"], pegout["m6id"])
+        assert_equal(restored["exchangestateroot"], state_root)
+        assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 1)
+        # A new template must use the restored in-memory bundle, not merely
+        # return the persisted header of the block loaded from disk.
+        self.generatetoaddress(
+            sidechain, 1, sidechain.getnewaddress(), sync_fun=self.no_op)
+        successor = sidechain.getblock(sidechain.getbestblockhash())
+        assert_equal(successor["previousblockhash"], committed_hash)
+        assert_equal(successor["withdrawalbundlehash"], pegout["m6id"])
+        assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 2)
 
 
 if __name__ == "__main__":

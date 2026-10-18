@@ -16,46 +16,6 @@ const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 
-/** A class that deserializes a single CTransaction one time. */
-class TxInputStream
-{
-public:
-    TxInputStream(const unsigned char *txTo, size_t txToLen) :
-    m_data(txTo),
-    m_remaining(txToLen)
-    {}
-
-    void read(Span<std::byte> dst)
-    {
-        if (dst.size() > m_remaining) {
-            throw std::ios_base::failure(std::string(__func__) + ": end of data");
-        }
-
-        if (dst.data() == nullptr) {
-            throw std::ios_base::failure(std::string(__func__) + ": bad destination buffer");
-        }
-
-        if (m_data == nullptr) {
-            throw std::ios_base::failure(std::string(__func__) + ": bad source buffer");
-        }
-
-        memcpy(dst.data(), m_data, dst.size());
-        m_remaining -= dst.size();
-        m_data += dst.size();
-    }
-
-    template<typename T>
-    TxInputStream& operator>>(T&& obj)
-    {
-        ::Unserialize(*this, obj);
-        return *this;
-    }
-
-private:
-    const unsigned char* m_data;
-    size_t m_remaining;
-};
-
 inline int set_error(bitcoinconsensus_error* ret, bitcoinconsensus_error serror)
 {
     if (ret)
@@ -80,7 +40,8 @@ static int verify_script(const unsigned char *hash_genesis_block,
         return set_error(err, bitcoinconsensus_ERR_INVALID_FLAGS);
     }
     try {
-        TxInputStream stream( txTo, txToLen);
+        if (!txTo) return set_error(err, bitcoinconsensus_ERR_TX_DESERIALIZE);
+        SpanReader stream{Span{txTo, txToLen}};
         CTransaction tx(deserialize, TX_WITH_WITNESS, stream);
         if (nIn >= tx.vin.size())
             return set_error(err, bitcoinconsensus_ERR_TX_INDEX);
@@ -107,7 +68,8 @@ int bitcoinconsensus_verify_script_with_amount(const unsigned char *hash_genesis
                                     unsigned int nIn, unsigned int flags, bitcoinconsensus_error* err)
 {
     try {
-        TxInputStream stream( amount, amountLen);
+        if (!amount) return set_error(err, bitcoinconsensus_ERR_TX_DESERIALIZE);
+        SpanReader stream{Span{amount, amountLen}};
         CConfidentialValue am;
         stream >> am;
 

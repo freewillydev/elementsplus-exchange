@@ -53,6 +53,11 @@ class StandardRegtestEcxIsolationTest(BitcoinTestFramework):
         # These calls deliberately use otherwise-invalid arguments. The exact
         # mode error proves the guard runs before wallet mutation, input
         # interpretation, block scans, or an enforcer/parent-chain request.
+        wallets = node.listwallets()
+        for wallet in wallets:
+            node.unloadwallet(wallet)
+        assert_equal(node.listwallets(), [])
+        wallet_directory = node.listwalletdir()
         assert_raises_rpc_error(
             -1,
             "sendtomainchain is unavailable outside an Elements parent-chain configuration",
@@ -85,11 +90,25 @@ class StandardRegtestEcxIsolationTest(BitcoinTestFramework):
             "ECX consensus context is unavailable outside an Elements-mode chain",
             node.getecxconsensuscontext,
         )
+        assert_equal(node.listwallets(), [])
+        assert_equal(node.listwalletdir(), wallet_directory)
+        for wallet in wallets:
+            node.loadwallet(wallet)
+        assert_equal(sorted(node.listwallets()), sorted(wallets))
 
         with open(node.debug_log_path, encoding="utf-8") as debug_log:
             assert "Starting drivechain L1 block sync thread" not in debug_log.read()
 
         self.stop_node(0)
+        # Bidder options must fail during startup on an ordinary network, even
+        # when their values would be valid on a native drivechain network.
+        for option in ("drivechainbmmslot=24", "drivechainbmmbid=1000"):
+            name = option.split("=", 1)[0]
+            node.assert_start_raises_init_error(
+                extra_args=[f"-{option}"],
+                expected_msg=f"-{name} may only be used on a native drivechain network",
+                match=ErrorMatch.PARTIAL_REGEX,
+            )
         node.assert_start_raises_init_error(
             extra_args=["-con_elementsmode=1"],
             expected_msg="-con_elementsmode is not supported with -chain=regtest",
@@ -105,6 +124,19 @@ class StandardRegtestEcxIsolationTest(BitcoinTestFramework):
             expected_msg="the dynafed deployment is not supported with -chain=regtest",
             match=ErrorMatch.PARTIAL_REGEX,
         )
+        self.start_node(0)
+        assert_equal(node.getbestblockhash(), genesis)
+        assert_equal(node.getblockheader(genesis, False), header_hex)
+        with open(node.debug_log_path, encoding="utf-8") as debug_log:
+            assert "Starting drivechain L1 block sync thread" not in debug_log.read()
+        # Ordinary PoW generation shares its nonce search with the drivechain
+        # producer, but must still produce only standard Bitcoin headers.
+        mined = self.generatetoaddress(node, 1, node.getnewaddress())[0]
+        assert_equal(len(node.getblockheader(mined, False)), 160)
+        assert node.verifychain(4, 0)
+        self.restart_node(0)
+        assert_equal(node.getblockcount(), 1)
+        assert_equal(node.getbestblockhash(), mined)
 
 
 if __name__ == "__main__":

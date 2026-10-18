@@ -4,8 +4,9 @@
 
 #include <node/drivechain_withdrawal_journal.h>
 
-#include <consensus/consensus.h>
 #include <hash.h>
+#include <haskell/bridge.h>
+#include <haskell/journal_constants.h>
 #include <logging.h>
 #include <random.h>
 #include <streams.h>
@@ -13,63 +14,37 @@
 #include <util/fs_helpers.h>
 
 #include <cstdio>
+#include <algorithm>
 
 namespace node {
 
 namespace {
 //! File name of the journal inside the network data directory.
-const char* const JOURNAL_FILENAME{"drivechain_withdrawal.dat"};
+const char* const JOURNAL_FILENAME{drivechain::WITHDRAWAL_JOURNAL_FILENAME};
 
 //! Distinguishes this file from any other serialized blob if one is ever
 //! pointed at the wrong path.
-const std::string JOURNAL_MAGIC{"ELEMENTS_DRIVECHAIN_WITHDRAWAL_JOURNAL_V1"};
+const std::string JOURNAL_MAGIC{drivechain::WITHDRAWAL_JOURNAL_MAGIC};
 
 bool ValidJournalEntry(const WithdrawalJournalEntry& entry, std::string& error)
 {
-    if (entry.version != 1) {
-        error = strprintf("unsupported journal version %d", entry.version);
-        return false;
-    }
-    if (entry.state > static_cast<uint8_t>(WithdrawalJournalState::FAILED)) {
-        error = strprintf("unknown journal state %d", entry.state);
-        return false;
-    }
-    if (entry.m6id.IsNull() || entry.sidechain_txid.IsNull()) {
-        error = "journal contains a null M6 or sidechain transaction id";
-        return false;
-    }
-    if (entry.amount <= 0 || !MoneyRange(entry.amount) ||
-        entry.mainchain_fee <= 0 || entry.mainchain_fee >= entry.amount ||
-        !MoneyRange(entry.mainchain_fee)) {
-        error = "journal amount or mainchain fee is out of range";
-        return false;
-    }
-    if (entry.sidechain_slot < 0 || entry.sidechain_slot > 255 ||
-        entry.destination.empty() || entry.payout_script.empty() ||
-        entry.payout_script.IsUnspendable() || entry.bundle_bytes.empty()) {
-        error = "journal identity, destination, payout script, or bundle is invalid";
-        return false;
-    }
-    if (entry.created_time <= 0) {
-        error = "journal creation time is invalid";
-        return false;
-    }
-    if (entry.bundle_bytes.size() < 7 || entry.bundle_bytes[4] != 0 ||
-        entry.bundle_bytes[5] != 1) {
-        error = "journal bundle is not the expected witness-encoded M6 transaction";
-        return false;
-    }
-    std::vector<unsigned char> no_witness_bytes;
-    no_witness_bytes.reserve(entry.bundle_bytes.size() - 2);
-    no_witness_bytes.insert(
-        no_witness_bytes.end(), entry.bundle_bytes.begin(), entry.bundle_bytes.begin() + 4);
-    no_witness_bytes.insert(
-        no_witness_bytes.end(), entry.bundle_bytes.begin() + 6, entry.bundle_bytes.end());
-    if (Hash(no_witness_bytes) != entry.m6id) {
-        error = "journal M6 identity does not match its serialized bundle";
-        return false;
-    }
-    return true;
+    const uint8_t facts = (entry.m6id.IsNull() || entry.sidechain_txid.IsNull()) |
+        (entry.destination.empty() << 1) | (entry.payout_script.empty() << 2) |
+        (entry.payout_script.IsUnspendable() << 3) | (entry.bundle_bytes.empty() << 4);
+    std::array<unsigned char,7> prefix{};
+    const auto prefix_size = std::min(prefix.size(), entry.bundle_bytes.size());
+    std::copy_n(entry.bundle_bytes.begin(), prefix_size, prefix.begin());
+    DataStream request;
+    request << entry.version << entry.state << entry.amount << entry.mainchain_fee
+            << entry.sidechain_slot << entry.created_time << facts << uint8_t(prefix_size) << prefix;
+    std::vector<unsigned char> ignored;
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::JOURNAL_ADMISSION,
+            {reinterpret_cast<const unsigned char*>(request.data()), request.size()}, ignored, &error)) return false;
+    const auto no_witness_bytes = drivechain::haskell::WithdrawalTransport(entry.bundle_bytes, true);
+    DataStream identity;
+    identity << Hash(no_witness_bytes) << entry.m6id;
+    return drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::JOURNAL_IDENTITY,
+        {reinterpret_cast<const unsigned char*>(identity.data()), identity.size()}, ignored, &error);
 }
 } // namespace
 
@@ -90,7 +65,7 @@ bool WriteWithdrawalJournal(const fs::path& data_dir, const WithdrawalJournalEnt
 
     uint16_t randv{0};
     GetRandBytes(Span{reinterpret_cast<unsigned char*>(&randv), sizeof(randv)});
-    const fs::path path_tmp = data_dir / fs::PathFromString(strprintf("drivechain_withdrawal.dat.%04x", randv));
+    const fs::path path_tmp = data_dir / fs::PathFromString(strprintf("%s.%04x", JOURNAL_FILENAME, randv));
 
     try {
         HashWriter hasher;
@@ -99,31 +74,29 @@ bool WriteWithdrawalJournal(const fs::path& data_dir, const WithdrawalJournalEnt
 
         FILE* file = fsbridge::fopen(path_tmp, "wb");
         AutoFile fileout{file};
-        if (fileout.IsNull()) {
-            fileout.fclose();
-            fs::remove(path_tmp);
-            LogPrintf("%s: failed to open %s\n", __func__, fs::PathToString(path_tmp));
-            return false;
-        }
-
-        fileout << JOURNAL_MAGIC << entry << checksum;
-
-        // The entire point of this file is that it survives a crash, so the
-        // data must be on stable storage before we return and let the caller
-        // spend anything.
-        if (!fileout.Commit()) {
-            fileout.fclose();
-            fs::remove(path_tmp);
-            LogPrintf("%s: failed to flush %s\n", __func__, fs::PathToString(path_tmp));
-            return false;
-        }
-        fileout.fclose();
-
-        if (!RenameOver(path_tmp, path)) {
-            fs::remove(path_tmp);
-            LogPrintf("%s: rename into place failed for %s\n", __func__, fs::PathToString(path));
-            return false;
-        }
+        const char* function = __func__;
+        if (!drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_JOURNAL_WRITE,
+            [&](uint32_t action) -> uint32_t {
+            switch (action) {
+            case 1: return !fileout.IsNull();
+            case 3: fileout << JOURNAL_MAGIC << entry << checksum; break;
+            case 4: return fileout.Commit();
+            case 6: fileout.fclose(); break;
+            case 7: return RenameOver(path_tmp, path);
+            case 2:
+            case 5:
+            case 8:
+                if (action != 8) fileout.fclose();
+                fs::remove(path_tmp);
+                LogPrintf("%s: %s %s\n", function,
+                    action == 2 ? "failed to open" : action == 5 ? "failed to flush" : "rename into place failed for",
+                    fs::PathToString(action == 8 ? path : path_tmp));
+                break;
+            default: throw std::logic_error("Invalid Haskell withdrawal journal write action");
+            }
+            return 1;
+        })) return false;
     } catch (const std::exception& e) {
         fs::remove(path_tmp);
         LogPrintf("%s: serialization error: %s\n", __func__, e.what());
@@ -151,41 +124,42 @@ WithdrawalJournalReadResult ReadWithdrawalJournal(
     try {
         FILE* file = fsbridge::fopen(path, "rb");
         AutoFile filein{file};
-        if (filein.IsNull()) {
-            const std::string message = strprintf("failed to open %s", fs::PathToString(path));
-            if (error) *error = message;
-            LogPrintf("%s: %s\n", __func__, message);
-            return WithdrawalJournalReadResult::CORRUPT;
-        }
-
         std::string magic;
         WithdrawalJournalEntry parsed;
         uint256 checksum;
-        filein >> magic >> parsed >> checksum;
-
-        if (magic != JOURNAL_MAGIC) {
-            const std::string message = strprintf("%s is not a withdrawal journal", fs::PathToString(path));
-            if (error) *error = message;
-            LogPrintf("%s: %s\n", __func__, message);
-            return WithdrawalJournalReadResult::CORRUPT;
-        }
-
-        HashWriter hasher;
-        hasher << JOURNAL_MAGIC << parsed;
-        if (hasher.GetHash() != checksum) {
-            const std::string message = strprintf("checksum mismatch in %s", fs::PathToString(path));
-            if (error) *error = message;
-            LogPrintf("%s: %s; refusing to act on it\n", __func__, message);
-            return WithdrawalJournalReadResult::CORRUPT;
-        }
         std::string validation_error;
-        if (!ValidJournalEntry(parsed, validation_error)) {
-            if (error) *error = validation_error;
-            LogPrintf("%s: invalid journal %s: %s\n", __func__, fs::PathToString(path), validation_error);
-            return WithdrawalJournalReadResult::CORRUPT;
-        }
-        entry = std::move(parsed);
-        return WithdrawalJournalReadResult::OK;
+        const char* function = __func__;
+        const auto accepted = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_JOURNAL_READ,
+            [&](uint32_t action) -> uint32_t {
+            switch (action) {
+            case 1: return !filein.IsNull();
+            case 3: filein >> magic >> parsed >> checksum; break;
+            case 4: return magic == JOURNAL_MAGIC;
+            case 6: {
+                HashWriter hasher;
+                hasher << JOURNAL_MAGIC << parsed;
+                return hasher.GetHash() == checksum;
+            }
+            case 8: return ValidJournalEntry(parsed, validation_error);
+            case 10: entry = std::move(parsed); break;
+            case 2:
+            case 5:
+            case 7:
+            case 9: {
+                const auto message = action == 2 ? strprintf("failed to open %s", fs::PathToString(path)) :
+                    action == 5 ? strprintf("%s is not a withdrawal journal", fs::PathToString(path)) :
+                    action == 7 ? strprintf("checksum mismatch in %s", fs::PathToString(path)) : validation_error;
+                if (error) *error = message;
+                if (action == 9) LogPrintf("%s: invalid journal %s: %s\n", function, fs::PathToString(path), message);
+                else LogPrintf("%s: %s%s\n", function, message, action == 7 ? "; refusing to act on it" : "");
+                break;
+            }
+            default: throw std::logic_error("Invalid Haskell withdrawal journal read action");
+            }
+            return 1;
+        });
+        return accepted ? WithdrawalJournalReadResult::OK : WithdrawalJournalReadResult::CORRUPT;
     } catch (const std::exception& e) {
         const std::string message = strprintf("failed to read %s: %s", fs::PathToString(path), e.what());
         if (error) *error = message;
@@ -197,15 +171,20 @@ WithdrawalJournalReadResult ReadWithdrawalJournal(
 bool ClearWithdrawalJournal(const fs::path& data_dir)
 {
     const fs::path path = WithdrawalJournalPath(data_dir);
-    if (!fs::exists(path)) return true;
     std::error_code ec;
-    fs::remove(path, ec);
-    if (ec) {
-        LogPrintf("%s: failed to remove %s: %s\n", __func__, fs::PathToString(path), ec.message());
-        return false;
-    }
-    DirectoryCommit(data_dir);
-    return true;
+    const char* function = __func__;
+    return drivechain::haskell::ParentReplayStore(
+        drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_JOURNAL_CLEAR,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return fs::exists(path);
+        case 2: fs::remove(path, ec); return !ec;
+        case 3: LogPrintf("%s: failed to remove %s: %s\n", function, fs::PathToString(path), ec.message()); break;
+        case 4: DirectoryCommit(data_dir); break;
+        default: throw std::logic_error("Invalid Haskell withdrawal journal clear action");
+        }
+        return 1;
+    });
 }
 
 } // namespace node

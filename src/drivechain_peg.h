@@ -6,12 +6,14 @@
 #define BITCOIN_DRIVECHAIN_PEG_H
 
 #include <consensus/amount.h>
+#include <haskell/bmm_constants.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include <univalue.h>
@@ -19,12 +21,18 @@
 class CCoinsViewCache;
 
 namespace drivechain {
+namespace haskell { enum class EventLayoutKind : uint32_t; }
 
-static constexpr int PEG_EVENT_SCHEMA_VERSION{1};
+void AppendEvent(UniValue& event, haskell::EventLayoutKind kind,
+    const std::function<UniValue(uint32_t)>& read = {}, uint32_t status = 0);
+
+// Prefer the non-null camel-case field, then the alias; non-objects return null.
+const UniValue& FindField(const UniValue& value, const std::string& lower_camel, const std::string& snake_case);
+bool IsHexField(const UniValue& value, size_t bytes = 0);
 
 struct DepositIdentity
 {
-    int sidechain_slot{24};
+    int sidechain_slot{DRIVECHAIN_SIDECHAIN_SLOT};
     std::string sidechain_network;
     std::string mainchain_network;
     std::string mainchain_signet_challenge;
@@ -56,12 +64,7 @@ struct CtipState
     CAmount value{0};
     int64_t sequence_number{0};
 
-    bool operator==(const CtipState& other) const
-    {
-        return outpoint == other.outpoint &&
-            value == other.value &&
-            sequence_number == other.sequence_number;
-    }
+    bool operator==(const CtipState&) const = default;
 };
 
 /** Extract reorg-safe BIP300 events committed by one Elements block. */

@@ -13,6 +13,7 @@
 #include <dbwrapper.h>
 #include <flatfile.h>
 #include <hash.h>
+#include <haskell/bridge.h>
 #include <kernel/blockmanager_opts.h>
 #include <kernel/chainparams.h>
 #include <kernel/messagestartchars.h>
@@ -40,7 +41,9 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <ranges>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace kernel {
@@ -95,28 +98,16 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (const CBlockIndex* bi : blockinfo) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, bi->GetBlockHash()), CDiskBlockIndex{bi});
-        const auto capital_key = std::make_pair(
-            DB_ECX_BOND_V2_CAPITAL, bi->GetBlockHash());
-        if (bi->ecxBondV2Capital.has_value()) {
-            batch.Write(capital_key, *bi->ecxBondV2Capital);
-        } else {
-            batch.Erase(capital_key);
-        }
-        const auto anchor_key = std::make_pair(DB_DRIVECHAIN_ANCHOR, bi->GetBlockHash());
-        if (bi->m_drivechain_anchor.has_value()) {
-            assert(bi->m_drivechain_anchor->IsSane());
-            batch.Write(anchor_key, *bi->m_drivechain_anchor);
-        } else {
-            batch.Erase(anchor_key);
-        }
-        const auto accumulator_key =
-            std::make_pair(DB_USDD_WITHDRAWAL_ACCUMULATOR, bi->GetBlockHash());
-        if (bi->m_usdd_withdrawal_accumulator.has_value()) {
-            assert(bi->m_usdd_withdrawal_accumulator->IsSane());
-            batch.Write(accumulator_key, *bi->m_usdd_withdrawal_accumulator);
-        } else {
-            batch.Erase(accumulator_key);
-        }
+        const auto write_optional = [&](uint8_t prefix, const auto& value) {
+            const auto key = std::make_pair(prefix, bi->GetBlockHash());
+            if (value) batch.Write(key, *value);
+            else batch.Erase(key);
+        };
+        write_optional(DB_ECX_BOND_V2_CAPITAL, bi->ecxBondV2Capital);
+        assert(!bi->m_drivechain_anchor || bi->m_drivechain_anchor->IsSane());
+        write_optional(DB_DRIVECHAIN_ANCHOR, bi->m_drivechain_anchor);
+        assert(!bi->m_usdd_withdrawal_accumulator || bi->m_usdd_withdrawal_accumulator->IsSane());
+        write_optional(DB_USDD_WITHDRAWAL_ACCUMULATOR, bi->m_usdd_withdrawal_accumulator);
     }
     return WriteBatch(batch, true);
 }
@@ -164,6 +155,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
                 pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
                 pindexNew->hashBmmProof   = diskindex.hashBmmProof;
+                pindexNew->utreexo       = diskindex.utreexo;
                 pindexNew->hashExchangeStateRoot = diskindex.hashExchangeStateRoot;
                 pindexNew->hashForcedInboxRoot = diskindex.hashForcedInboxRoot;
                 pindexNew->hashDepositInboxRoot = diskindex.hashDepositInboxRoot;
@@ -179,32 +171,44 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nTx            = diskindex.nTx;
 
                 DrivechainAnchor drivechain_anchor;
-                if (Read(std::make_pair(DB_DRIVECHAIN_ANCHOR, pindexNew->GetBlockHash()), drivechain_anchor)) {
-                    if (!drivechain_anchor.IsSane()) {
-                        return (LogError("%s: malformed persisted drivechain anchor for %s", __func__, pindexNew->GetBlockHash().GetHex()), false);
-                    }
-                    pindexNew->m_drivechain_anchor = drivechain_anchor;
-                }
-
-                const auto accumulator_key = std::make_pair(
-                    DB_USDD_WITHDRAWAL_ACCUMULATOR, pindexNew->GetBlockHash());
+                std::pair<uint8_t,uint256> accumulator_key;
                 usdd::WithdrawalAccumulatorState accumulator;
-                if (Exists(accumulator_key)) {
-                    if (!Read(accumulator_key, accumulator) || !accumulator.IsSane()) {
-                        return (LogError("%s: malformed persisted USDD withdrawal accumulator for %s",
-                                     __func__, pindexNew->GetBlockHash().GetHex()), false);
+                const char* function = __func__;
+                if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_DERIVED,
+                    [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+                    switch (step) {
+                    case 1: return Read(std::make_pair(DB_DRIVECHAIN_ANCHOR,pindexNew->GetBlockHash()),drivechain_anchor);
+                    case 2: return drivechain_anchor.IsSane();
+                    case 3:
+                        LogError("%s: malformed persisted drivechain anchor for %s", function, pindexNew->GetBlockHash().GetHex());
+                        return 1;
+                    case 4: pindexNew->m_drivechain_anchor=drivechain_anchor; return 1;
+                    case 5:
+                        accumulator_key=std::make_pair(DB_USDD_WITHDRAWAL_ACCUMULATOR,pindexNew->GetBlockHash());
+                        return Exists(accumulator_key);
+                    case 6: return Read(accumulator_key,accumulator);
+                    case 7: return accumulator.IsSane();
+                    case 8:
+                        LogError("%s: malformed persisted USDD withdrawal accumulator for %s",
+                            function,pindexNew->GetBlockHash().GetHex());
+                        return 1;
+                    case 9:
+                        pindexNew->m_usdd_withdrawal_accumulator=accumulator;
+                        accumulator_indices.push_back(pindexNew);
+                        return 1;
+                    case 10: return pindexNew->GetBlockHash()==consensusParams.hashGenesisBlock;
+                    case 11:
+                        pindexNew->m_usdd_withdrawal_accumulator=usdd::WithdrawalAccumulatorState::Empty();
+                        accumulator_indices.push_back(pindexNew);
+                        return 1;
+                    case 12: return pindexNew->IsValid(BLOCK_VALID_SCRIPTS);
+                    case 13:
+                        LogError("%s: missing derived USDD withdrawal accumulator for validated block %s; reindex required",
+                            function,pindexNew->GetBlockHash().GetHex());
+                        return 1;
+                    default: throw std::logic_error("invalid derived index action");
                     }
-                    pindexNew->m_usdd_withdrawal_accumulator = accumulator;
-                    accumulator_indices.push_back(pindexNew);
-                } else if (pindexNew->GetBlockHash() == consensusParams.hashGenesisBlock) {
-                    pindexNew->m_usdd_withdrawal_accumulator =
-                        usdd::WithdrawalAccumulatorState::Empty();
-                    accumulator_indices.push_back(pindexNew);
-                } else if (pindexNew->IsValid(BLOCK_VALID_SCRIPTS)) {
-                    return (LogError(
-                        "%s: missing derived USDD withdrawal accumulator for validated block %s; reindex required",
-                        __func__, pindexNew->GetBlockHash().GetHex()), false);
-                }
+                }) != 0) return false;
 
                 pindexNew->proof               = diskindex.proof;
                 pindexNew->m_dynafed_params    = diskindex.m_dynafed_params;
@@ -238,55 +242,77 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
     }
 
     const auto empty_accumulator = usdd::WithdrawalAccumulatorState::Empty();
-    for (const CBlockIndex* pindex : accumulator_indices) {
-        const auto& accumulator = *pindex->m_usdd_withdrawal_accumulator;
-        if (!pindex->pprev) {
-            if (pindex->GetBlockHash() != consensusParams.hashGenesisBlock ||
-                !(accumulator == empty_accumulator)) {
-                return (LogError("%s: nonempty or misplaced genesis USDD withdrawal accumulator", __func__), false);
-            }
-            continue;
+    auto current=accumulator_indices.begin();
+    const CBlockIndex* pindex{nullptr};
+    const usdd::WithdrawalAccumulatorState* accumulator{nullptr};
+    const char* function=__func__;
+    if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_CONTINUITY,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1:
+            if (current==accumulator_indices.end()) return 0;
+            pindex=*current;
+            accumulator=&*pindex->m_usdd_withdrawal_accumulator;
+            return 1;
+        case 2: return pindex->pprev!=nullptr;
+        case 3: return pindex->GetBlockHash()==consensusParams.hashGenesisBlock;
+        case 4: return *accumulator==empty_accumulator;
+        case 5:
+            LogError("%s: nonempty or misplaced genesis USDD withdrawal accumulator",function);
+            return 1;
+        case 6: return pindex->pprev->m_usdd_withdrawal_accumulator.has_value();
+        case 7: return accumulator->count>=pindex->pprev->m_usdd_withdrawal_accumulator->count;
+        case 8: return accumulator->count==pindex->pprev->m_usdd_withdrawal_accumulator->count;
+        case 9:
+            LogError("%s: discontinuous USDD withdrawal accumulator at %s",function,pindex->GetBlockHash().GetHex());
+            return 1;
+        case 10: return *accumulator==*pindex->pprev->m_usdd_withdrawal_accumulator;
+        case 11:
+            LogError("%s: USDD withdrawal accumulator changed without an appended leaf at %s",function,pindex->GetBlockHash().GetHex());
+            return 1;
+        case 12: ++current; return 1;
+        default: throw std::logic_error("invalid index continuity action");
         }
-        if (!pindex->pprev->m_usdd_withdrawal_accumulator.has_value() ||
-            accumulator.count < pindex->pprev->m_usdd_withdrawal_accumulator->count) {
-            return (LogError("%s: discontinuous USDD withdrawal accumulator at %s",
-                         __func__, pindex->GetBlockHash().GetHex()), false);
-        }
-        const auto& previous = *pindex->pprev->m_usdd_withdrawal_accumulator;
-        if (accumulator.count == previous.count && !(accumulator == previous)) {
-            return (LogError("%s: USDD withdrawal accumulator changed without an appended leaf at %s",
-                         __func__, pindex->GetBlockHash().GetHex()), false);
-        }
-    }
+    }) != 0) return false;
 
     LogPrintf("LoadBlockIndexGuts: loaded %d total / %d untrimmed (fully in-memory) headers\n", n_total, n_untrimmed);
 
     // V2 projections are intentionally a disjoint database namespace.  This
     // permits an old V1 index to load without reinterpretation while making a
     // missing V2 projection fail closed at its RPC/activation boundary.
-    pcursor->Seek(std::make_pair(DB_ECX_BOND_V2_CAPITAL, uint256()));
     size_t capital_entries{0};
-    while (pcursor->Valid()) {
-        std::pair<uint8_t, uint256> key;
-        if (!pcursor->GetKey(key) || key.first != DB_ECX_BOND_V2_CAPITAL) break;
-        ecx::BondV2CapitalSnapshot snapshot;
-        if (!pcursor->GetValue(snapshot)) {
-            return (LogError("%s: failed to read ECX bond V2 capital projection", __func__), false);
+    std::pair<uint8_t,uint256> key;
+    std::optional<ecx::BondV2CapitalSnapshot> snapshot;
+    CBlockIndex* index{nullptr};
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_CAPITAL,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: pcursor->Seek(std::make_pair(DB_ECX_BOND_V2_CAPITAL,uint256())); return 1;
+        case 2: return pcursor->Valid();
+        case 3: key={}; return pcursor->GetKey(key);
+        case 4: return key.first==DB_ECX_BOND_V2_CAPITAL;
+        case 5: return pcursor->GetValue(snapshot.emplace());
+        case 6:
+            LogError("%s: failed to read ECX bond V2 capital projection",function);
+            return 1;
+        case 7: index=insertBlockIndex(key.second); return index!=nullptr;
+        case 8: return index->GetBlockHash()==key.second;
+        case 9: return snapshot->exchange_state_root==index->hashExchangeStateRoot;
+        case 10:
+            LogError("%s: ECX bond V2 projection is orphaned or root-mismatched for %s",function,key.second.GetHex());
+            return 1;
+        case 11:
+            index->ecxBondV2Capital=std::move(*snapshot);
+            ++capital_entries;
+            pcursor->Next();
+            snapshot.reset();
+            return 1;
+        case 12:
+            LogPrintf("LoadBlockIndexGuts: loaded %u ECX bond V2 capital projections\n",static_cast<unsigned int>(capital_entries));
+            return 1;
+        default: throw std::logic_error("invalid capital index action");
         }
-        CBlockIndex* index{insertBlockIndex(key.second)};
-        if (!index || index->GetBlockHash() != key.second ||
-            snapshot.exchange_state_root != index->hashExchangeStateRoot) {
-            return (LogError(
-                "%s: ECX bond V2 projection is orphaned or root-mismatched for %s",
-                __func__, key.second.GetHex()), false);
-        }
-        index->ecxBondV2Capital = std::move(snapshot);
-        ++capital_entries;
-        pcursor->Next();
-    }
-    LogPrintf("LoadBlockIndexGuts: loaded %u ECX bond V2 capital projections\n",
-        static_cast<unsigned int>(capital_entries));
-    return true;
+    })==0;
 }
 
 // ELEMENTS
@@ -330,6 +356,7 @@ const CBlockIndex *BlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTri
     pindexNew->hashMerkleRoot = pindexTrimmed->hashMerkleRoot;
     pindexNew->hashWithdrawalBundle = pindexTrimmed->hashWithdrawalBundle;
     pindexNew->hashBmmProof   = pindexTrimmed->hashBmmProof;
+    pindexNew->utreexo       = pindexTrimmed->utreexo;
     pindexNew->hashExchangeStateRoot = pindexTrimmed->hashExchangeStateRoot;
     pindexNew->hashForcedInboxRoot = pindexTrimmed->hashForcedInboxRoot;
     pindexNew->hashDepositInboxRoot = pindexTrimmed->hashDepositInboxRoot;
@@ -443,8 +470,8 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
     pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
-    if (update_best_header &&
-        (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork)) {
+    if (drivechain::haskell::ParentReplayAll<2>({[&] { return update_best_header; },
+        [&] { return best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork; }})) {
         best_header = pindexNew;
     }
 

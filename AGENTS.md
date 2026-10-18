@@ -1,0 +1,17 @@
+# Haskell operation design
+
+- Migrate only behavior added by this fork relative to the original upstream baseline. Keep inherited Elements/Bitcoin behavior in C++; in mixed functions, extract only fork-added behavior and retain minimal native FFI wiring. A file being modified by the fork does not make its inherited contents migration scope.
+
+- Prefer the shared `operation-capabilities` design whenever it simplifies operation dispatch or multi-step behavior. Reuse the library rather than copy its framework.
+- Keep `Operation op caps | op -> caps`, unique declared capability lists, and the same capability constraints on existential payloads. Preserve the existing `interpret` API.
+- Put concrete behavior in focused capability classes and their instances. Prove payload equality with `eqT`/`Refl` before inspecting the associated DSL GADT, preserving lazy payload mismatches. Then discover the selected index's constraints and call their methods or compose them through a generic capability-constrained helper.
+- Helpers should require only the capabilities they use, not `Operation` or `Typeable` unless genuinely necessary. Reuse helpers across payloads where useful; keep the interpreter focused on dispatch rather than embedding every concrete behavior.
+- Where it removes duplicated orchestration, give capability classes associated input, plan, or output types and carry the required class/equality constraints in the DSL constructor. After payload `Refl`, compose those methods with branching or return a deferred function over the associated input. Keep runtime information in explicit values; a constraint dictionary is not evidence that validation ran. Prefer abstract validated-plan types when execution requires prior validation. Do not add type families or extra capability parameters when the existing payload and input already suffice or the change only increases code.
+- Keep operations uninterpreted through preparation where practical. Use explicit `Preserve`, `Restrict`, and `Expand` transitions; expansion may only restore declared capabilities. Capability visibility is an API discipline, not a security sandbox.
+- Preserve validation order, short-circuiting, error distinctions, effect ordering, transaction boundaries, and FFI lifetimes. `Nothing` denotes a dispatch mismatch (payload or index), not domain failure. Keep effects explicit in the outcome; never use unchecked casts to bypass dispatch.
+- Retain the simple `Check`/`Validation` adapter for simple rules. Do not introduce classes, existential wrappers, or pipelines solely to satisfy this preference when they add complexity.
+- Test successful dispatch, domain rejection, lazy mismatches, rejected-stage short-circuiting, and reusable orchestration; retain applicable consensus, ABI, and effect-order regression tests.
+- For custom indexed workflows, accept the unresolved TypeRep without its method dictionary. After payload Refl, resolve only registered indices via eqTypeRep/HRefl and a constraint-carrying GADT, then use its methods. Reuse Workflow.discoverRequest and the library's IndexedRequest where suitable; use domain-specific witnesses for distinct method sets. Reject unknown/same-result/wrong-kind indices without forcing inputs or running effects. A TypeRep cannot manufacture an instance, and discovering index methods must not expand the operation beyond its declared capabilities.
+
+See src/haskell/README.md and src/haskell/Withdrawal.hs for the node implementation.
+This preference does not authorize changing consensus behavior or deploying code.

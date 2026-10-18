@@ -10,7 +10,6 @@
 #include <qt/clientmodel.h>
 #include <qt/createwalletdialog.h>
 #include <qt/issueassetdialog.h>
-#include <qt/lwkwalletdialog.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
@@ -277,9 +276,6 @@ void BitcoinGUI::createActions()
     issueAssetAction->setToolTip(issueAssetAction->statusTip());
     // not a main tab
 
-    lwkWalletAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("L&WK Wallet..."), this);
-    lwkWalletAction->setStatusTip(tr("Open the LWK wallet dialog"));
-    lwkWalletAction->setToolTip(lwkWalletAction->statusTip());
 
     historyAction = new QAction(platformStyle->SingleColorIcon(":/icons/history"), tr("&Transactions"), this);
     historyAction->setStatusTip(tr("Browse transaction history"));
@@ -298,7 +294,6 @@ void BitcoinGUI::createActions()
     connect(receiveCoinsAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
     connect(receiveCoinsAction, &QAction::triggered, this, &BitcoinGUI::gotoReceiveCoinsPage);
     connect(issueAssetAction, &QAction::triggered, this, &BitcoinGUI::issueAssetClicked);
-    connect(lwkWalletAction, &QAction::triggered, this, &BitcoinGUI::lwkWalletClicked);
     connect(historyAction, &QAction::triggered, [this]{ showNormalIfMinimized(); });
     connect(historyAction, &QAction::triggered, this, &BitcoinGUI::gotoHistoryPage);
 #endif // ENABLE_WALLET
@@ -521,7 +516,6 @@ void BitcoinGUI::createMenuBar()
         file->addAction(signMessageAction);
         file->addAction(verifyMessageAction);
         file->addAction(issueAssetAction);
-        file->addAction(lwkWalletAction);
         file->addAction(m_load_psbt_action);
         file->addAction(m_load_psbt_clipboard_action);
         file->addSeparator();
@@ -608,7 +602,6 @@ void BitcoinGUI::createToolBars()
         toolbar->addAction(sendCoinsAction);
         toolbar->addAction(receiveCoinsAction);
         toolbar->addAction(issueAssetAction);
-        toolbar->addAction(lwkWalletAction);
         toolbar->addAction(historyAction);
         overviewAction->setChecked(true);
 
@@ -831,7 +824,6 @@ void BitcoinGUI::setWalletActionsEnabled(bool enabled)
     sendCoinsAction->setEnabled(enabled);
     receiveCoinsAction->setEnabled(enabled);
     issueAssetAction->setEnabled(enabled);
-    lwkWalletAction->setEnabled(enabled);
     historyAction->setEnabled(enabled);
     encryptWalletAction->setEnabled(enabled);
     backupWalletAction->setEnabled(enabled);
@@ -879,7 +871,6 @@ void BitcoinGUI::createTrayIconMenu()
         send_action = trayIconMenu->addAction(sendCoinsAction->text(), sendCoinsAction, &QAction::trigger);
         receive_action = trayIconMenu->addAction(receiveCoinsAction->text(), receiveCoinsAction, &QAction::trigger);
         trayIconMenu->addAction(issueAssetAction->text(), issueAssetAction, &QAction::trigger);
-        trayIconMenu->addAction(lwkWalletAction->text(), lwkWalletAction, &QAction::trigger);
         trayIconMenu->addSeparator();
         sign_action = trayIconMenu->addAction(signMessageAction->text(), signMessageAction, &QAction::trigger);
         verify_action = trayIconMenu->addAction(verifyMessageAction->text(), verifyMessageAction, &QAction::trigger);
@@ -1021,13 +1012,6 @@ void BitcoinGUI::issueAssetClicked()
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 
-void BitcoinGUI::lwkWalletClicked()
-{
-    if (!clientModel) return;
-    showNormalIfMinimized();
-    auto dlg = new LwkWalletDialog(clientModel, this);
-    GUIUtil::ShowModalDialogAsynchronously(dlg);
-}
 #endif // ENABLE_WALLET
 
 void BitcoinGUI::updateNetworkState()

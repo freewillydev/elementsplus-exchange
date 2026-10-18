@@ -14,6 +14,7 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <pegins.h>
+#include <haskell/bridge.h>
 #include <policy/discount.h>
 #include <logging.h>
 #include <policy/policy.h>
@@ -732,14 +733,14 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
                     const CTxIn& in = tx.vin[nIn];
                     std::string err;
                     bool parent_unavailable{false};
-                    if (in.m_is_pegin &&
+                    const bool invalid = in.m_is_pegin &&
                         (!tx.HasWitness() ||
                          !IsValidPeginWitness(tx.witness.vtxinwit[nIn].m_pegin_witness,
                                               fedpegscripts, in.prevout, err,
                                               true /* check_depth */, nullptr,
                                               &parent_unavailable,
-                                              p_block_index_new->nHeight + 1)) &&
-                        !parent_unavailable) {
+                                              p_block_index_new->nHeight + 1));
+                    if (invalid && drivechain::haskell::RejectParentResult(true, parent_unavailable)) {
                         tx_to_remove.push_back(MakeTransactionRef(tx));
                         break;
                     }
@@ -865,7 +866,7 @@ void CTxMemPool::check(const CBlockIndex* active_chain_tip, const CCoinsViewCach
         // accepted Drivechain deposit cannot be reauthenticated during a
         // transient parent RPC outage. Deterministic invalidity remains an
         // assertion failure.
-        assert(inputs_valid || dummy_state.IsError());
+        assert(inputs_valid || !drivechain::haskell::RejectParentResult(true, dummy_state.IsError()));
         for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
         AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max());
     }

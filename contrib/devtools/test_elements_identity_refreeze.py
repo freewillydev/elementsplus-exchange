@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 
+import os
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
 from elements_identity_refreeze import (
-    Header, IDENTITY_HEADER, ALPHA_CHECKPOINT, assert_current_v7,
+    Header as IdentityHeader, IDENTITY_HEADER, ALPHA_CHECKPOINT, assert_current_v7,
     calculate_v11, calculate_alphanet_v11, calculate_betanet_v11,
     betanet_bootstrap_commitment, hash256, sha256, BETANET_LOCAL_RULE_DOMAIN,
     indexer_bindings,
 )
+
+
+def Header(path):
+    directory = os.environ.get("ELEMENTS_GENERATED_INCLUDE_DIR")
+    return IdentityHeader(path, Path(directory) if directory else None)
 
 CURRENT_CONTROLLER_PROGRAM_ID = "4e44d18d512d561128dae53d10bee2b36bd5390d1e4c4b72688464ea544943ec"
 CURRENT_ANCHOR_PROGRAM_ID = "518ab5707c07430e28b9eea551b83cc04e1e1fd8662db4e850288ffa483c3d68"
@@ -26,6 +33,31 @@ def replace_field(header: Header, name: str, value) -> None:
     header.text, count = re.subn(pattern, lambda m: m[1] + encoded + m[2], header.text, count=1)
     if count != 1:
         raise AssertionError(f"fixture field not found: {name}")
+
+
+class GeneratedResourceHeaderTests(unittest.TestCase):
+    def test_bootstrap_requires_explicit_directory(self):
+        with self.assertRaisesRegex(ValueError, "explicit generated include directory"):
+            IdentityHeader(Path(IDENTITY_HEADER).with_name("elements_drivechain_bootstrap.h"))
+
+    def test_missing_generated_bootstrap_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                IdentityHeader(Path(IDENTITY_HEADER).with_name("elements_drivechain_bootstrap.h"),
+                               Path(directory))
+
+    def test_current_identity_reads_generated_resources(self):
+        current = Header(IDENTITY_HEADER)
+        resources = Header(Path(IDENTITY_HEADER).parent / "haskell/resource_constants.h")
+        self.assertEqual(current.integer("USDD_SP1_ANNEX_MAX_BYTES"),
+                         resources.integer("USDD_SP1_ANNEX_MAX_BYTES"))
+
+    def test_missing_include_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "identity.h"
+            path.write_text("#include <haskell/resource_constants.h>\n", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                Header(path)
 
 
 class BetanetIdentityCandidateTests(unittest.TestCase):

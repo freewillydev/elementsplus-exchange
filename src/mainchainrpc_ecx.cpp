@@ -1,12 +1,11 @@
 #include <mainchainrpc.h>
-#include <init.h>
+#include <haskell/bridge.h>
+#include <haskell/network_defaults.h>
 
 #include <chainparams.h>
-#include <chainparamsbase.h>
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
 #include <drivechain_treasury.h>
-#include <util/fs.h>
 #include <logging.h>
 #include <pegins.h>
 #include <primitives/bitcoin/transaction.h>
@@ -15,17 +14,23 @@
 #include <script/script.h>
 #include <streams.h>
 #include <common/args.h>
-#include <util/fs_helpers.h>
 #include <util/strencodings.h>
-#include <util/translation.h>
-#include <rpc/request.h>
+#include <tinyformat.h>
 
-#include <algorithm>
-#include <array>
-#include <cctype>
-#include <fstream>
 #include <optional>
 #include <vector>
+
+namespace {
+template <typename Action>
+bool CatchParentError(std::string* error, Action&& action)
+{
+    try { return action(); }
+    catch (const std::exception& exception) {
+        if (error) *error = exception.what();
+        return false;
+    }
+}
+} // namespace
 
 bool CallAuthenticatedDrivechainJSON(
     const std::string& endpoint,
@@ -34,29 +39,50 @@ bool CallAuthenticatedDrivechainJSON(
     UniValue& response,
     std::string* error)
 {
-    response = UniValue();
-    if (error) error->clear();
-    if (endpoint != GetDrivechainGrpcAddress(gArgs)) {
-        if (error) *error = "enforcer endpoint differs from the configured mTLS endpoint";
-        return false;
-    }
-    const auto result = RunAuthenticatedDrivechainGrpc(
-        method, request.write(), std::chrono::seconds{30}, 16U * 1024U * 1024U);
-    if (!result.started || !result.exited || result.exit_code != 0 ||
-        result.timed_out || result.cancelled || result.output_truncated ||
-        !result.error.empty()) {
-        if (error) *error = result.error.empty()
-            ? "authenticated enforcer request failed, timed out, or exceeded its output limit"
-            : result.error;
-        return false;
-    }
-    if (!response.read(result.output) || !response.isObject()) {
-        response = UniValue();
-        if (error) *error = "authenticated enforcer returned non-object JSON";
-        return false;
-    }
-    return true;
+    namespace hs = drivechain::haskell;
+    std::optional<BoundedCommandResult> result;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::AUTHENTICATED_JSON, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: case 19: response = UniValue(); return 1;
+        case 2: case 5: case 15: case 20: return error != nullptr;
+        case 3: error->clear(); return 1;
+        case 4: return endpoint == GetDrivechainGrpcAddress(gArgs);
+        case 6: *error = "enforcer endpoint differs from the configured mTLS endpoint"; return 1;
+        case 7: result.emplace(RunAuthenticatedDrivechainGrpc(
+            method, request.write(), std::chrono::seconds{drivechain::AUTHENTICATED_GRPC_TIMEOUT_SECONDS},
+            drivechain::MAX_AUTHENTICATED_GRPC_RESPONSE_SIZE)); return 1;
+        case 8: return result->started;
+        case 9: return result->exited;
+        case 10: return result->exit_code == 0;
+        case 11: return !result->timed_out;
+        case 12: return !result->cancelled;
+        case 13: return !result->output_truncated;
+        case 14: return result->error.empty();
+        case 16: *error = "authenticated enforcer request failed, timed out, or exceeded its output limit"; return 1;
+        case 22: return result->error.empty();
+        case 23: *error = result->error; return 1;
+        case 17: return response.read(result->output);
+        case 18: return response.isObject();
+        case 21: *error = "authenticated enforcer returned non-object JSON"; return 1;
+        default: throw std::logic_error("invalid authenticated JSON action");
+        }
+    });
 }
+UniValue BuildDrivechainBmmRequest(int sidechain_slot, uint64_t bid_sats, int64_t parent_height,
+    const uint256& critical_hash, const uint256& previous_parent_hash)
+{
+    using Layout = drivechain::haskell::EventLayoutKind;
+    const auto object = [](Layout layout, const std::vector<UniValue>& values) {
+        UniValue result(UniValue::VOBJ);
+        drivechain::AppendEvent(result, layout, [&](uint32_t index) { return values.at(index); });
+        return result;
+    };
+    // uint64 wrapper values are strings in canonical protobuf JSON.
+    return object(Layout::BMM_REQUEST,{UniValue(sidechain_slot),UniValue(std::to_string(bid_sats)),
+        UniValue(parent_height),object(Layout::HEX,{UniValue(critical_hash.GetHex())}),
+        object(Layout::HEX,{UniValue(previous_parent_hash.GetHex())})});
+}
+
 bool SubmitDrivechainBmmBid(
     const int sidechain_slot,
     const uint64_t bid_sats,
@@ -66,94 +92,98 @@ bool SubmitDrivechainBmmBid(
     uint256& request_txid,
     std::string* error)
 {
-    try {
-        if (sidechain_slot < 0 || sidechain_slot > 255) {
-            throw std::runtime_error("BMM sidechain slot is outside uint8 range");
-        }
-        if (bid_sats == 0 || bid_sats > static_cast<uint64_t>(MAX_MONEY)) {
-            throw std::runtime_error("BMM bid must be positive and within the money range");
-        }
-        if (parent_height == 0 || critical_hash.IsNull() || previous_parent_hash.IsNull()) {
-            throw std::runtime_error("BMM bid identity is incomplete");
-        }
-
-        UniValue request(UniValue::VOBJ);
-        request.pushKV("sidechainId", sidechain_slot);
-        // uint64 wrapper values are strings in canonical protobuf JSON.
-        request.pushKV("valueSats", std::to_string(bid_sats));
-        request.pushKV("height", static_cast<uint64_t>(parent_height));
-        UniValue critical(UniValue::VOBJ);
-        critical.pushKV("hex", critical_hash.GetHex());
-        request.pushKV("criticalHash", critical);
-        UniValue previous(UniValue::VOBJ);
-        previous.pushKV("hex", previous_parent_hash.GetHex());
-        request.pushKV("prevBytes", previous);
-
+    return CatchParentError(error, [&]() -> bool {
+        namespace hs = drivechain::haskell;
         UniValue response;
-        if (!CallAuthenticatedDrivechainJSON(
+        return hs::ParentReplayAll<3>({[&] {
+        return hs::ParentReplayStore(hs::ReplayStoreFlow::BMM_BID_PREFLIGHT, [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return hs::ParentReplayRecord(hs::ReplayRecordKind::HEIGHT, 0, 0, static_cast<uint64_t>(sidechain_slot), 255);
+            case 2: throw std::runtime_error("BMM sidechain slot is outside uint8 range");
+            case 3: return hs::ParentReplayRecord(hs::ReplayRecordKind::POSITIVE, 0, 0, bid_sats, 0);
+            case 4: return !hs::ParentReplayRecord(hs::ReplayRecordKind::LESS, 0, 0, MAX_MONEY, bid_sats);
+            case 5: throw std::runtime_error("BMM bid must be positive and within the money range");
+            case 6: return hs::ParentReplayRecord(hs::ReplayRecordKind::POSITIVE, 0, 0, parent_height, 0);
+            case 7: return !critical_hash.IsNull();
+            case 8: return !previous_parent_hash.IsNull();
+            case 9: throw std::runtime_error("BMM bid identity is incomplete");
+            default: throw std::logic_error("invalid BMM bid preflight action");
+            }
+        });
+        }, [&] {
+        const UniValue request = BuildDrivechainBmmRequest(sidechain_slot,bid_sats,parent_height,critical_hash,previous_parent_hash);
+        return CallAuthenticatedDrivechainJSON(
                 GetDrivechainGrpcAddress(gArgs),
                 "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
                 request,
                 response,
-                error)) {
-            return false;
-        }
-        const UniValue& txid_value = response.get_obj()["txid"];
-        if (!txid_value.isObject()) {
-            throw std::runtime_error("BMM wallet response has no transaction id");
-        }
-        const UniValue& hex = txid_value.get_obj()["hex"];
-        if (!hex.isStr() || !IsHex(hex.get_str()) || hex.get_str().size() != 64) {
-            throw std::runtime_error("BMM wallet returned a malformed transaction id");
-        }
-        request_txid = uint256S(hex.get_str());
-        return true;
-    } catch (const std::exception& exception) {
-        if (error != nullptr) *error = exception.what();
-        return false;
-    }
+                error);
+        }, [&] {
+        const UniValue* txid_value{nullptr};
+        const UniValue* hex{nullptr};
+        return hs::ParentReplayStore(hs::ReplayStoreFlow::BMM_BID_TXID, [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: txid_value = &response.get_obj()["txid"]; return 1;
+            case 2: return txid_value->isObject();
+            case 3: throw std::runtime_error("BMM wallet response has no transaction id");
+            case 4: hex = &txid_value->get_obj()["hex"]; return 1;
+            case 5: return hex->isStr();
+            case 6: return IsHex(hex->get_str());
+            case 7: return hex->get_str().size() == drivechain::PARENT_HASH_HEX_LENGTH;
+            case 8: throw std::runtime_error("BMM wallet returned a malformed transaction id");
+            case 9: request_txid = uint256S(hex->get_str()); return 1;
+            default: throw std::logic_error("invalid BMM bid transaction id action");
+            }
+        });
+        }});
+    });
 }
 
-static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
+static UniValue CallMainChainHexRPC(const std::string& method, const UniValue& params, const char* malformed)
 {
-    const UniValue reply = CallMainChainRPC(method, params);
-    const UniValue& error = reply["error"];
-    if (!error.isNull()) {
-        throw std::runtime_error(strprintf("%s returned error: %s", method, error.write()));
-    }
-    const UniValue& result = reply["result"];
-    if (result.isNull()) {
-        throw std::runtime_error(strprintf("%s returned no result", method));
-    }
+    UniValue result = CallMainChainRPCChecked(method, params);
+    if (!drivechain::IsHexField(result)) throw std::runtime_error(malformed);
     return result;
+}
+
+static UniValue CallMainChainTransactionHex(bool proof, const std::string& txid,
+    const std::string& block_hash, const char* malformed)
+{
+    UniValue params(UniValue::VARR);
+    if (proof) {
+        UniValue txids(UniValue::VARR);
+        txids.push_back(txid);
+        params.push_back(txids);
+    } else {
+        params.push_back(txid);
+        params.push_back(false);
+    }
+    params.push_back(block_hash);
+    return CallMainChainHexRPC(proof ? "gettxoutproof" : "getrawtransaction",params,malformed);
+}
+
+static std::string CallMainChainBlockHash(int64_t height)
+{
+    UniValue params(UniValue::VARR);
+    params.push_back(height);
+    return CallMainChainRPCChecked("getblockhash", params).get_str();
 }
 
 static const UniValue& FindField(const UniValue& obj, const std::string& lower_camel, const std::string& snake_case)
 {
-    const UniValue& lower_value = obj.get_obj()[lower_camel];
-    if (!lower_value.isNull()) {
-        return lower_value;
-    }
-    return obj.get_obj()[snake_case];
+    return drivechain::FindField(obj.get_obj(), lower_camel, snake_case);
 }
 
 static bool GetDrivechainGrpcJSON(
     const std::string& method,
-    const std::string& request,
+    const UniValue& request,
     UniValue& response,
     std::string* error)
 {
-    UniValue payload;
-    if (!payload.read(request) || !payload.isObject()) {
-        if (error != nullptr) {
-            *error = "internal drivechain request is not object JSON";
-        }
-        return false;
-    }
     return CallAuthenticatedDrivechainJSON(
         GetDrivechainGrpcAddress(gArgs),
         "cusf.mainchain.v1.ValidatorService/" + method,
-        payload,
+        request,
         response,
         error);
 }
@@ -164,11 +194,12 @@ static bool GetDrivechainTwoWayPegDataAtTip(
     UniValue& response,
     std::string* error)
 {
-    try {
-        const std::string request = strprintf(
-            "{\"sidechainId\":%d,\"endBlockHash\":{\"hex\":\"%s\"}}",
-            sidechain_slot,
-            mainchain_tip.GetHex());
+    return CatchParentError(error, [&]() -> bool {
+        UniValue request(UniValue::VOBJ), block_hash(UniValue::VOBJ);
+        using Layout = drivechain::haskell::EventLayoutKind;
+        drivechain::AppendEvent(block_hash, Layout::HEX, [&](uint32_t) { return UniValue(mainchain_tip.GetHex()); });
+        drivechain::AppendEvent(request, Layout::TWO_WAY_PEG_REQUEST,
+            [&](uint32_t index) { return index == 0 ? UniValue(sidechain_slot) : block_hash; });
         if (!GetDrivechainGrpcJSON("GetTwoWayPegData", request, response, error)) {
             return false;
         }
@@ -188,52 +219,36 @@ static bool GetDrivechainTwoWayPegDataAtTip(
         }
         LogPrintf("GetTwoWayPegData returned %u blocks and %u raw events for sidechain %d\n", block_count, event_count, sidechain_slot);
         return true;
-    } catch (const std::exception& e) {
-        if (error) {
-            *error = e.what();
-        }
-        return false;
-    }
+    });
 }
 
 bool GetDrivechainTwoWayPegData(const int sidechain_slot, UniValue& response, std::string* error)
 {
-    try {
+    return CatchParentError(error, [&]() -> bool {
         UniValue no_params(UniValue::VARR);
         const uint256 mainchain_tip = uint256S(CallMainChainRPCChecked("getbestblockhash", no_params).get_str());
         return GetDrivechainTwoWayPegDataAtTip(sidechain_slot, mainchain_tip, response, error);
-    } catch (const std::exception& e) {
-        if (error) {
-            *error = e.what();
-        }
-        return false;
-    }
-}
-
-static std::string Lowercase(std::string value)
-{
-    for (char& c : value) c = std::tolower(static_cast<unsigned char>(c));
-    return value;
+    });
 }
 
 static drivechain::DepositIdentity ConfiguredDepositIdentity()
 {
     drivechain::DepositIdentity identity;
-    identity.sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
-    identity.sidechain_network = gArgs.GetArg("-drivechainsidechainnetwork", "liquid-signet");
-    identity.mainchain_network = gArgs.GetArg("-drivechainmainchainnetwork", "signet");
-    identity.mainchain_signet_challenge = Lowercase(gArgs.GetArg(
+    identity.sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", drivechain::HISTORICAL_DEPOSIT_SLOT);
+    identity.sidechain_network = gArgs.GetArg("-drivechainsidechainnetwork", drivechain::HISTORICAL_DEPOSIT_SIDECHAIN_NETWORK);
+    identity.mainchain_network = gArgs.GetArg("-drivechainmainchainnetwork", drivechain::HISTORICAL_DEPOSIT_MAINCHAIN_NETWORK);
+    identity.mainchain_signet_challenge = ToLower(gArgs.GetArg(
         "-drivechainmainchainsignetchallenge",
-        "00148835832e28c816b7acd8fdb19772ab2199603a56"));
-    identity.enforcer_network = gArgs.GetArg("-drivechainenforcernetwork", "NETWORK_SIGNET");
+        drivechain::HISTORICAL_DEPOSIT_SIGNET_CHALLENGE));
+    identity.enforcer_network = gArgs.GetArg("-drivechainenforcernetwork", drivechain::HISTORICAL_DEPOSIT_ENFORCER_NETWORK);
     identity.mainchain_genesis = Params().ParentGenesisBlockHash();
-    identity.title = gArgs.GetArg("-drivechainsidechaintitle", "Elements");
-    identity.hash_id_1 = Lowercase(gArgs.GetArg(
+    identity.title = gArgs.GetArg("-drivechainsidechaintitle", drivechain::HISTORICAL_DEPOSIT_TITLE);
+    identity.hash_id_1 = ToLower(gArgs.GetArg(
         "-drivechainsidechainhashid1",
-        "5883560531f013b9b27b2f9cfbac4f64ee5062b95ad3e21593a8f6916530b74b"));
-    identity.hash_id_2 = Lowercase(gArgs.GetArg(
+        drivechain::HISTORICAL_DEPOSIT_HASH_ID_1));
+    identity.hash_id_2 = ToLower(gArgs.GetArg(
         "-drivechainsidechainhashid2",
-        "b2b7b20f3fbc4baf50e9d39f58661c6168e279d4"));
+        drivechain::HISTORICAL_DEPOSIT_HASH_ID_2));
     return identity;
 }
 
@@ -243,60 +258,52 @@ bool VerifyDrivechainDeposit(
     drivechain::AuthenticatedDeposit* authenticated_out,
     std::string* error)
 {
-    try {
-        if (input_index >= tx.vin.size() || input_index >= tx.witness.vtxinwit.size()) {
-            throw std::runtime_error("drivechain deposit input or witness index is out of range");
-        }
-
+    return CatchParentError(error, [&]() -> bool {
+        namespace hs = drivechain::haskell;
         CAmount value{0};
         CScript claim_script;
-        uint256 mainchain_txid;
-        if (!GetDrivechainDepositPeginData(
+        uint256 mainchain_txid, mainchain_genesis, mainchain_tip;
+        UniValue mainchain_info, enforcer_chain_info, enforcer_tip, sidechains, ctip, two_way_peg_data;
+        std::optional<drivechain::DepositIdentity> identity;
+        drivechain::AuthenticatedDeposit authenticated;
+        std::string lookup_error, verify_error;
+        hs::DepositVerify(input_index, tx.vin.size(), tx.witness.vtxinwit.size(), [&](uint32_t stage) {
+        switch (stage) {
+        case 1:
+        return GetDrivechainDepositPeginData(
                 tx.witness.vtxinwit[input_index].m_pegin_witness,
                 tx.vin[input_index].prevout,
                 value,
                 claim_script,
-                mainchain_txid)) {
-            throw std::runtime_error("transaction input is not a valid drivechain deposit witness");
-        }
-
+                mainchain_txid);
+        case 2: {
         UniValue no_params(UniValue::VARR);
-        const UniValue mainchain_info = CallMainChainRPCChecked("getblockchaininfo", no_params);
+        mainchain_info = CallMainChainRPCChecked("getblockchaininfo", no_params);
         UniValue genesis_params(UniValue::VARR);
         genesis_params.push_back(0);
-        const uint256 mainchain_genesis = uint256S(CallMainChainRPCChecked("getblockhash", genesis_params).get_str());
-        const uint256 mainchain_tip = uint256S(mainchain_info.get_obj()["bestblockhash"].get_str());
-
-        UniValue enforcer_chain_info(UniValue::VOBJ);
-        UniValue enforcer_tip(UniValue::VOBJ);
-        UniValue sidechains(UniValue::VOBJ);
-        UniValue ctip(UniValue::VOBJ);
-        UniValue two_way_peg_data(UniValue::VOBJ);
-        std::string lookup_error;
-        if (!GetDrivechainGrpcJSON("GetChainInfo", "{}", enforcer_chain_info, &lookup_error) ||
-            !GetDrivechainGrpcJSON("GetChainTip", "{}", enforcer_tip, &lookup_error) ||
-            !GetDrivechainGrpcJSON("GetSidechains", "{}", sidechains, &lookup_error)) {
-            throw std::runtime_error("unable to obtain enforcer chain identity: " + lookup_error);
+        mainchain_genesis = uint256S(CallMainChainRPCChecked("getblockhash", genesis_params).get_str());
+        mainchain_tip = uint256S(mainchain_info.get_obj()["bestblockhash"].get_str());
+        return true;
         }
-
-        const drivechain::DepositIdentity identity = ConfiguredDepositIdentity();
-        const std::string ctip_request = strprintf(
-            "{\"sidechainNumber\":%d}",
-            identity.sidechain_slot);
-        if (!GetDrivechainGrpcJSON("GetCtip", ctip_request, ctip, &lookup_error)) {
-            throw std::runtime_error("unable to obtain current CTIP state: " + lookup_error);
+        case 3: case 4: case 5: {
+        static constexpr const char* methods[]{"GetChainInfo", "GetChainTip", "GetSidechains"};
+        UniValue* replies[]{&enforcer_chain_info, &enforcer_tip, &sidechains};
+        return GetDrivechainGrpcJSON(methods[stage-3], UniValue(UniValue::VOBJ), *replies[stage-3], &lookup_error);
         }
-        if (!GetDrivechainTwoWayPegDataAtTip(
-                identity.sidechain_slot,
+        case 6: {
+        identity = ConfiguredDepositIdentity();
+        UniValue ctip_request(UniValue::VOBJ);
+        ctip_request.pushKV("sidechainNumber", identity->sidechain_slot);
+        return GetDrivechainGrpcJSON("GetCtip", ctip_request, ctip, &lookup_error);
+        }
+        case 7:
+        return GetDrivechainTwoWayPegDataAtTip(
+                identity->sidechain_slot,
                 mainchain_tip,
                 two_way_peg_data,
-                &lookup_error)) {
-            throw std::runtime_error("unable to obtain confirmed two-way-peg data: " + lookup_error);
-        }
-
-        drivechain::AuthenticatedDeposit authenticated;
-        std::string verify_error;
-        if (!drivechain::AuthenticateDepositEvidence(
+                &lookup_error);
+        case 8:
+        return drivechain::AuthenticateDepositEvidence(
                 mainchain_info,
                 mainchain_genesis,
                 enforcer_chain_info,
@@ -305,50 +312,43 @@ bool VerifyDrivechainDeposit(
                 two_way_peg_data,
                 ctip,
                 Params().NetworkIDString(),
-                identity,
+                *identity,
                 tx.vin[input_index].prevout,
                 value,
                 authenticated,
-                verify_error)) {
-            throw std::runtime_error(verify_error);
-        }
-
+                verify_error);
+        case 9: {
         UniValue block_params(UniValue::VARR);
         block_params.push_back(authenticated.confirmation_block.GetHex());
         block_params.push_back(true);
         const UniValue block_header = CallMainChainRPCChecked("getblockheader", block_params);
-        if (!drivechain::VerifyDepositBlockConfirmation(block_header, authenticated, verify_error)) {
-            throw std::runtime_error(verify_error);
+        return drivechain::VerifyDepositBlockConfirmation(block_header, authenticated, verify_error);
         }
-
+        case 10: {
         UniValue ctip_params(UniValue::VARR);
         ctip_params.push_back(authenticated.current_ctip.hash.GetHex());
         ctip_params.push_back(static_cast<int64_t>(authenticated.current_ctip.n));
         ctip_params.push_back(false);
         const UniValue ctip_txout = CallMainChainRPCChecked("gettxout", ctip_params);
-        if (!drivechain::VerifyCurrentCtipOutput(ctip_txout, authenticated, verify_error)) {
-            throw std::runtime_error(verify_error);
+        return drivechain::VerifyCurrentCtipOutput(ctip_txout, authenticated, verify_error);
         }
-
-        if (!drivechain::VerifyDepositTransaction(tx, input_index, authenticated, verify_error)) {
-            throw std::runtime_error(verify_error);
-        }
+        case 11:
+        return drivechain::VerifyDepositTransaction(tx, input_index, authenticated, verify_error);
+        case 12:
         if (authenticated_out) {
             *authenticated_out = std::move(authenticated);
         }
         return true;
-    } catch (const std::exception& e) {
-        if (error) {
-            *error = e.what();
+        case 13: throw std::runtime_error("transaction input is not a valid drivechain deposit witness");
+        case 14: throw std::runtime_error("unable to obtain enforcer chain identity: " + lookup_error);
+        case 15: throw std::runtime_error("unable to obtain current CTIP state: " + lookup_error);
+        case 16: throw std::runtime_error("unable to obtain confirmed two-way-peg data: " + lookup_error);
+        case 17: throw std::runtime_error(verify_error);
+        default: throw std::logic_error("Invalid Haskell live deposit stage");
         }
-        return false;
-    }
-}
-
-static bool IsDrivechainCtipScript(const CScript& script, const int sidechain_slot)
-{
-    // This constructs historical ECX v2 evidence, not native Betanet replay.
-    return drivechain::IsTreasuryScript(script, drivechain::TreasuryOpcode::NOP5, sidechain_slot);
+        });
+        return true;
+    });
 }
 
 bool BuildDrivechainDepositEvidence(
@@ -356,112 +356,108 @@ bool BuildDrivechainDepositEvidence(
     DrivechainDepositEvidence& evidence,
     std::string* error)
 {
-    try {
-        if (authenticated.sequence_number <= 0 ||
-            authenticated.outpoint.hash.IsNull() ||
-            authenticated.confirmation_block.IsNull() ||
-            authenticated.confirmation_height < 0) {
-            throw std::runtime_error("authenticated deposit cannot form a v2 CTIP transition");
-        }
-
-        UniValue raw_params(UniValue::VARR);
-        raw_params.push_back(authenticated.outpoint.hash.GetHex());
-        raw_params.push_back(false);
-        raw_params.push_back(authenticated.confirmation_block.GetHex());
-        const UniValue raw_result = CallMainChainRPCChecked("getrawtransaction", raw_params);
-        if (!raw_result.isStr() || !IsHex(raw_result.get_str())) {
-            throw std::runtime_error("getrawtransaction returned malformed deposit transaction hex");
-        }
+    return CatchParentError(error, [&]() -> bool {
+        std::optional<Sidechain::Bitcoin::CMutableTransaction> deposit_tx;
+        bool fully_decoded{false};
+        const uint32_t flags = unsigned{!authenticated.outpoint.hash.IsNull()} |
+            (unsigned{!authenticated.confirmation_block.IsNull()} << 1);
+        drivechain::haskell::DepositBuild(authenticated.sequence_number, authenticated.confirmation_height, flags, [&](uint32_t build_stage) {
+        switch (build_stage) {
+        case 1: {
+        const UniValue raw_result = CallMainChainTransactionHex(false,
+            authenticated.outpoint.hash.GetHex(),authenticated.confirmation_block.GetHex(),
+            "getrawtransaction returned malformed deposit transaction hex");
         evidence.deposit_tx = ParseHex(raw_result.get_str());
 
-        Sidechain::Bitcoin::CMutableTransaction deposit_tx;
+        deposit_tx.emplace();
         {
             DataStream stream{evidence.deposit_tx};
-            stream >> TX_WITH_WITNESS(deposit_tx);
-            if (!stream.empty() || deposit_tx.GetHash() != authenticated.outpoint.hash ||
-                authenticated.outpoint.n >= deposit_tx.vout.size()) {
-                throw std::runtime_error("L1 deposit transaction does not contain the authenticated outpoint");
-            }
+            stream >> TX_WITH_WITNESS(*deposit_tx);
+            fully_decoded = stream.empty();
         }
-
-        UniValue proof_params(UniValue::VARR);
-        UniValue proof_txids(UniValue::VARR);
-        proof_txids.push_back(authenticated.outpoint.hash.GetHex());
-        proof_params.push_back(proof_txids);
-        proof_params.push_back(authenticated.confirmation_block.GetHex());
-        const UniValue proof_result = CallMainChainRPCChecked("gettxoutproof", proof_params);
-        if (!proof_result.isStr() || !IsHex(proof_result.get_str())) {
-            throw std::runtime_error("gettxoutproof returned malformed proof hex");
+        return true;
         }
+        case 5: return fully_decoded;
+        case 6: return deposit_tx->GetHash() == authenticated.outpoint.hash;
+        case 7: return authenticated.outpoint.n < deposit_tx->vout.size();
+        case 8: throw std::runtime_error("L1 deposit transaction does not contain the authenticated outpoint");
+        case 2: {
+        const UniValue proof_result = CallMainChainTransactionHex(true,
+            authenticated.outpoint.hash.GetHex(),authenticated.confirmation_block.GetHex(),
+            "gettxoutproof returned malformed proof hex");
         evidence.txout_proof = ParseHex(proof_result.get_str());
-
+        return true;
+        }
+        case 3: {
         std::optional<std::vector<unsigned char>> previous_ctip;
-        for (const auto& input : deposit_tx.vin) {
+        std::vector<unsigned char> candidate;
+        UniValue previous_result;
+        Sidechain::Bitcoin::CMutableTransaction previous_tx;
+        drivechain::haskell::DepositCtipSearch(deposit_tx->vin.size(), [&](uint32_t stage, uint64_t index) -> int32_t {
+            if (stage < 1 || stage > 5) throw std::logic_error("Invalid Haskell CTIP search stage");
             try {
+                const auto& input = deposit_tx->vin.at(index);
+                switch (stage) {
+                case 1: {
                 UniValue previous_params(UniValue::VARR);
                 previous_params.push_back(input.prevout.hash.GetHex());
                 previous_params.push_back(false);
-                const UniValue previous_result = CallMainChainRPCChecked("getrawtransaction", previous_params);
-                if (!previous_result.isStr() || !IsHex(previous_result.get_str())) continue;
-                const std::vector<unsigned char> previous_bytes = ParseHex(previous_result.get_str());
-                Sidechain::Bitcoin::CMutableTransaction previous_tx;
-                DataStream stream{previous_bytes};
+                previous_result = CallMainChainRPCChecked("getrawtransaction", previous_params);
+                return drivechain::IsHexField(previous_result);
+                }
+                case 2: previous_ctip = candidate; return 1;
+                case 3: {
+                candidate = ParseHex(previous_result.get_str());
+                previous_tx = {};
+                DataStream stream{candidate};
                 stream >> TX_WITH_WITNESS(previous_tx);
-                if (!stream.empty() || input.prevout.n >= previous_tx.vout.size() ||
-                    !IsDrivechainCtipScript(
-                        previous_tx.vout[input.prevout.n].scriptPubKey,
-                        authenticated.sidechain_slot)) {
-                    continue;
+                return stream.empty();
                 }
-                if (previous_ctip) {
-                    throw std::runtime_error("deposit transaction spends multiple slot CTIP outputs");
+                case 4: return input.prevout.n < previous_tx.vout.size();
+                // Historical ECX v2 evidence requires NOP5, not native Betanet's opcode.
+                case 5: return drivechain::IsTreasuryScript(previous_tx.vout[input.prevout.n].scriptPubKey,
+                    drivechain::TreasuryOpcode::NOP5, authenticated.sidechain_slot);
                 }
-                previous_ctip = previous_bytes;
             } catch (const std::runtime_error& exception) {
-                if (std::string(exception.what()).find("multiple slot CTIP") != std::string::npos) throw;
+                if (drivechain::haskell::DepositMessageMatches(2, exception.what())) throw;
             } catch (...) {
             }
-        }
-        if (!previous_ctip) {
-            throw std::runtime_error("deposit transaction's prior CTIP transaction is unavailable");
-        }
+            return 0;
+        });
         evidence.previous_ctip_tx = std::move(*previous_ctip);
         evidence.sequence_number = authenticated.sequence_number;
-        evidence.previous_sequence_number = authenticated.sequence_number - 1;
-
+        evidence.previous_sequence_number = drivechain::haskell::PreviousDepositSequence(authenticated.sequence_number);
+        return true;
+        }
+        case 4: {
         UniValue chain_info_params(UniValue::VARR);
         const UniValue chain_info = CallMainChainRPCChecked("getblockchaininfo", chain_info_params);
         const int64_t tip_height = chain_info.get_obj()["blocks"].getInt<int64_t>();
-        if (tip_height < authenticated.confirmation_height ||
-            tip_height - authenticated.confirmation_height > 2016) {
-            throw std::runtime_error("deposit confirmation is outside the bounded v2 L1 header window");
-        }
-        evidence.headers.clear();
-        for (int64_t height = authenticated.confirmation_height; height <= tip_height; ++height) {
-            UniValue hash_params(UniValue::VARR);
-            hash_params.push_back(height);
-            const UniValue hash_result = CallMainChainRPCChecked("getblockhash", hash_params);
+        Sidechain::Bitcoin::CBlockHeader header;
+        drivechain::haskell::DepositHeaders(authenticated.confirmation_height, tip_height, [&](uint32_t stage, uint64_t height) {
+            if (stage == 1) { evidence.headers.clear(); return true; }
+            if (stage == 3) throw std::runtime_error("serialized L1 header contains trailing data");
+            if (stage == 4) { evidence.headers.push_back(header); return true; }
+            if (stage != 2) throw std::logic_error("Invalid Haskell deposit header stage");
+            const std::string hash = CallMainChainBlockHash(static_cast<int64_t>(height));
             UniValue header_params(UniValue::VARR);
-            header_params.push_back(hash_result.get_str());
+            header_params.push_back(hash);
             header_params.push_back(false);
-            const UniValue header_result = CallMainChainRPCChecked("getblockheader", header_params);
-            if (!header_result.isStr() || !IsHex(header_result.get_str())) {
-                throw std::runtime_error("getblockheader returned malformed serialized header");
-            }
+            const UniValue header_result = CallMainChainHexRPC("getblockheader", header_params,
+                "getblockheader returned malformed serialized header");
             const std::vector<unsigned char> header_bytes = ParseHex(header_result.get_str());
-            Sidechain::Bitcoin::CBlockHeader header;
+            header = {};
             DataStream stream{header_bytes};
             stream >> header;
-            if (!stream.empty()) {
-                throw std::runtime_error("serialized L1 header contains trailing data");
-            }
-            evidence.headers.push_back(header);
-        }
+            return stream.empty();
+        });
         return true;
-    } catch (const std::exception& exception) {
-        if (error) *error = exception.what();
-        return false;
-    }
+        }
+        default: throw std::logic_error("Invalid Haskell deposit build stage");
+        }
+        });
+        return true;
+    });
 }
 
 bool BuildDrivechainBmmProof(
@@ -472,97 +468,76 @@ bool BuildDrivechainBmmProof(
     drivechain::BmmProof& proof,
     std::string* error)
 {
-    try {
-        if (parent_height < 0 ||
-            static_cast<uint64_t>(parent_height) < previous_state.height ||
-            static_cast<uint64_t>(parent_height + 1 - previous_state.height) >
-                drivechain::MAX_BMM_PROOF_ENTRIES) {
-            throw std::runtime_error("BMM successor is outside the bounded parent-header window");
+    return CatchParentError(error, [&]() -> bool {
+        std::string verify_error;
+        uint256 block_hash;
+        UniValue block;
+        const UniValue* transactions{nullptr};
+        drivechain::haskell::BmmProofBuild(previous_state.height, parent_height, [&](uint32_t stage, uint64_t height) {
+        switch (stage) {
+        case 1: {
+        const uint256 active_anchor{uint256S(CallMainChainBlockHash(static_cast<int64_t>(previous_state.height)))};
+        return active_anchor == previous_state.block_hash;
         }
-
-        UniValue anchor_params(UniValue::VARR);
-        anchor_params.push_back(static_cast<int64_t>(previous_state.height));
-        const uint256 active_anchor{
-            uint256S(CallMainChainRPCChecked("getblockhash", anchor_params).get_str())};
-        if (active_anchor != previous_state.block_hash) {
+        case 6:
             throw std::runtime_error(strprintf(
                 "authenticated BMM anchor %s at height %u is not on the active L1 chain",
                 previous_state.block_hash.GetHex(),
                 previous_state.height));
+        case 2: {
+        const uint256 active_parent{uint256S(CallMainChainBlockHash(parent_height))};
+        return active_parent == parent_hash;
         }
-
-        UniValue parent_params(UniValue::VARR);
-        parent_params.push_back(parent_height);
-        const uint256 active_parent{
-            uint256S(CallMainChainRPCChecked("getblockhash", parent_params).get_str())};
-        if (active_parent != parent_hash) {
+        case 7:
             throw std::runtime_error("sidechain parent commitment is no longer the active L1 block");
-        }
-
+        case 3:
         proof = drivechain::BmmProof{};
         proof.previous_state = previous_state;
-        for (int64_t height = previous_state.height + 1;
-             height <= parent_height + 1;
-             ++height) {
-            UniValue hash_params(UniValue::VARR);
-            hash_params.push_back(height);
-            const uint256 block_hash{
-                uint256S(CallMainChainRPCChecked("getblockhash", hash_params).get_str())};
+        return true;
+        case 4: {
+            block_hash = uint256S(CallMainChainBlockHash(static_cast<int64_t>(height)));
 
             UniValue block_params(UniValue::VARR);
             block_params.push_back(block_hash.GetHex());
             block_params.push_back(1);
-            const UniValue block{
-                CallMainChainRPCChecked("getblock", block_params)};
-            const UniValue& transactions = block.get_obj()["tx"];
-            if (!transactions.isArray() ||
-                transactions.empty() ||
-                !transactions[0].isStr()) {
-                throw std::runtime_error("getblock returned no parent-chain coinbase txid");
-            }
-            const std::string coinbase_txid = transactions[0].get_str();
+            block = CallMainChainRPCChecked("getblock", block_params);
+            transactions = &block.get_obj()["tx"];
+            return true;
+        }
+        case 9: return transactions->isArray();
+        case 10: return !transactions->empty();
+        case 11: return (*transactions)[0].isStr();
+        case 13: throw std::runtime_error("getblock returned no parent-chain coinbase txid");
+        case 12: {
+            const std::string coinbase_txid = (*transactions)[0].get_str();
 
-            UniValue raw_params(UniValue::VARR);
-            raw_params.push_back(coinbase_txid);
-            raw_params.push_back(false);
-            raw_params.push_back(block_hash.GetHex());
-            const UniValue raw{
-                CallMainChainRPCChecked("getrawtransaction", raw_params)};
-            if (!raw.isStr() || !IsHex(raw.get_str())) {
-                throw std::runtime_error("getrawtransaction returned malformed coinbase hex");
-            }
+            const UniValue raw = CallMainChainTransactionHex(false,coinbase_txid,block_hash.GetHex(),
+                "getrawtransaction returned malformed coinbase hex");
 
-            UniValue proof_params(UniValue::VARR);
-            UniValue proof_txids(UniValue::VARR);
-            proof_txids.push_back(coinbase_txid);
-            proof_params.push_back(proof_txids);
-            proof_params.push_back(block_hash.GetHex());
-            const UniValue merkle{
-                CallMainChainRPCChecked("gettxoutproof", proof_params)};
-            if (!merkle.isStr() || !IsHex(merkle.get_str())) {
-                throw std::runtime_error("gettxoutproof returned malformed coinbase proof hex");
-            }
+            const UniValue merkle = CallMainChainTransactionHex(true,coinbase_txid,block_hash.GetHex(),
+                "gettxoutproof returned malformed coinbase proof hex");
             proof.entries.push_back({
                 ParseHex(raw.get_str()),
                 ParseHex(merkle.get_str())});
+            return true;
         }
-
+        case 5: {
         drivechain::BmmL1State next_state;
-        std::string verify_error;
-        if (!drivechain::VerifyBmmProofEntries(
+        return drivechain::VerifyBmmProofEntries(
                 proof,
                 critical_hash,
                 parent_hash,
                 next_state,
                 verify_error,
-                drivechain::LayerTwoLabsBmmConsensus())) {
+                drivechain::LayerTwoLabsBmmConsensus());
+        }
+        case 8:
             throw std::runtime_error(
                 "constructed BMM successor proof failed self-verification: " +
                 verify_error);
+        default: throw std::logic_error("Invalid Haskell BMM proof build stage");
         }
+        });
         return true;
-    } catch (const std::exception& exception) {
-        if (error) *error = exception.what();
-        return false;
-    }
+    });
 }

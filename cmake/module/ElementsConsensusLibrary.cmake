@@ -4,6 +4,7 @@ include(GNUInstallDirs)
 add_library(elementsconsensus_objects OBJECT
   script/bitcoinconsensus.cpp
   util/strencodings.cpp
+  util/moneystr.cpp
   util/check.cpp
 )
 target_compile_definitions(elementsconsensus_objects PRIVATE BUILD_BITCOIN_INTERNAL)
@@ -23,7 +24,13 @@ foreach(kind IN ITEMS SHARED STATIC)
     $<TARGET_OBJECTS:elementssimplicity>
   )
   set_target_properties(${target} PROPERTIES OUTPUT_NAME elementsconsensus)
-  target_link_libraries(${target} PRIVATE core_interface secp256k1 drivechain_verifiers)
+  target_link_libraries(${target} PRIVATE core_interface secp256k1 drivechain_verifiers elements_haskell)
+  if(BUILD_TESTS)
+    add_executable(test_consensus_reader_${kind} haskell/test/consensus_reader_tests.cpp)
+    target_include_directories(test_consensus_reader_${kind} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/script)
+    target_link_libraries(test_consensus_reader_${kind} PRIVATE ${target} core_interface)
+    add_test(NAME consensus_reader_${kind} COMMAND test_consensus_reader_${kind})
+  endif()
   install(TARGETS ${target}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT elementsconsensus
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT elementsconsensus
@@ -39,7 +46,7 @@ install(FILES $<TARGET_FILE:secp256k1> DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RENAME ${CMAKE_STATIC_LIBRARY_PREFIX}elements-secp256k1${CMAKE_STATIC_LIBRARY_SUFFIX}
   COMPONENT elementsconsensus)
 
-set(consensus_private_libs "-lelements-secp256k1")
+set(consensus_private_libs "-lelements-secp256k1 -lelements_haskell_bridge -lelements_haskell")
 foreach(verifier IN ITEMS USDD ECX)
   if(${verifier}_SP1_VERIFIER_ARCHIVE)
     string(TOLOWER ${verifier} name)
@@ -63,7 +70,7 @@ foreach(verifier IN ITEMS USDD ECX)
   endif()
 endforeach()
 if(APPLE)
-  string(APPEND consensus_private_libs " -lc++")
+  string(APPEND consensus_private_libs " -Wl,-dead_strip -lc++")
 elseif(NOT MSVC)
   string(APPEND consensus_private_libs " -lstdc++ -lm")
 endif()

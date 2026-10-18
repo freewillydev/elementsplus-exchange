@@ -6,11 +6,13 @@
 #include <primitives/block.h>
 
 #include <hash.h>
+#include <haskell/bridge.h>
 #include <tinyformat.h>
 
 
 bool g_con_blockheightinheader = false;
 bool g_signed_blocks = false;
+bool g_con_utreexo = false;
 
 std::string CProof::ToString() const
 {
@@ -18,50 +20,37 @@ std::string CProof::ToString() const
                      HexStr(challenge), HexStr(solution));
 }
 
+CBlockHeader::HeaderLayout CBlockHeader::GetLayout(int32_t version, bool withdrawal, bool dynamic, bool reading, bool critical)
+{
+    static_assert(DYNAFED_HF_MASK == 0x80000000U && WITHDRAWAL_BUNDLE_HF_MASK == 0x40000000U &&
+        BMM_PROOF_HF_MASK == (1U << 20) && EXCHANGE_STATE_HF_MASK == (1U << 19) &&
+        FORCED_INBOX_HF_MASK == (1U << 18) && DEPOSIT_INBOX_HF_MASK == (1U << 17) && INBOX_CURSOR_HF_MASK == (1U << 16));
+    const auto layout = drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(version),
+        uint32_t(g_con_elementsmode) | (reading << 1) | (withdrawal << 2) | (dynamic << 3) | (critical << 5));
+    const auto fields = layout[1];
+    return {static_cast<int32_t>(layout[0]), bool(fields & 1), bool(fields & 2), bool(fields & 4),
+        bool(fields & 8), bool(fields & 16), bool(fields & 32), bool(fields & 64), bool(fields & 128), bool(fields & 256)};
+}
+
+uint32_t CBlockHeader::GetRawExtensionFlags() const
+{
+    return drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(nVersion),16)[1];
+}
+
 // ELEMENTS: GetHash manually implemented for CBlockHeader.
 // SER_GETHASH removed in #28508 so CProof now always serializes `solution`.
 // Only include `challenge` of CProof here, and no signblock witness
-uint256 CBlockHeader::GetHash() const
+uint256 CBlockHeader::ComputeHash(bool critical) const
 {
     HashWriter s{};
-    const bool has_withdrawal_bundle_hash = g_con_elementsmode &&
-        !hashWithdrawalBundle.IsNull();
-    // Bits 16--20 are ordinary BIP9/unknown-version bits on Bitcoin-mode
-    // networks. They acquire ECX/BMM serialization meaning only on an
-    // Elements-mode chain, where those bit assignments are reserved by
-    // this consensus implementation.
-    const bool has_bmm_proof = g_con_elementsmode &&
-        (static_cast<uint32_t>(this->nVersion) & BMM_PROOF_HF_MASK) != 0;
-    const bool has_exchange_state = g_con_elementsmode &&
-        (static_cast<uint32_t>(this->nVersion) & EXCHANGE_STATE_HF_MASK) != 0;
-    const bool has_forced_inbox = g_con_elementsmode &&
-        (static_cast<uint32_t>(this->nVersion) & FORCED_INBOX_HF_MASK) != 0;
-    const bool has_deposit_inbox = g_con_elementsmode &&
-        (static_cast<uint32_t>(this->nVersion) & DEPOSIT_INBOX_HF_MASK) != 0;
-    const bool has_inbox_cursors = g_con_elementsmode &&
-        (static_cast<uint32_t>(this->nVersion) & INBOX_CURSOR_HF_MASK) != 0;
-
-    // Detect dynamic federation block serialization using "HF bit",
-    // or the signed bit which is invalid in Bitcoin
-    bool is_dyna = false;
-    int32_t nVersion = this->nVersion;
-    if (g_con_elementsmode) {
-        nVersion = static_cast<int32_t>(
-            static_cast<uint32_t>(nVersion) &
-            ~(DYNAFED_HF_MASK | WITHDRAWAL_BUNDLE_HF_MASK));
-    }
-    if (g_con_elementsmode && !m_dynafed_params.IsNull()) {
-        nVersion |= DYNAFED_HF_MASK;
-        is_dyna = true;
-    }
-    if (has_withdrawal_bundle_hash) {
-        nVersion |= WITHDRAWAL_BUNDLE_HF_MASK;
-    }
+    const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, has_exchange_state,
+        has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm] =
+        GetLayout(this->nVersion, !hashWithdrawalBundle.IsNull(), !m_dynafed_params.IsNull(), false, critical);
     s << (nVersion);
     s << hashPrevBlock;
     s << hashMerkleRoot;
     if (has_withdrawal_bundle_hash) s << hashWithdrawalBundle;
-    if (has_bmm_proof) s << hashBmmProof;
+    if (has_bmm_proof) s << (zero_bmm ? uint256{} : hashBmmProof);
     s << nTime;
 
     if (is_dyna) {
@@ -81,21 +70,18 @@ uint256 CBlockHeader::GetHash() const
     if (has_exchange_state) s << hashExchangeStateRoot;
     if (has_forced_inbox) s << hashForcedInboxRoot;
     if (has_deposit_inbox) s << hashDepositInboxRoot;
-    if (has_forced_inbox && has_deposit_inbox) s << ecxParentHeight;
+    if (has_parent_height) s << ecxParentHeight;
     if (has_inbox_cursors) {
         s << forcedProcessedCursor;
         s << depositProcessedCursor;
         s << sourceBacklogOldestParentHeight;
     }
+    if (HasUtreexo()) s << utreexo;
     return s.GetHash();
 }
 
-uint256 CBlockHeader::GetBmmCriticalHash() const
-{
-    CBlockHeader critical_header{*this};
-    critical_header.hashBmmProof.SetNull();
-    return critical_header.GetHash();
-}
+uint256 CBlockHeader::GetHash() const { return ComputeHash(false); }
+uint256 CBlockHeader::GetBmmCriticalHash() const { return ComputeHash(true); }
 
 std::string CBlock::ToString() const
 {

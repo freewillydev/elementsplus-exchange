@@ -234,7 +234,7 @@ public:
     virtual ~CChainParams() = default;
 
 protected:
-    CChainParams() = default;
+    CChainParams() { g_con_utreexo = false; }
 
     Consensus::Params consensus;
     MessageStartChars pchMessageStart;

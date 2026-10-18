@@ -12,6 +12,7 @@
 #include <consensus/validation.h>
 #include <node/miner.h>
 #include <node/blockstorage.h>
+#include <node/kernel_notifications.h>
 #include <pow.h>
 #include <random.h>
 #include <rpc/server.h>
@@ -22,6 +23,7 @@
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <util/time.h>
+#include <usdd_withdrawal_accumulator.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -50,6 +52,197 @@ struct MinerTestingSetup : public TestingSetup {
 } // namespace validation_block_tests
 
 BOOST_FIXTURE_TEST_SUITE(validation_block_tests, MinerTestingSetup)
+
+BOOST_AUTO_TEST_CASE(usdd_genesis_connection_preserves_publication_boundaries)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto& chainstate = chainman.ActiveChainstate();
+    auto& consensus = const_cast<Consensus::Params&>(chainman.GetConsensus());
+    LOCK(cs_main);
+    struct Restore {
+        Consensus::Params& consensus;
+        bool connect;
+        ~Restore() { consensus.connect_genesis_outputs = connect; }
+    } restore{consensus, consensus.connect_genesis_outputs};
+    const CBlock& genesis = chainman.GetParams().GenesisBlock();
+    const uint256 hash = genesis.GetHash();
+    auto* index = chainman.m_blockman.LookupBlockIndex(hash);
+    BOOST_REQUIRE(index);
+    struct RestoreAccumulator {
+        CBlockIndex& index;
+        std::optional<usdd::WithdrawalAccumulatorState> previous;
+        ~RestoreAccumulator() { index.m_usdd_withdrawal_accumulator = previous; }
+    } restore_accumulator{*index, index->m_usdd_withdrawal_accumulator};
+    const auto empty = usdd::WithdrawalAccumulatorState::Empty();
+    for (bool connect : {false, true}) for (bool just_check : {false, true}) {
+        for (unsigned stored : {0, 1, 2}) {
+            consensus.connect_genesis_outputs = connect;
+            index->m_usdd_withdrawal_accumulator.reset();
+            if (stored) index->m_usdd_withdrawal_accumulator = empty;
+            if (stored == 2) index->m_usdd_withdrawal_accumulator->count = 1;
+            const auto previous = index->m_usdd_withdrawal_accumulator;
+            CCoinsView base;
+            CCoinsViewCache view(&base);
+            BlockValidationState result;
+            const bool accepted = chainstate.ConnectBlock(genesis, result, index, view, nullptr, just_check);
+            const bool commits = stored != 2 && !just_check;
+            BOOST_CHECK_EQUAL(accepted, stored != 2);
+            BOOST_CHECK(view.GetBestBlock() == (commits ? hash : uint256{}));
+            BOOST_CHECK_EQUAL(view.GetCacheSize() != 0, commits && connect);
+            BOOST_CHECK(index->m_usdd_withdrawal_accumulator == (commits ? std::optional{empty} : previous));
+            if (stored == 2) {
+                BOOST_CHECK(result.IsError());
+                BOOST_CHECK_EQUAL(result.GetRejectReason(), "genesis has a nonempty USDD withdrawal accumulator");
+            } else {
+                BOOST_CHECK(result.IsValid());
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_connection_dry_run_preserves_accumulator_state)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto block = Block(chainman.GetParams().GenesisBlock().GetHash());
+    block->hashMerkleRoot = BlockMerkleRoot(*block);
+    const uint256 hash = block->GetHash();
+    LOCK(cs_main);
+    auto& chainstate = chainman.ActiveChainstate();
+    auto* previous = chainstate.m_chain.Tip();
+    BOOST_REQUIRE(previous);
+    struct RestoreAccumulator {
+        CBlockIndex& index;
+        std::optional<usdd::WithdrawalAccumulatorState> accumulator;
+        ~RestoreAccumulator() { index.m_usdd_withdrawal_accumulator = accumulator; }
+    } restore{*previous, previous->m_usdd_withdrawal_accumulator};
+    const auto empty = usdd::WithdrawalAccumulatorState::Empty();
+    for (unsigned prior : {0, 1, 2}) for (unsigned stored : {0, 1, 2}) {
+        previous->m_usdd_withdrawal_accumulator = prior ? std::optional{empty} : std::nullopt;
+        if (prior == 2) previous->m_usdd_withdrawal_accumulator->root[0] ^= 1;
+        const auto prior_before = previous->m_usdd_withdrawal_accumulator;
+        CBlockIndex index(*block);
+        index.phashBlock = &hash;
+        index.pprev = previous;
+        index.nHeight = previous->nHeight + 1;
+        if (stored) index.m_usdd_withdrawal_accumulator = empty;
+        if (stored == 2) index.m_usdd_withdrawal_accumulator->count = 1;
+        const auto before = index.m_usdd_withdrawal_accumulator;
+        CCoinsViewCache view(&chainstate.CoinsTip());
+        BlockValidationState result;
+        const bool accepted = chainstate.ConnectBlock(*block, result, &index, view, nullptr, true);
+        BOOST_CHECK_EQUAL(accepted, prior == 1 && stored != 2);
+        BOOST_CHECK(index.m_usdd_withdrawal_accumulator == before);
+        BOOST_CHECK(previous->m_usdd_withdrawal_accumulator == prior_before);
+        if (prior != 1 || stored == 2) {
+            BOOST_CHECK(result.IsError());
+            BOOST_CHECK_EQUAL(result.GetRejectReason(), prior == 0
+                ? "missing prior USDD withdrawal accumulator; reindex required"
+                : prior == 2 ? "failed to derive USDD withdrawal accumulator: malformed prior USDD withdrawal accumulator state"
+                : "persisted USDD withdrawal accumulator disagrees with validated block");
+        } else {
+            BOOST_CHECK(result.IsValid());
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(usdd_connection_waits_for_undo_before_publication)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto block = FinalizeBlock(Block(chainman.GetParams().GenesisBlock().GetHash()));
+    LOCK(cs_main);
+    auto& chainstate = chainman.ActiveChainstate();
+    CBlockIndex* index{nullptr};
+    BlockValidationState admission;
+    BOOST_REQUIRE_MESSAGE(chainman.AcceptBlock(block, admission, &index, true, nullptr, nullptr, true), admission.ToString());
+    BOOST_REQUIRE(index);
+    BOOST_REQUIRE(!index->m_usdd_withdrawal_accumulator);
+    BOOST_REQUIRE(index->GetUndoPos().IsNull());
+    const auto undo_path = m_args.GetBlocksDirPath() / fs::PathFromString(strprintf("rev%05i.dat", index->nFile));
+    BOOST_REQUIRE(!fs::exists(undo_path));
+    BOOST_REQUIRE(fs::create_directory(undo_path));
+    {
+        auto& notifications = *m_node.notifications;
+        struct Restore {
+            node::KernelNotifications& notifications;
+            bool shutdown;
+            std::atomic<int>& exit_status;
+            int status;
+            fs::path path;
+            ~Restore() {
+                notifications.m_shutdown_on_fatal_error = shutdown;
+                exit_status = status;
+                std::error_code ignored;
+                fs::remove(path, ignored);
+            }
+        } restore{notifications, notifications.m_shutdown_on_fatal_error,
+                  m_node.exit_status, m_node.exit_status.load(), undo_path};
+        notifications.m_shutdown_on_fatal_error = false;
+        CCoinsViewCache view(&chainstate.CoinsTip());
+        const auto best = view.GetBestBlock();
+        BlockValidationState result;
+        BOOST_CHECK(!chainstate.ConnectBlock(*block, result, index, view, nullptr, false));
+        BOOST_CHECK(result.IsError());
+        BOOST_CHECK_EQUAL(result.GetRejectReason(), "Failed to write undo data.");
+        BOOST_CHECK(!index->m_usdd_withdrawal_accumulator);
+        BOOST_CHECK(index->GetUndoPos().IsNull());
+        BOOST_CHECK(view.GetBestBlock() == best);
+    }
+    BOOST_REQUIRE(!fs::exists(undo_path));
+    CCoinsViewCache view(&chainstate.CoinsTip());
+    BlockValidationState result;
+    BOOST_REQUIRE_MESSAGE(chainstate.ConnectBlock(*block, result, index, view, nullptr, false), result.ToString());
+    BOOST_REQUIRE(index->m_usdd_withdrawal_accumulator);
+    BOOST_CHECK(*index->m_usdd_withdrawal_accumulator == usdd::WithdrawalAccumulatorState::Empty());
+    BOOST_CHECK(!index->GetUndoPos().IsNull());
+    BOOST_CHECK(view.GetBestBlock() == block->GetHash());
+}
+
+BOOST_AUTO_TEST_CASE(usdd_bip301_connection_rejects_missing_and_corrupt_predecessor)
+{
+    auto& chainman = *Assert(m_node.chainman);
+    auto block = Block(chainman.GetParams().GenesisBlock().GetHash());
+    block->hashMerkleRoot = BlockMerkleRoot(*block);
+    const uint256 hash = block->GetHash();
+    LOCK(cs_main);
+    auto& chainstate = chainman.ActiveChainstate();
+    auto* previous = chainstate.m_chain.Tip();
+    BOOST_REQUIRE(previous);
+    auto& consensus = const_cast<Consensus::Params&>(chainman.GetConsensus());
+    struct Restore {
+        Consensus::Params& consensus;
+        std::optional<uint8_t> slot;
+        CBlockIndex& previous;
+        std::optional<usdd::WithdrawalAccumulatorState> accumulator;
+        ~Restore() {
+            consensus.drivechain_slot = slot;
+            previous.m_usdd_withdrawal_accumulator = accumulator;
+        }
+    } restore{consensus, consensus.drivechain_slot, *previous, previous->m_usdd_withdrawal_accumulator};
+    consensus.drivechain_slot = 24;
+    for (bool corrupt : {false, true}) {
+        previous->m_usdd_withdrawal_accumulator.reset();
+        if (corrupt) {
+            previous->m_usdd_withdrawal_accumulator = usdd::WithdrawalAccumulatorState::Empty();
+            previous->m_usdd_withdrawal_accumulator->root[0] ^= 1;
+        }
+        const auto before = previous->m_usdd_withdrawal_accumulator;
+        CBlockIndex index(*block);
+        index.phashBlock = &hash;
+        index.pprev = previous;
+        index.nHeight = previous->nHeight + 1;
+        CCoinsViewCache view(&chainstate.CoinsTip());
+        const auto best = view.GetBestBlock();
+        BlockValidationState result;
+        BOOST_CHECK(!chainstate.ConnectBlock(*block, result, &index, view, nullptr, true));
+        BOOST_CHECK(result.IsError());
+        BOOST_CHECK_EQUAL(result.GetRejectReason(), strprintf("cannot derive USDD BIP301 checkpoint for block %s: %s",
+            hash.GetHex(), corrupt ? "malformed prior USDD withdrawal accumulator state" :
+                "USDD BIP301 checkpoint requires the predecessor accumulator; reindex required"));
+        BOOST_CHECK(previous->m_usdd_withdrawal_accumulator == before);
+        BOOST_CHECK(!index.m_usdd_withdrawal_accumulator);
+        BOOST_CHECK(view.GetBestBlock() == best);
+    }
+}
 
 void MinerTestingSetup::CheckExplicitGatePaths()
 {

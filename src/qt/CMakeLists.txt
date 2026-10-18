@@ -131,6 +131,7 @@ target_link_libraries(bitcoinqt
     Qt5::Widgets
   PRIVATE
     core_interface
+    elements_haskell
     bitcoin_cli
     leveldb
     Boost::headers
@@ -158,8 +159,6 @@ if(ENABLE_WALLET)
       editaddressdialog.h
       issueassetdialog.cpp
       issueassetdialog.h
-      lwkwalletdialog.cpp
-      lwkwalletdialog.h
       openuridialog.cpp
       openuridialog.h
       overviewpage.cpp

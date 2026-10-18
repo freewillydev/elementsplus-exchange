@@ -11,8 +11,8 @@
 
 #include <elements_drivechain_identity.h>
 #include <script/usdd_sp1_verifier_ffi.h>
+#include <haskell/bridge.h>
 
-#include <algorithm>
 #include <array>
 #include <string>
 
@@ -30,43 +30,17 @@ inline bool CheckUsddSp1VerifierStartupIdentity(
     const std::array<uint8_t, 32>& expected_identity,
     std::string* error)
 {
-    if (error) error->clear();
-    if (!activation_configured) return true;
-
-    if (std::all_of(expected_identity.begin(), expected_identity.end(),
-                    [](const uint8_t byte) { return byte == 0; })) {
-        if (error) *error = "USDD SP1 activation has no frozen verifier semantic identity";
-        return false;
-    }
-
+    return drivechain::haskell::VerifierIdentity(activation_configured,
+        ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_ABI_VERSION,
+        ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_VERSION,
+        expected_identity,
 #if defined(HAVE_USDD_SP1_VERIFIER)
-    if (usdd_sp1_verifier_abi_version() !=
-        ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_ABI_VERSION) {
-        if (error) *error = "linked USDD SP1 verifier ABI does not match the production identity";
-        return false;
-    }
-    if (usdd_sp1_verifier_semantic_identity_version() !=
-        ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_VERSION) {
-        if (error) *error = "linked USDD SP1 verifier semantic-identity format does not match the production identity";
-        return false;
-    }
-    std::array<uint8_t, USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_SIZE> actual_identity{};
-    const uint32_t status = usdd_sp1_verifier_semantic_identity(
-        actual_identity.data(), actual_identity.size());
-    if (status != USDD_SP1_VERIFIER_ACCEPTED) {
-        if (error) *error = "linked USDD SP1 verifier could not export its semantic identity";
-        return false;
-    }
-    if (!std::equal(actual_identity.begin(), actual_identity.end(), expected_identity.begin())) {
-        if (error) *error = "linked USDD SP1 verifier semantics do not match the production identity";
-        return false;
-    }
-    return true;
+        usdd_sp1_verifier_abi_version, usdd_sp1_verifier_semantic_identity_version,
+        usdd_sp1_verifier_semantic_identity,
 #else
-    (void)expected_identity;
-    if (error) *error = "USDD SP1 activation requires the pinned verifier, but this binary was built without it";
-    return false;
+        nullptr, nullptr, nullptr,
 #endif
+        error);
 }
 
 inline bool CheckCanonicalUsddSp1VerifierStartupIdentity(std::string* error)

@@ -16,6 +16,7 @@
 #include <assetsdir.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
+#include <haskell/bridge.h>
 #include <common/args.h>
 #include <interfaces/node.h>
 #include <key_io.h>
@@ -158,11 +159,8 @@ bool parseBitcoinURI(const QUrl &uri, SendCoinsRecipient *out)
     // return if URI is not valid or incorrect scheme
     const bool canonical_elements =
         Params().NetworkIDString() == CBaseChainParams::ELEMENTS;
-    bool valid_elements = g_con_elementsmode && canonical_elements && uri.scheme() == QString("elements");
-    bool valid_liquid = g_con_elementsmode && !canonical_elements &&
-        (uri.scheme() == QString("liquidnetwork") || uri.scheme() == QString("liquidtestnet"));
-    bool valid_bitcoin = !g_con_elementsmode && (uri.scheme() == QString("bitcoin"));
-    if (!uri.isValid() || !(valid_elements || valid_liquid || valid_bitcoin))
+    if (!uri.isValid() || !drivechain::haskell::AcceptPaymentUri(
+            g_con_elementsmode, canonical_elements, uri.scheme().toStdString()))
         return false;
 
     SendCoinsRecipient rv;
@@ -225,14 +223,10 @@ QString formatBitcoinURI(const SendCoinsRecipient &info)
 {
     bool bech_32 = info.address.startsWith(QString::fromStdString(Params().Bech32HRP() + "1"));
 
-    QString network = QString("bitcoin:%1");
-    if (g_con_elementsmode) {
-        if (Params().GetChainTypeMeta().chain_type == ChainType::ELEMENTS) {
-            network = QString("elements:%1");
-        } else {
-            network = Params().GetChainTypeMeta().chain_type == ChainType::LIQUIDTESTNET ? QString("liquidtestnet:%1") : QString("liquidnetwork:%1");
-        }
-    }
+    const auto chain = Params().GetChainTypeMeta().chain_type;
+    const auto scheme = drivechain::haskell::PaymentUriScheme(g_con_elementsmode,
+        chain == ChainType::ELEMENTS, chain == ChainType::LIQUIDTESTNET);
+    const QString network = QString::fromLatin1(scheme.data(), scheme.size()) + ":%1";
     QString ret = network.arg(bech_32 ? info.address.toUpper() : info.address);
     int paramCount = 0;
 

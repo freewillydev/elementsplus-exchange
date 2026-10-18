@@ -3,12 +3,49 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/merkle.h>
+#include <primitives/bitcoin/merkleblock.h>
+#include <limits>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(merkle_tests, TestingSetup)
+
+BOOST_AUTO_TEST_CASE(parent_merkle_replacement)
+{
+    std::vector<uint256> leaves{uint256{1},uint256{2},uint256{3}};
+    for (unsigned mask=0; mask<8; ++mask) {
+        std::vector<bool> selected;
+        std::vector<unsigned> expectedIndices;
+        std::vector<uint256> expectedMatches;
+        for (unsigned i=0; i<leaves.size(); ++i) {
+            selected.push_back((mask >> i) & 1);
+            if (selected.back()) { expectedIndices.push_back(i); expectedMatches.push_back(leaves[i]); }
+        }
+        for (unsigned index : {0U,1U,2U,3U,std::numeric_limits<unsigned>::max()}) {
+            Sidechain::Bitcoin::CPartialMerkleTree tree(leaves,selected);
+            std::vector<uint256> matches{uint256{99}};
+            std::vector<unsigned> indices{99};
+            auto root=tree.ExtractMatchesWithReplacement(matches,indices,index,uint256{4});
+            auto changed=leaves;
+            const bool enabled=index!=std::numeric_limits<unsigned>::max();
+            if (enabled && index<3) changed[index]=uint256{4};
+            BOOST_CHECK(root==((enabled && (index>=3 || !selected[index])) ? uint256{} : ComputeMerkleRoot(changed)));
+            BOOST_CHECK(matches==expectedMatches);
+            BOOST_CHECK(indices==expectedIndices);
+        }
+    }
+    Sidechain::Bitcoin::CPartialMerkleTree duplicate({leaves[0],leaves[1]},{true,true});
+    std::vector<uint256> matches;
+    std::vector<unsigned> indices;
+    BOOST_CHECK(duplicate.ExtractMatchesWithReplacement(matches,indices,0,leaves[1]).IsNull());
+    Sidechain::Bitcoin::CPartialMerkleTree empty;
+    matches={leaves[0]}; indices={1};
+    BOOST_CHECK(empty.ExtractMatchesWithReplacement(matches,indices,0,leaves[1]).IsNull());
+    BOOST_CHECK(matches.empty());
+    BOOST_CHECK(indices.empty());
+}
 
 static uint256 ComputeMerkleRootFromBranch(const uint256& leaf, const std::vector<uint256>& vMerkleBranch, uint32_t nIndex) {
     uint256 hash = leaf;

@@ -42,6 +42,14 @@ struct Sp1AnnexResourceUsage {
     bool malformed_public_values{false};
     bool deployment_unconfigured{false};
     bool wrong_inbound_mint_domain{false};
+
+    uint32_t Flags() const
+    {
+        return (oversized << 1) | (malformed << 2) | (wrong_spend_shape << 3) |
+               (wrong_controller_cmr << 4) | (wrong_guest_program_id << 5) |
+               (malformed_public_values << 6) | (deployment_unconfigured << 7) |
+               (wrong_inbound_mint_domain << 8);
+    }
 };
 
 static constexpr std::size_t SP1_TAPSIMPLICITY_WITNESS_ITEMS{5};
@@ -55,8 +63,9 @@ static constexpr unsigned char SP1_TAPSIMPLICITY_LEAF_VERSION{0xbe};
 inline bool ExceedsUsddSp1AnnexLane(const std::size_t current,
                                     const std::size_t additional)
 {
-    return current > SP1_ANNEXES_PER_BLOCK ||
-           additional > SP1_ANNEXES_PER_BLOCK - current;
+    static_assert(SP1_ANNEXES_PER_BLOCK <= UINT32_MAX);
+    return drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::LANE_EXCEEDED,
+        SP1_ANNEXES_PER_BLOCK, 0, current, additional);
 }
 
 /**
@@ -68,107 +77,47 @@ inline bool ExceedsUsddSp1AnnexLane(const std::size_t current,
  * successful execution of the configuration-bound Simplicity leaf and its
  * verifier jet. Historical profiles retain their frozen-pair prefilter.
  */
+class ResourceReader {
+    const CTransaction* m_tx{nullptr};
+public:
+    uint64_t Select(const CTransaction& tx) {
+        m_tx = &tx;
+        return tx.witness.vtxinwit.size();
+    }
+    drivechain::haskell::UsddResourceSource Source() const {
+        using namespace ElementsDrivechainIdentity;
+        return {{{ {}, HISTORICAL_V8_CONTROLLER_CMR, {}, USDD_SP1_GUEST_PROGRAM_ID, {}, USDD_SP1_INBOUND_MINT_DOMAIN_ID, {} }},
+            {USDD_SP1_DEPLOYMENT_BINDING_VERSION, USDD_SP1_ANNEX_DIGEST_MODE, USDD_SP1_ANNEX_STATEMENT_KIND,
+             USDD_SP1_ANNEX_ENVELOPE_VERSION, USDD_SP1_ANNEX_PROOF_SYSTEM},
+            SP1_ANNEX_MAX_SIZE,V11_PARAMETERIZED_CONTROLLER_PROFILE,[this](uint64_t index) {
+            if (!m_tx) throw std::logic_error("USDD resource transaction not selected");
+            const auto& stack = m_tx->witness.vtxinwit.at(index).scriptWitness.stack;
+            using Bytes = std::span<const unsigned char>;
+            return drivechain::haskell::UsddWitness{stack.empty() ? Bytes{} : Bytes{stack.back()},
+                stack.size()>2 ? Bytes{stack[2]} : Bytes{}, stack.size()>3 ? Bytes{stack[3]} : Bytes{},stack.size()};
+        }};
+    }
+};
+
 inline Sp1AnnexResourceUsage GetUsddSp1AnnexResourceUsage(const CTransaction& tx)
 {
     Sp1AnnexResourceUsage usage;
-    for (const auto& input_witness : tx.witness.vtxinwit) {
-        const auto& stack = input_witness.scriptWitness.stack;
-        if (stack.size() < 2 ||
-            !IsUsddSp1ProofAnnex(stack.back())) {
-            continue;
-        }
-        ++usage.namespace_annexes;
-        usage.oversized |= stack.back().size() > SP1_ANNEX_MAX_SIZE;
-
-        Sp1ProofAnnexView parsed;
-        const Sp1AnnexError parse_error =
-            ParseUsddSp1ProofAnnex(stack.back(), parsed);
-        switch (parse_error) {
-        case Sp1AnnexError::OK:
-            break;
-        case Sp1AnnexError::PUBLIC_VALUES_TOO_LARGE:
-            // Preserve rejection while reporting the precise bounded-field
-            // violation. All other parser failures remain malformed-envelope
-            // errors, including V11 zero or wrong-width public values.
-            usage.malformed_public_values = true;
-            continue;
-        case Sp1AnnexError::NOT_USDD:
-        case Sp1AnnexError::TOO_LARGE:
-        case Sp1AnnexError::TRUNCATED:
-        case Sp1AnnexError::BAD_MAGIC:
-        case Sp1AnnexError::BAD_VERSION:
-        case Sp1AnnexError::BAD_PROOF_SYSTEM:
-        case Sp1AnnexError::BAD_STATEMENT_KIND:
-        case Sp1AnnexError::BAD_DIGEST_MODE:
-        case Sp1AnnexError::BAD_FLAGS:
-        case Sp1AnnexError::EMPTY_PUBLIC_VALUES:
-        case Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES:
-        case Sp1AnnexError::EMPTY_PROOF:
-        case Sp1AnnexError::ZERO_GUEST_PROGRAM_ID:
-        case Sp1AnnexError::LENGTH_MISMATCH:
-            usage.malformed = true;
-            continue;
-        }
-
-        if constexpr (ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
-            if (parsed.statement_kind !=
-                Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2) {
-                usage.malformed = true;
-                continue;
-            }
-        }
-
-        // A reserved proof annex is valid only on the exact structural form
-        // of a Tapsimplicity script-path spend:
-        //
-        //   witness, program, script CMR, control block, annex
-        //
-        // UTXO commitment and program/CMR equality remain script-consensus
-        // checks. This context-free rule also compares the carried CMR and
-        // annex guest ID to the frozen pair, preventing any other key path,
-        // Tapscript, or Tapsimplicity program from occupying the proof lane.
-        if (stack.size() != SP1_TAPSIMPLICITY_WITNESS_ITEMS ||
-            stack[2].size() != 32) {
-            usage.wrong_spend_shape = true;
-            continue;
-        }
-        const auto& control = stack[3];
-        const bool wrong_spend_shape =
-            control.size() < SP1_TAPROOT_CONTROL_BASE_SIZE ||
-            control.size() > SP1_TAPROOT_CONTROL_MAX_SIZE ||
-            (control.size() - SP1_TAPROOT_CONTROL_BASE_SIZE) %
-                    SP1_TAPROOT_CONTROL_NODE_SIZE !=
-                0 ||
-            (control[0] & SP1_TAPROOT_LEAF_MASK) !=
-                SP1_TAPSIMPLICITY_LEAF_VERSION;
-        usage.wrong_spend_shape |= wrong_spend_shape;
-        if (wrong_spend_shape) continue;
-
-        if constexpr (ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE) {
-            continue;
-        }
-
-        switch (CheckUsddSp1ProofIdentity(
-            stack[2], parsed.guest_program_id, parsed.public_values)) {
-        case Sp1ProofIdentityResult::MATCH:
-            break;
-        case Sp1ProofIdentityResult::WRONG_CONTROLLER_CMR:
-            usage.wrong_controller_cmr = true;
-            break;
-        case Sp1ProofIdentityResult::WRONG_GUEST_PROGRAM_ID:
-            usage.wrong_guest_program_id = true;
-            break;
-        case Sp1ProofIdentityResult::MALFORMED_PUBLIC_VALUES:
-            usage.malformed_public_values = true;
-            break;
-        case Sp1ProofIdentityResult::DEPLOYMENT_UNCONFIGURED:
-            usage.deployment_unconfigured = true;
-            break;
-        case Sp1ProofIdentityResult::WRONG_INBOUND_MINT_DOMAIN:
-            usage.wrong_inbound_mint_domain = true;
-            break;
-        }
-    }
+    ResourceReader reader;
+    const auto witnesses = reader.Select(tx);
+    // With no witnesses there are no rows to classify.
+    if (!witnesses) return usage;
+    const auto source = reader.Source();
+    const auto [flags,count] = drivechain::haskell::UsddResources(witnesses,source.fields,source.profile,
+        source.limit,source.parameterized,source.read);
+    usage.namespace_annexes = count;
+    usage.oversized = flags & 2;
+    usage.malformed = flags & 4;
+    usage.wrong_spend_shape = flags & 8;
+    usage.wrong_controller_cmr = flags & 16;
+    usage.wrong_guest_program_id = flags & 32;
+    usage.malformed_public_values = flags & 64;
+    usage.deployment_unconfigured = flags & 128;
+    usage.wrong_inbound_mint_domain = flags & 256;
     return usage;
 }
 

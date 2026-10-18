@@ -4,6 +4,7 @@
 #define BITCOIN_ECX_BOND_V2_H
 
 #include <serialize.h>
+#include <crypto/common.h>
 #include <uint256.h>
 
 #include <algorithm>
@@ -43,10 +44,7 @@ struct BigEndianUint128
     BigEndianUint128& operator=(uint64_t value)
     {
         bytes.fill(0);
-        for (size_t i = 0; i < 8; ++i) {
-            bytes[15 - i] = static_cast<unsigned char>(value & 0xff);
-            value >>= 8;
-        }
+        WriteBE64(bytes.data() + 8, value);
         return *this;
     }
 
@@ -59,18 +57,8 @@ struct BigEndianUint128
     bool ToU64(uint64_t& value) const
     {
         if (!FitsU64()) return false;
-        value = 0;
-        for (size_t i = 8; i < 16; ++i) value = (value << 8) | bytes[i];
+        value = ReadBE64(bytes.data() + 8);
         return true;
-    }
-
-    bool Increment()
-    {
-        for (auto cursor = bytes.rbegin(); cursor != bytes.rend(); ++cursor) {
-            ++*cursor;
-            if (*cursor != 0) return true;
-        }
-        return false;
     }
 
     friend bool operator==(const BigEndianUint128& left, const BigEndianUint128& right)

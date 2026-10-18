@@ -16,14 +16,17 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/common.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
+#include <haskell/bmm_constants.h>
 #include <drivechain_peg.h>
 #include <ecx_exchange_state.h>
 #include <drivechain_withdrawal.h>
 #include <flatfile.h>
 #include <hash.h>
+#include <haskell/bridge.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <init.h>
@@ -66,8 +69,6 @@
 
 #include <stdint.h>
 
-#include <univalue.h>
-
 #include <chrono>
 #include <condition_variable>
 #include <algorithm>
@@ -77,6 +78,7 @@
 #include <mutex>
 #include <string>
 #include <optional>
+#include <ranges>
 #include <vector>
 
 using kernel::CCoinsStats;
@@ -95,6 +97,14 @@ PrepareUTXOSnapshot(
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 static std::mutex g_usdd_withdrawal_proof_mutex;
+
+UniValue EcxWideNumberToJSON(std::span<const unsigned char,16> bytes, bool signed_value)
+{
+    UniValue number;
+    number.setNumStr(drivechain::haskell::WideDecimal(bytes,signed_value));
+    return number;
+}
+
 UniValue WriteUTXOSnapshot(
     Chainstate& chainstate,
     CCoinsViewCursor* pcursor,
@@ -240,6 +250,13 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
     result.pushKV("version", blockindex->nVersion);
     result.pushKV("versionHex", strprintf("%08x", blockindex->nVersion));
     result.pushKV("merkleroot", blockindex->hashMerkleRoot.GetHex());
+    if (Params().GetConsensus().utreexo && blockindex->nHeight > 0) {
+        UniValue accumulator(UniValue::VOBJ), roots(UniValue::VARR);
+        for (const auto& root : blockindex->utreexo.roots) roots.push_back(root.GetHex());
+        accumulator.pushKV("leaves", blockindex->utreexo.leaves);
+        accumulator.pushKV("roots", std::move(roots));
+        result.pushKV("utreexo", std::move(accumulator));
+    }
     if (Params().GetConsensus().elements_mode) {
         result.pushKV("withdrawalbundlehash", blockindex->hashWithdrawalBundle.GetHex());
         result.pushKV("bmmproofhash", blockindex->hashBmmProof.GetHex());
@@ -700,6 +717,12 @@ static RPCHelpMan getblockheader()
                                     {RPCResult::Type::ELISION, "", "same entries as \"current\""}
                                 }},
                             }},
+                            {RPCResult::Type::OBJ, "utreexo", /*optional=*/true, "Post-block accumulator on the isolated Utreexo test chain",
+                            {
+                                {RPCResult::Type::NUM, "leaves", "Cumulative leaf count, including spent leaves"},
+                                {RPCResult::Type::ARR, "roots", "Forest roots in commitment order",
+                                {{RPCResult::Type::STR_HEX, "", "Root hash"}}},
+                            }},
                             {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                             {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
                         }},
@@ -904,6 +927,12 @@ static RPCHelpMan getblock()
                         {
                             {RPCResult::Type::ELISION, "", "same entries as \"current\""}
                         }},
+                    }},
+                    {RPCResult::Type::OBJ, "utreexo", /*optional=*/true, "Post-block accumulator on the isolated Utreexo test chain",
+                    {
+                        {RPCResult::Type::NUM, "leaves", "Cumulative leaf count, including spent leaves"},
+                        {RPCResult::Type::ARR, "roots", "Forest roots in commitment order",
+                        {{RPCResult::Type::STR_HEX, "", "Root hash"}}},
                     }},
                     {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                     {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
@@ -1377,7 +1406,8 @@ static RPCHelpMan getecxstateutxoroot()
             HelpExampleRpc("getecxstateutxoroot", "\"txid\", 0")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    if (!Params().GetConsensus().elements_mode) {
+    if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
+            [](uint32_t) { return Params().GetConsensus().elements_mode; })) {
         throw JSONRPCError(
             RPC_MISC_ERROR,
             "ECX state is unavailable outside an Elements-mode chain");
@@ -1388,17 +1418,22 @@ static RPCHelpMan getecxstateutxoroot()
 
     const uint256 txid{ParseHashV(request.params[0], "txid")};
     const int vout = request.params[1].getInt<int>();
-    if (vout < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be nonnegative");
-    const COutPoint outpoint{Txid::FromUint256(txid), static_cast<uint32_t>(vout)};
-    const auto coin = chainman.ActiveChainstate().CoinsTip().GetCoin(outpoint);
-    if (!coin) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "ECX singleton UTXO not found");
-    }
+    COutPoint outpoint;
+    std::optional<Coin> coin;
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
+        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+        switch (step) {
+        case 1: return vout >= 0;
+        case 2: throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be nonnegative");
+        case 3:
+            outpoint = COutPoint{Txid::FromUint256(txid), static_cast<uint32_t>(vout)};
+            coin = chainman.ActiveChainstate().CoinsTip().GetCoin(outpoint);
+            return coin.has_value();
+        case 4: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "ECX singleton UTXO not found");
+        default: throw std::logic_error("invalid ECX UTXO admission action");
+        }
+    });
 
-    const bool eligible = coin->out.nAsset.IsExplicit() &&
-        coin->out.nValue.IsExplicit() && coin->out.nNonce.IsNull() &&
-        coin->out.scriptPubKey.size() == 34 &&
-        coin->out.scriptPubKey[0] == OP_1 && coin->out.scriptPubKey[1] == 0x20;
     UniValue result(UniValue::VOBJ);
     result.pushKV(
         "root",
@@ -1406,7 +1441,7 @@ static RPCHelpMan getecxstateutxoroot()
             Params().GetConsensus().hashGenesisBlock,
             outpoint,
             coin->out).GetHex());
-    result.pushKV("eligible", eligible);
+    result.pushKV("eligible", ecx::IsStateAuthorityOutput(coin->out));
     result.pushKV("height", static_cast<uint64_t>(coin->nHeight));
     return result;
 },
@@ -1470,7 +1505,8 @@ static RPCHelpMan getecxconsensuscontext()
             HelpExampleRpc("getecxconsensuscontext", "")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    if (!Params().GetConsensus().elements_mode) {
+    if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
+            [](uint32_t) { return Params().GetConsensus().elements_mode; })) {
         throw JSONRPCError(
             RPC_MISC_ERROR,
             "ECX consensus context is unavailable outside an Elements-mode chain");
@@ -1478,72 +1514,69 @@ static RPCHelpMan getecxconsensuscontext()
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
     const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-    if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
-
     std::string context_error;
     ecx::ExchangeConsensusSnapshot exchange;
-    if (!ecx::GetExchangeConsensusSnapshot(
-            chainman.ActiveChainstate().CoinsTip(),
-            tip,
-            exchange,
-            context_error)) {
-        throw JSONRPCError(RPC_MISC_ERROR, context_error);
-    }
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
+        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+        switch (step) {
+        case 1: return tip != nullptr;
+        case 2: throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
+        case 3: return ecx::GetExchangeConsensusSnapshot(
+            chainman.ActiveChainstate().CoinsTip(), tip, exchange, context_error);
+        case 4: throw JSONRPCError(RPC_MISC_ERROR, context_error);
+        default: throw std::logic_error("invalid ECX context admission action");
+        }
+    });
     drivechain::BmmParentContext bmm;
     bool bmm_authenticated{true};
     drivechain::BmmL1State bmm_state;
-    if (Params().GetConsensus().drivechain_slot.has_value()) {
-        // Report the prior child's authenticated P, not its M7 inclusion block Q
-        // or the advancing mempool parent. Native Alpha has no signet BMM state.
-        // Use the same authentication gate as the covenant checkpoint context.
-        if (!GetPriorActiveBmmParentCheckpoint(tip, Params().GetConsensus())) {
-            throw JSONRPCError(
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_REPORT,
+        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+        switch (step) {
+        case 1: return Params().GetConsensus().drivechain_slot.has_value();
+        // Report authenticated P, not its M7 inclusion Q or the mempool parent.
+        case 2: return GetPriorActiveBmmParentCheckpoint(tip, Params().GetConsensus()).has_value();
+        case 3: throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "active native ECX tip has no authenticated parent checkpoint");
-        }
+        case 4: {
         const DrivechainAnchor& anchor{*tip->m_drivechain_anchor};
         bmm.block_hash = anchor.parent_block_hash;
         bmm.height = anchor.parent_height;
         bmm.median_time_past = anchor.parent_median_time_past;
-    } else if (drivechain::GetEffectiveBmmState(
-            chainman.ActiveChainstate().CoinsTip(),
-            tip,
-            bmm_state,
-            context_error)) {
-        if (!drivechain::GetBmmParentContext(bmm_state, bmm, context_error)) {
-            throw JSONRPCError(RPC_MISC_ERROR, context_error);
+        return 1;
         }
-    } else {
-        const std::string& network = Params().NetworkIDString();
-        if (network != "elementsregtest") {
-            throw JSONRPCError(RPC_MISC_ERROR, context_error);
-        }
-        if (tip->ecxParentHeight == 0) {
-            throw JSONRPCError(
+        case 5: return drivechain::GetEffectiveBmmState(chainman.ActiveChainstate().CoinsTip(),tip,bmm_state,context_error);
+        case 6: return drivechain::GetBmmParentContext(bmm_state,bmm,context_error);
+        case 7: throw JSONRPCError(RPC_MISC_ERROR,context_error);
+        case 8: return Params().NetworkIDString() == "elementsregtest";
+        case 9: return tip->ecxParentHeight;
+        case 10: throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "active ECX regtest tip has no synthetic parent height");
-        }
+        case 11:
         bmm.block_hash.SetNull();
         bmm.height = tip->ecxParentHeight;
         bmm.median_time_past = tip->GetMedianTimePast();
         bmm_authenticated = false;
-    }
-    if (tip->ecxParentHeight == 0 || tip->ecxParentHeight != bmm.height) {
-        throw JSONRPCError(
+        return 1;
+        case 12: return tip->ecxParentHeight;
+        case 13: return tip->ecxParentHeight == bmm.height;
+        case 14: throw JSONRPCError(
             RPC_MISC_ERROR,
             "active ECX header approval height disagrees with BMM chainstate");
-    }
+        default: throw std::logic_error("invalid parent report action");
+        }
+    });
 
-    UniValue forced(UniValue::VOBJ);
-    forced.pushKV("headroot", exchange.forced_inbox_root.GetHex());
-    forced.pushKV("entrycount", exchange.forced_entry_count);
-    forced.pushKV("nextindex", exchange.forced_entry_count);
-    forced.pushKV("processedcursor", exchange.forced_processed_cursor);
-    UniValue deposits(UniValue::VOBJ);
-    deposits.pushKV("headroot", exchange.deposit_inbox_root.GetHex());
-    deposits.pushKV("entrycount", exchange.deposit_entry_count);
-    deposits.pushKV("nextindex", exchange.deposit_entry_count);
-    deposits.pushKV("processedcursor", exchange.deposit_processed_cursor);
+    const auto inbox_json = [](const uint256& root, uint64_t count, uint64_t cursor) {
+        UniValue inbox(UniValue::VOBJ);
+        inbox.pushKV("headroot",root.GetHex());
+        inbox.pushKV("entrycount",count);
+        inbox.pushKV("nextindex",count);
+        inbox.pushKV("processedcursor",cursor);
+        return inbox;
+    };
     UniValue parent(UniValue::VOBJ);
     parent.pushKV("authenticated", bmm_authenticated);
     parent.pushKV("parentheight", bmm.height);
@@ -1554,89 +1587,48 @@ static RPCHelpMan getecxconsensuscontext()
     result.pushKV("sidechainheight", static_cast<uint64_t>(tip->nHeight));
     result.pushKV("sidechainblockhash", tip->GetBlockHash().GetHex());
     result.pushKV("exchangestateroot", exchange.exchange_state_root.GetHex());
-    result.pushKV("forcedinbox", forced);
-    result.pushKV("depositinbox", deposits);
+    result.pushKV("forcedinbox", inbox_json(exchange.forced_inbox_root,exchange.forced_entry_count,exchange.forced_processed_cursor));
+    result.pushKV("depositinbox", inbox_json(exchange.deposit_inbox_root,exchange.deposit_entry_count,exchange.deposit_processed_cursor));
     result.pushKV("bmm", parent);
     result.pushKV("sourceparentheight", static_cast<uint64_t>(tip->ecxParentHeight));
     result.pushKV(
         "sourcebacklogoldestparentheight",
         exchange.source_backlog_oldest_parent_height);
     const ecx::ExchangeConsensus& frozen{ecx::LayerTwoLabsExchangeConsensus()};
-    if (frozen.bond_v2.activation_enabled) {
-        if (!tip->ecxBondV2Capital.has_value()) {
-            throw JSONRPCError(
+    static_assert(ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION == 4);
+    if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_REPORT,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return frozen.bond_v2.activation_enabled;
+        case 2: return tip->ecxBondV2Capital.has_value();
+        case 3: throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "active ECX V2 tip has no fully verified capital projection");
+        default: break;
         }
         const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
-        const bool finite_identity{
-            capital.proof_profile == 0 &&
-            capital.configuration_hash == frozen.bond_v2.configuration_hash &&
-            capital.transition_program_id == frozen.bond_v2.transition_program_id &&
-            capital.transition_cmr == frozen.bond_v2.transition_cmr};
-        const bool successor_identity{
-            capital.proof_profile == 1 &&
-            capital.configuration_hash ==
-                frozen.bond_v2.incremental_successor_configuration_hash &&
-            capital.transition_program_id ==
-                frozen.bond_v2.incremental_successor_program_id &&
-            capital.transition_cmr ==
-                frozen.bond_v2.incremental_successor_transition_cmr};
-        if (capital.version != ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION ||
-            capital.exchange_state_root != exchange.exchange_state_root ||
-            (!finite_identity && !successor_identity) ||
-            capital.bond_asset_id != frozen.bond_v2.bond_asset_id ||
-            capital.bond_deployment_commitment !=
-                frozen.bond_v2.bond_deployment_commitment ||
-            capital.bond_inventory_covenant_hash !=
-                frozen.bond_v2.inventory_covenant_script_sha256 ||
-            capital.capital_mode > 2 ||
-            capital.oracle_mode > 3 ||
-            capital.operationally_safe > 1 ||
-            std::any_of(
-                capital.legacy_fee_pool.begin(),
-                capital.legacy_fee_pool.end(),
-                [](unsigned char byte) { return byte != 0; })) {
-            throw JSONRPCError(
+        switch (step) {
+            case 4: return capital.version;
+            case 5: return drivechain::haskell::ExchangeCarryIdentity(capital.proof_profile,
+                std::array<const unsigned char*,15>{
+                    capital.configuration_hash.begin(),capital.transition_program_id.begin(),capital.transition_cmr.begin(),
+                    capital.exchange_state_root.begin(),capital.bond_asset_id.begin(),capital.bond_deployment_commitment.begin(),
+                    frozen.bond_v2.configuration_hash.begin(),frozen.bond_v2.transition_program_id.begin(),frozen.bond_v2.transition_cmr.begin(),
+                    frozen.bond_v2.incremental_successor_configuration_hash.begin(),frozen.bond_v2.incremental_successor_program_id.begin(),
+                    frozen.bond_v2.incremental_successor_transition_cmr.begin(),exchange.exchange_state_root.begin(),
+                    frozen.bond_v2.bond_asset_id.begin(),frozen.bond_v2.bond_deployment_commitment.begin()});
+            case 6: return capital.bond_inventory_covenant_hash == frozen.bond_v2.inventory_covenant_script_sha256;
+            case 7: return capital.capital_mode;
+            case 8: return capital.oracle_mode;
+            case 9: return capital.operationally_safe;
+            case 10: return capital.legacy_fee_pool == std::array<unsigned char,16>{};
+            case 11: throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "active ECX V2 capital projection is not root/frozen-identity bound");
-        }
-        const auto u128_number = [](const std::array<unsigned char, 16>& bytes) {
-            std::string decimal{"0"};
-            for (const unsigned char byte : bytes) {
-                unsigned int carry{byte};
-                for (auto digit = decimal.rbegin(); digit != decimal.rend(); ++digit) {
-                    const unsigned int value{
-                        static_cast<unsigned int>(*digit - '0') * 256U + carry};
-                    *digit = static_cast<char>('0' + value % 10U);
-                    carry = value / 10U;
-                }
-                while (carry != 0) {
-                    decimal.insert(decimal.begin(), static_cast<char>('0' + carry % 10U));
-                    carry /= 10U;
-                }
+            default: throw std::logic_error("invalid capital report action");
             }
-            UniValue number;
-            number.setNumStr(decimal);
-            return number;
-        };
-        const auto counter_number = [&u128_number](const ecx::BigEndianUint128& value) {
-            return u128_number(value.bytes);
-        };
-        const auto i128_number = [&u128_number](std::array<unsigned char, 16> bytes) {
-            const bool negative{(bytes[0] & 0x80) != 0};
-            if (!negative) return u128_number(bytes);
-            unsigned int carry{1};
-            for (auto cursor = bytes.rbegin(); cursor != bytes.rend(); ++cursor) {
-                const unsigned int value{static_cast<unsigned int>(~*cursor & 0xff) + carry};
-                *cursor = static_cast<unsigned char>(value & 0xff);
-                carry = value >> 8;
-            }
-            UniValue magnitude{u128_number(bytes)};
-            UniValue number;
-            number.setNumStr("-" + magnitude.getValStr());
-            return number;
-        };
+        })) {
+        const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
         UniValue capital_json(UniValue::VOBJ);
         capital_json.pushKV("version", capital.version);
         capital_json.pushKV(
@@ -1656,28 +1648,25 @@ static RPCHelpMan getecxconsensuscontext()
         capital_json.pushKV("fundingstateroot", capital.funding_state_root.GetHex());
         capital_json.pushKV(
             "bondinventorycovenanthash", capital.bond_inventory_covenant_hash.GetHex());
-        capital_json.pushKV("insurancereservequoteunits", u128_number(capital.insurance_reserve));
+        capital_json.pushKV("insurancereservequoteunits", EcxWideNumberToJSON(capital.insurance_reserve));
         capital_json.pushKV("issuedbondunits", capital.issued_share_atoms);
         capital_json.pushKV("outstandingbondunits", capital.outstanding_share_atoms);
         capital_json.pushKV("inventorybondunits", capital.inventory_share_atoms);
-        capital_json.pushKV("navquoteunitsperbond", u128_number(capital.nav_per_whole_share));
-        capital_json.pushKV("deficitquoteunits", u128_number(capital.full_bound_deficit));
-        capital_json.pushKV("targetreservequoteunits", u128_number(capital.target_reserve));
-        capital_json.pushKV("coveragebps", u128_number(capital.coverage_bps));
-        capital_json.pushKV("controlledquoteunits", u128_number(capital.controlled_usdd_atoms));
-        capital_json.pushKV(
-            "mode",
-            capital.capital_mode == 0 ? "Normal" :
-            capital.capital_mode == 1 ? "ReduceOnly" : "Recovery");
+        capital_json.pushKV("navquoteunitsperbond", EcxWideNumberToJSON(capital.nav_per_whole_share));
+        capital_json.pushKV("deficitquoteunits", EcxWideNumberToJSON(capital.full_bound_deficit));
+        capital_json.pushKV("targetreservequoteunits", EcxWideNumberToJSON(capital.target_reserve));
+        capital_json.pushKV("coveragebps", EcxWideNumberToJSON(capital.coverage_bps));
+        capital_json.pushKV("controlledquoteunits", EcxWideNumberToJSON(capital.controlled_usdd_atoms));
+        capital_json.pushKV("mode", drivechain::ECX_CAPITAL_MODES.at(capital.capital_mode));
         capital_json.pushKV("minimumauthenticatedprice", capital.minimum_authenticated_price);
         capital_json.pushKV("maximumauthenticatedprice", capital.maximum_authenticated_price);
         capital_json.pushKV("fundingepoch", capital.funding_epoch);
         capital_json.pushKV("fundingrateppm", capital.funding_rate_ppm);
         capital_json.pushKV(
-            "globalfundingindexnumerator", i128_number(capital.global_funding_index_numerator));
+            "globalfundingindexnumerator", EcxWideNumberToJSON(capital.global_funding_index_numerator,true));
         capital_json.pushKV("redemptionqueueroot", capital.redemption_queue_root.GetHex());
-        capital_json.pushKV("redemptionhead", counter_number(capital.redemption_head));
-        capital_json.pushKV("redemptiontail", counter_number(capital.redemption_tail));
+        capital_json.pushKV("redemptionhead", EcxWideNumberToJSON(capital.redemption_head.bytes));
+        capital_json.pushKV("redemptiontail", EcxWideNumberToJSON(capital.redemption_tail.bytes));
         capital_json.pushKV(
             "queuedredemptionbondunits",
             capital.queued_redemption_share_atoms);
@@ -1685,39 +1674,35 @@ static RPCHelpMan getecxconsensuscontext()
         oracle_json.pushKV("certificatehash", capital.oracle_certificate_hash.GetHex());
         oracle_json.pushKV(
             "validthroughparentmtp", capital.oracle_valid_through_parent_mtp);
-        oracle_json.pushKV(
-            "mode",
-            capital.oracle_mode == 0 ? "Normal" :
-            capital.oracle_mode == 1 ? "ReduceOnly" :
-            capital.oracle_mode == 2 ? "Disputed" : "Halt");
+        oracle_json.pushKV("mode", drivechain::ECX_ORACLE_MODES.at(capital.oracle_mode));
         capital_json.pushKV("oracle", oracle_json);
         capital_json.pushKV(
             "encryptedavailabilityroot", capital.encrypted_availability_root.GetHex());
         UniValue bond_inbox_json(UniValue::VOBJ);
         bond_inbox_json.pushKV("headroot", capital.bond_inbox_head_root.GetHex());
-        bond_inbox_json.pushKV("entrycount", counter_number(capital.bond_inbox_entry_count));
+        bond_inbox_json.pushKV("entrycount", EcxWideNumberToJSON(capital.bond_inbox_entry_count.bytes));
         bond_inbox_json.pushKV("processedroot", capital.bond_inbox_processed_root.GetHex());
         bond_inbox_json.pushKV(
-            "processedcursor", counter_number(capital.bond_inbox_processed_cursor));
+            "processedcursor", EcxWideNumberToJSON(capital.bond_inbox_processed_cursor.bytes));
         bond_inbox_json.pushKV("outcomeroot", capital.bond_inbox_outcome_root.GetHex());
         bond_inbox_json.pushKV(
-            "outcomecount", counter_number(capital.bond_inbox_outcome_count));
+            "outcomecount", EcxWideNumberToJSON(capital.bond_inbox_outcome_count.bytes));
         bond_inbox_json.pushKV(
             "nodeverifiedsourceheadroot", capital.node_bond_inbox_head_root.GetHex());
         bond_inbox_json.pushKV(
-            "nodeverifiedsourceentrycount", counter_number(capital.node_bond_inbox_entry_count));
+            "nodeverifiedsourceentrycount", EcxWideNumberToJSON(capital.node_bond_inbox_entry_count.bytes));
         capital_json.pushKV("bondinbox", bond_inbox_json);
         UniValue execution_json(UniValue::VOBJ);
         execution_json.pushKV(
             "receiptbatchroot", capital.matcher_execution_receipt_batch_root.GetHex());
         execution_json.pushKV(
-            "previoussequence", counter_number(capital.previous_matcher_execution_sequence));
-        execution_json.pushKV("sequence", counter_number(capital.matcher_execution_sequence));
+            "previoussequence", EcxWideNumberToJSON(capital.previous_matcher_execution_sequence.bytes));
+        execution_json.pushKV("sequence", EcxWideNumberToJSON(capital.matcher_execution_sequence.bytes));
         capital_json.pushKV("matcherexecution", execution_json);
         capital_json.pushKV(
             "lasttransitionsidechainheight", capital.last_transition_sidechain_height);
         capital_json.pushKV("operationallysafe", capital.operationally_safe == 1);
-        capital_json.pushKV("legacyfeepoolquoteunits", u128_number(capital.legacy_fee_pool));
+        capital_json.pushKV("legacyfeepoolquoteunits", EcxWideNumberToJSON(capital.legacy_fee_pool));
         result.pushKV("capital", capital_json);
     }
     return result;
@@ -1739,7 +1724,7 @@ static RPCHelpMan getecxbondinboxentries()
         {
             {"start_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
                 "First active sidechain height to scan (at or after V2 activation)"},
-            {"block_count", RPCArg::Type::NUM, RPCArg::Default{1},
+            {"block_count", RPCArg::Type::NUM, RPCArg::Default{drivechain::BOND_EXPORT_DEFAULT_BLOCKS},
                 "Number of active blocks to scan, 1..64; output stops before "
                 "a block that would exceed eight returned entries"},
         },
@@ -1780,17 +1765,21 @@ static RPCHelpMan getecxbondinboxentries()
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     const ecx::ExchangeConsensus& frozen{ecx::LayerTwoLabsExchangeConsensus()};
-    if (!Params().GetConsensus().elements_mode ||
-        !frozen.bond_v2.activation_enabled || !frozen.bond_v2.identities_frozen) {
+    if (!drivechain::haskell::ParentReplayAll<3>({
+        [&] { return Params().GetConsensus().elements_mode; },
+        [&] { return frozen.bond_v2.activation_enabled; },
+        [&] { return frozen.bond_v2.identities_frozen; },
+    })) {
         throw JSONRPCError(
             RPC_MISC_ERROR,
             "frozen ECX bond V2 source export is unavailable");
     }
     const int start_height{request.params[0].getInt<int>()};
     const int block_count{
-        request.params[1].isNull() ? 1 : request.params[1].getInt<int>()};
-    if (start_height < frozen.activation_height || block_count < 1 ||
-        block_count > 64) {
+        request.params[1].isNull() ? drivechain::BOND_EXPORT_DEFAULT_BLOCKS : request.params[1].getInt<int>()};
+    int32_t requested_end{0};
+    if (drivechain::haskell::ExchangeExportRange(start_height, block_count,
+            frozen.activation_height, std::nullopt, requested_end)) {
         throw JSONRPCError(
             RPC_INVALID_PARAMETER,
             "start_height must be at/after V2 activation and block_count must be 1..64");
@@ -1798,48 +1787,62 @@ static RPCHelpMan getecxbondinboxentries()
 
     uint256 captured_tip_hash;
     int captured_tip_height{0};
-    int requested_end{0};
     ecx::BondV2CapitalSnapshot working;
     std::vector<std::pair<const CBlockIndex*, ecx::BondV2CapitalSnapshot>> blocks;
+    const auto has_projection = [](const CBlockIndex* index) {
+        return drivechain::haskell::ParentReplayAll<2>({
+            [&] { return index != nullptr; },
+            [&] { return index->ecxBondV2Capital.has_value(); },
+        });
+    };
     {
         LOCK(cs_main);
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-        if (tip == nullptr || start_height > tip->nHeight) {
+        if (drivechain::haskell::ExchangeExportRange(start_height, block_count,
+                frozen.activation_height, tip ? tip->nHeight : -1, requested_end)) {
             throw JSONRPCError(
                 RPC_INVALID_PARAMETER, "start_height is beyond the active tip");
         }
         captured_tip_hash = tip->GetBlockHash();
         captured_tip_height = tip->nHeight;
-        requested_end = std::min(
-            tip->nHeight,
-            start_height + block_count - 1);
-        if (start_height == frozen.activation_height) {
-            working.bond_inbox_head_root = ecx::BondInboxGenesisHead(frozen);
-            working.node_bond_inbox_head_root = working.bond_inbox_head_root;
-        } else {
-            const CBlockIndex* previous{chainman.ActiveChain()[start_height - 1]};
-            if (previous == nullptr || !previous->ecxBondV2Capital.has_value()) {
-                throw JSONRPCError(
+        const CBlockIndex* previous{nullptr};
+        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_INITIALIZE,
+            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+            switch (step) {
+            case 1: return start_height == frozen.activation_height;
+            case 2:
+                working.bond_inbox_head_root = ecx::BondInboxGenesisHead(frozen);
+                working.node_bond_inbox_head_root = working.bond_inbox_head_root;
+                return 1;
+            case 3:
+                previous = chainman.ActiveChain()[start_height - 1];
+                return has_projection(previous);
+            case 4: throw JSONRPCError(
                     RPC_MISC_ERROR,
                     "predecessor lacks a verified bond-inbox projection");
+            case 5: working = *previous->ecxBondV2Capital; return 1;
+            default: throw std::logic_error("invalid bond-inbox initialization action");
             }
-            working = *previous->ecxBondV2Capital;
-        }
-        for (int height = start_height; height <= requested_end; ++height) {
-            const CBlockIndex* index{chainman.ActiveChain()[height]};
-            if (index == nullptr || !index->ecxBondV2Capital.has_value()) {
+        });
+        const std::function<bool(int64_t)> capture = [&](int64_t height) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+            AssertLockHeld(cs_main);
+            const CBlockIndex* index{chainman.ActiveChain()[static_cast<int>(height)]};
+            if (!has_projection(index)) {
                 throw JSONRPCError(
                     RPC_MISC_ERROR,
                     strprintf("height %d lacks a verified bond-inbox projection", height));
             }
             blocks.emplace_back(index, *index->ecxBondV2Capital);
-        }
+            return true;
+        };
+        drivechain::haskell::ParentReplayEach(
+            std::views::iota(int64_t{start_height}, int64_t{requested_end} + 1), capture);
     }
 
     std::vector<ecx::BondInboxSourceExport> exported;
     int end_height{start_height - 1};
-    bool truncated{false};
-    for (const auto& [index, expected] : blocks) {
+    const bool truncated{!drivechain::haskell::ParentReplayEach(blocks, [&](const auto& entry) {
+        const auto& [index, expected] = entry;
         CBlock block;
         if (!chainman.m_blockman.ReadBlock(block, *index)) {
             throw JSONRPCError(
@@ -1847,47 +1850,41 @@ static RPCHelpMan getecxbondinboxentries()
                 strprintf("archival block unavailable at height %d", index->nHeight));
         }
         ecx::BondV2CapitalSnapshot candidate{working};
-        if (expected.proof_profile == 1 && working.proof_profile == 0) {
-            candidate.proof_profile = 1;
-            candidate.bond_inbox_head_root =
-                ecx::IncrementalSuccessorBondInboxGenesisHead(frozen);
-            candidate.node_bond_inbox_head_root = candidate.bond_inbox_head_root;
-            candidate.bond_inbox_entry_count = 0;
-            candidate.node_bond_inbox_entry_count = 0;
-        }
         std::vector<ecx::BondInboxSourceExport> block_entries;
         std::string error;
-        const bool reconstructed{expected.proof_profile == 1
-            ? ecx::AppendIncrementalSuccessorBondInboxSourcesForBlock(
-                block,
-                static_cast<uint64_t>(index->nHeight),
-                static_cast<uint64_t>(index->ecxParentHeight),
-                candidate,
-                error,
-                frozen,
-                &block_entries)
-            : ecx::AppendBondInboxSourcesForBlock(
-                block,
-                static_cast<uint64_t>(index->nHeight),
-                static_cast<uint64_t>(index->ecxParentHeight),
-                candidate,
-                error,
-                frozen,
-                &block_entries)};
-        if (!reconstructed) {
-            throw JSONRPCError(RPC_MISC_ERROR, error);
-        }
-        if (candidate.node_bond_inbox_head_root !=
-                expected.node_bond_inbox_head_root ||
-            candidate.node_bond_inbox_entry_count !=
-                expected.node_bond_inbox_entry_count) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "archival source reconstruction disagrees with the verified block index");
-        }
-        if (!exported.empty() && exported.size() + block_entries.size() > 8) {
-            truncated = true;
-            break;
+        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECONSTRUCT,
+            [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return expected.proof_profile;
+            case 2: return working.proof_profile;
+            case 3:
+                candidate.proof_profile = 1;
+                candidate.bond_inbox_head_root = ecx::IncrementalSuccessorBondInboxGenesisHead(frozen);
+                candidate.node_bond_inbox_head_root = candidate.bond_inbox_head_root;
+                candidate.bond_inbox_entry_count = 0;
+                candidate.node_bond_inbox_entry_count = 0;
+                return true;
+            case 4: case 5: {
+                const auto append_sources = step == 5
+                    ? ecx::AppendIncrementalSuccessorBondInboxSourcesForBlock : ecx::AppendBondInboxSourcesForBlock;
+                return append_sources(block, static_cast<uint64_t>(index->nHeight),
+                    static_cast<uint64_t>(index->ecxParentHeight), candidate, error, frozen, &block_entries);
+            }
+            case 6: return candidate.node_bond_inbox_head_root == expected.node_bond_inbox_head_root;
+            case 7: return candidate.node_bond_inbox_entry_count == expected.node_bond_inbox_entry_count;
+            case 8:
+                throw JSONRPCError(RPC_MISC_ERROR, "archival source reconstruction disagrees with the verified block index");
+            case 9: throw JSONRPCError(RPC_MISC_ERROR, error);
+            default: throw std::logic_error("invalid bond-inbox reconstruction action");
+            }
+        });
+        if (drivechain::haskell::ParentReplayAll<2>({
+            [&] { return !exported.empty(); },
+            [&] { return drivechain::haskell::ParentReplayRecord(
+                drivechain::haskell::ReplayRecordKind::LANE_EXCEEDED, drivechain::BOND_EXPORT_ENTRY_LIMIT, 0,
+                exported.size(), block_entries.size()); },
+        })) {
+            return false;
         }
         exported.insert(
             exported.end(),
@@ -1895,50 +1892,45 @@ static RPCHelpMan getecxbondinboxentries()
             std::make_move_iterator(block_entries.end()));
         working = expected;
         end_height = index->nHeight;
-    }
+        return true;
+    })};
 
     {
         LOCK(cs_main);
         const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-        if (tip == nullptr || tip->GetBlockHash() != captured_tip_hash ||
-            tip->nHeight != captured_tip_height) {
+        if (!drivechain::haskell::ParentReplayAll<3>({
+            [&] { return tip != nullptr; },
+            [&] { return tip->GetBlockHash() == captured_tip_hash; },
+            [&] { return tip->nHeight == captured_tip_height; },
+        })) {
             throw JSONRPCError(
                 RPC_MISC_ERROR,
                 "active chain changed while reconstructing bond-inbox entries");
         }
-        for (const auto& [index, expected] : blocks) {
-            if (index->nHeight > end_height) break;
-            if (chainman.ActiveChain()[index->nHeight] != index) {
-                throw JSONRPCError(
+        const std::function<bool(const std::pair<const CBlockIndex*, ecx::BondV2CapitalSnapshot>&)> check_range =
+            [&](const auto& entry) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+            AssertLockHeld(cs_main);
+            const auto* index = entry.first;
+            return bool(drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECHECK,
+                [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+                switch (step) {
+                case 1: return index->nHeight <= end_height;
+                case 2: return chainman.ActiveChain()[index->nHeight] == index;
+                case 3: throw JSONRPCError(
                     RPC_MISC_ERROR,
                     "bond-inbox export range was reorganized during reconstruction");
-            }
-        }
+                default: throw std::logic_error("invalid bond-inbox recheck action");
+                }
+            }));
+        };
+        drivechain::haskell::ParentReplayEach(blocks, check_range);
     }
 
-    const auto u128_number = [](const ecx::BigEndianUint128& value) {
-        std::string decimal{"0"};
-        for (const unsigned char byte : value.bytes) {
-            unsigned int carry{byte};
-            for (auto cursor = decimal.rbegin(); cursor != decimal.rend(); ++cursor) {
-                const unsigned int digit = static_cast<unsigned int>(*cursor - '0') * 256 + carry;
-                *cursor = static_cast<char>('0' + digit % 10);
-                carry = digit / 10;
-            }
-            while (carry != 0) {
-                decimal.insert(decimal.begin(), static_cast<char>('0' + carry % 10));
-                carry /= 10;
-            }
-        }
-        UniValue result(UniValue::VNUM);
-        result.setNumStr(decimal);
-        return result;
-    };
     UniValue entries(UniValue::VARR);
     for (const auto& entry : exported) {
         UniValue object(UniValue::VOBJ);
         object.pushKV("proofprofile", static_cast<uint64_t>(entry.proof_profile));
-        object.pushKV("entryindex", u128_number(entry.entry_index_u128));
+        object.pushKV("entryindex", EcxWideNumberToJSON(entry.entry_index_u128.bytes));
         object.pushKV("sidechainheight", entry.sidechain_height);
         object.pushKV("observedparentheight", entry.observed_parent_height);
         object.pushKV(
@@ -1959,8 +1951,6 @@ static RPCHelpMan getecxbondinboxentries()
         object.pushKV("sourcetransactionhex", HexStr(entry.source_transaction));
         entries.push_back(object);
     }
-    const int next_height{std::max(start_height, end_height + 1)};
-    if (end_height < requested_end) truncated = true;
     UniValue result(UniValue::VOBJ);
     result.pushKV("schema_version", 4);
     result.pushKV("configurationhash", frozen.bond_v2.configuration_hash.GetHex());
@@ -1969,11 +1959,11 @@ static RPCHelpMan getecxbondinboxentries()
     result.pushKV("capturedtipheight", captured_tip_height);
     result.pushKV("startheight", start_height);
     result.pushKV("endheight", end_height);
-    result.pushKV("nextheight", next_height);
+    result.pushKV("nextheight", int64_t{end_height} + 1);
     result.pushKV("truncated", truncated);
     result.pushKV("endingheadroot", working.node_bond_inbox_head_root.GetHex());
     result.pushKV(
-        "endingentrycount", u128_number(working.node_bond_inbox_entry_count));
+        "endingentrycount", EcxWideNumberToJSON(working.node_bond_inbox_entry_count.bytes));
     result.pushKV("entries", entries);
     return result;
 },
@@ -2350,22 +2340,29 @@ static RPCHelpMan getalphacheckpointevidence()
     LOCK(cs_main);
     CChain& active = chainman.ActiveChain();
     const CBlockIndex* tip = active.Tip();
-    if (!tip || tip->GetBlockHash() != expected || expected.IsNull()) {
+    using drivechain::haskell::ParentReplayAll;
+    if (!ParentReplayAll<3>({[&] { return tip != nullptr; },
+        [&] { return tip->GetBlockHash() == expected; }, [&] { return !expected.IsNull(); }})) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Checkpoint tip changed or is unavailable");
     }
-    if (tip->nHeight >= 10000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint header limit exceeded");
-    if (!tip->m_usdd_withdrawal_accumulator || !tip->m_usdd_withdrawal_accumulator->IsSane()) {
+    const auto check_limit = [](uint64_t used, uint64_t added, uint32_t limit, const char* message) {
+        if (drivechain::haskell::ParentReplayRecord(
+                drivechain::haskell::ReplayRecordKind::LANE_EXCEEDED, limit, 0, used, added))
+            throw JSONRPCError(RPC_MISC_ERROR, message);
+    };
+    check_limit(tip->nHeight, 1, drivechain::CHECKPOINT_HEADER_LIMIT, "Checkpoint header limit exceeded");
+    if (!ParentReplayAll<2>({[&] { return tip->m_usdd_withdrawal_accumulator.has_value(); },
+        [&] { return tip->m_usdd_withdrawal_accumulator->IsSane(); }})) {
         throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint withdrawal state unavailable or invalid");
     }
     auto sources = node::PrepareChildCheckpointSources(chainman);
     auto& cursor = sources.coins;
-    if (cursor->GetBestBlock() != expected) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint database tip mismatch");
     size_t raw_bytes{0};
     auto encode = [&](const auto& value) {
         DataStream bytes{};
         bytes << value;
+        check_limit(raw_bytes, bytes.size(), drivechain::CHECKPOINT_BYTE_LIMIT, "Checkpoint evidence size limit exceeded");
         raw_bytes += bytes.size();
-        if (raw_bytes > 64 * 1024 * 1024) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint evidence size limit exceeded");
         return HexStr(bytes);
     };
     UniValue result(UniValue::VOBJ), headers(UniValue::VARR), coins(UniValue::VARR),
@@ -2384,7 +2381,7 @@ static RPCHelpMan getalphacheckpointevidence()
     }
     for (; sources.spent_claims->Valid(); sources.spent_claims->Next()) {
         node.rpc_interruption_point();
-        if (spent.size() >= 100000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint claim limit exceeded");
+        check_limit(spent.size(), 1, drivechain::CHECKPOINT_ENTRY_LIMIT, "Checkpoint claim limit exceeded");
         spent.push_back(encode(sources.spent_claims->GetKey()));
     }
     // The coin database omits output witnesses. Retain the original blocks,
@@ -2392,17 +2389,19 @@ static RPCHelpMan getalphacheckpointevidence()
     std::map<int, CBlock> source_blocks;
     for (; cursor->Valid(); cursor->Next()) {
         node.rpc_interruption_point();
-        if (coins.size() >= 100000) throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin limit exceeded");
+        check_limit(coins.size(), 1, drivechain::CHECKPOINT_ENTRY_LIMIT, "Checkpoint coin limit exceeded");
         COutPoint outpoint;
         Coin coin;
-        if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin) || coin.IsSpent() || coin.nHeight > uint32_t(tip->nHeight)) {
+        if (!ParentReplayAll<4>({[&] { return cursor->GetKey(outpoint); },
+            [&] { return cursor->GetValue(coin); }, [&] { return !coin.IsSpent(); },
+            [&] { return coin.nHeight <= uint32_t(tip->nHeight); }})) {
             throw JSONRPCError(RPC_MISC_ERROR, "Unreadable or inconsistent checkpoint coin");
         }
         const int height = coin.nHeight;
         auto [it, inserted] = source_blocks.try_emplace(height);
         if (inserted) {
-            if (!chainman.m_blockman.ReadBlock(it->second, *active[height]) ||
-                it->second.GetHash() != active[height]->GetBlockHash()) {
+            if (!ParentReplayAll<2>({[&] { return chainman.m_blockman.ReadBlock(it->second, *active[height]); },
+                [&] { return it->second.GetHash() == active[height]->GetBlockHash(); }})) {
                 throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin source block unavailable or mismatched");
             }
             UniValue block(UniValue::VOBJ);
@@ -2414,8 +2413,10 @@ static RPCHelpMan getalphacheckpointevidence()
         auto tx = std::find_if(transactions.begin(), transactions.end(), [&](const auto& candidate) {
             return candidate->GetHash() == outpoint.hash;
         });
-        if (tx == transactions.end() || outpoint.n >= (*tx)->vout.size() ||
-            (*tx)->vout[outpoint.n] != coin.out || (*tx)->IsCoinBase() != coin.IsCoinBase()) {
+        if (!ParentReplayAll<4>({[&] { return tx != transactions.end(); },
+            [&] { return outpoint.n < (*tx)->vout.size(); },
+            [&] { return (*tx)->vout[outpoint.n] == coin.out; },
+            [&] { return (*tx)->IsCoinBase() == coin.IsCoinBase(); }})) {
             throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint coin does not match its original transaction");
         }
         UniValue item(UniValue::VOBJ);
@@ -4456,7 +4457,7 @@ static RPCHelpMan getdrivechainpegevents()
                 "Set include_l1 to query and normalize CUSF GetTwoWayPegData from the configured enforcer.\n",
                 {
                     {"start_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"tip - 999"}, "First sidechain height to scan."},
-                    {"count", RPCArg::Type::NUM, RPCArg::Default{1000}, "Number of sidechain blocks to scan (1-10000)."},
+                    {"count", RPCArg::Type::NUM, RPCArg::Default{drivechain::PEG_EVENT_DEFAULT_COUNT}, "Number of sidechain blocks to scan (1-10000)."},
                     {"include_l1", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include normalized L1 CUSF lifecycle events."},
                 },
                 RPCResult{
@@ -4517,15 +4518,17 @@ static RPCHelpMan getdrivechainpegevents()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     const auto& consensus = Params().GetConsensus();
-    if (!consensus.elements_mode || !consensus.has_parent_chain) {
+    if (!drivechain::haskell::ParentReplayAll<2>({[&] { return consensus.elements_mode; },
+        [&] { return consensus.has_parent_chain; }})) {
         throw JSONRPCError(
             RPC_MISC_ERROR,
             "getdrivechainpegevents is unavailable outside an Elements parent-chain configuration");
     }
     NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
-    const int sidechain_id = gArgs.GetIntArg("-drivechainbmmslot", 24);
-    if (sidechain_id < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "-drivechainbmmslot must be non-negative");
+    const int sidechain_id = gArgs.GetIntArg("-drivechainbmmslot", drivechain::DRIVECHAIN_SIDECHAIN_SLOT);
+    if (!drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::AMOUNT,
+            0,sidechain_id,0,INT32_MAX)) throw JSONRPCError(RPC_INVALID_PARAMETER, "-drivechainbmmslot must be non-negative");
 
     int tip_height;
     uint256 tip_hash;
@@ -4535,39 +4538,40 @@ static RPCHelpMan getdrivechainpegevents()
     {
         LOCK(cs_main);
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
-        if (tip == nullptr) throw JSONRPCError(RPC_MISC_ERROR, "Sidechain tip is unavailable");
+        if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
+                [&](uint32_t) { return tip != nullptr; })) throw JSONRPCError(RPC_MISC_ERROR, "Sidechain tip is unavailable");
         tip_height = tip->nHeight;
         tip_hash = tip->GetBlockHash();
 
-        start_height = request.params[0].isNull() ? std::max(0, tip_height - 999) : request.params[0].getInt<int>();
-        const int count = request.params[1].isNull() ? 1000 : request.params[1].getInt<int>();
-        if (start_height < 0 || start_height > tip_height) throw JSONRPCError(RPC_INVALID_PARAMETER, "start_height is outside the active sidechain");
-        if (count < 1 || count > 10000) throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 10000");
-        end_height = std::min(tip_height, start_height + count - 1);
+        start_height = request.params[0].isNull() ? drivechain::haskell::PegEventStart(tip_height) : request.params[0].getInt<int>();
+        const int count = request.params[1].isNull() ? drivechain::PEG_EVENT_DEFAULT_COUNT : request.params[1].getInt<int>();
+        const auto range = drivechain::haskell::PegEventRange(start_height,count,tip_height,end_height);
+        if (range == 1) throw JSONRPCError(RPC_INVALID_PARAMETER, "start_height is outside the active sidechain");
+        if (range == 2) throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 10000");
         blocks.reserve(end_height - start_height + 1);
-        for (int height = start_height; height <= end_height; ++height) {
-            blocks.push_back(chainman.ActiveChain()[height]);
+        for (int64_t height = start_height; height <= end_height; ++height) {
+            blocks.push_back(chainman.ActiveChain()[static_cast<int>(height)]);
         }
     }
 
     UniValue events(UniValue::VARR);
-    for (const CBlockIndex* block_index : blocks) {
+    drivechain::haskell::ParentReplayEach(blocks, [&](const CBlockIndex* block_index) {
         CBlock block;
         if (!chainman.m_blockman.ReadBlock(block, *block_index)) {
             throw JSONRPCError(RPC_MISC_ERROR, strprintf("Block not available at height %d", block_index->nHeight));
         }
         const uint256 previous_bundle_hash = block_index->pprev == nullptr ? uint256::ZERO : block_index->pprev->hashWithdrawalBundle;
         const UniValue block_events = drivechain::ExtractSidechainPegEvents(block, block_index->nHeight, previous_bundle_hash);
-        for (const UniValue& event : block_events.getValues()) {
-            events.push_back(event);
-        }
-    }
+        events.push_backV(block_events.getValues());
+        return true;
+    });
 
     const bool include_l1 = request.params[2].isNull() ? false : request.params[2].get_bool();
-    if (include_l1) {
+    drivechain::haskell::ParentReplayAll<2>({[&] { return include_l1; }, [&] {
         const UniValue l1_events = FetchDrivechainL1PegEvents(sidechain_id);
-        for (const UniValue& event : l1_events.getValues()) events.push_back(event);
-    }
+        events.push_backV(l1_events.getValues());
+        return true;
+    }});
 
     UniValue tip(UniValue::VOBJ);
     tip.pushKV("hash", tip_hash.GetHex());
@@ -4654,10 +4658,11 @@ static RPCHelpMan getsidechaininfo()
     obj.pushKV("parent_chain_has_pow", consensus.ParentChainHasPow());
     obj.pushKV("enforce_pak", Params().GetEnforcePak());
     const int child_tip_height = chainman.ActiveChain().Height();
-    obj.pushKV("pegin_confirmation_depth", (uint64_t)GetDrivechainPeginConfirmationDepth(Params(), child_tip_height + 1));
+    const int validation_height = drivechain::haskell::NextBlockHeight(true, child_tip_height);
+    obj.pushKV("pegin_confirmation_depth", (uint64_t)GetDrivechainPeginConfirmationDepth(Params(), validation_height));
     obj.pushKV("pegin_confirmation_depth_historical", (uint64_t)consensus.pegin_min_depth);
     obj.pushKV("pegin_confirmation_depth_current_block", (uint64_t)GetDrivechainPeginConfirmationDepth(Params(), child_tip_height));
-    obj.pushKV("pegin_confirmation_depth_validation_height", child_tip_height + 1);
+    obj.pushKV("pegin_confirmation_depth_validation_height", validation_height);
     if (HasAlphaPeginOneConfirmationUpgrade(Params())) {
         obj.pushKV("pegin_confirmation_depth_activation_height", ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT);
         obj.pushKV("pegin_confirmation_depth_after_activation", 1);
@@ -4705,34 +4710,63 @@ struct AuthenticatedNativeWithdrawal
     std::optional<DrivechainSuccessfulWithdrawal> successful_parent_withdrawal;
 };
 
-bool IsSupportedNativeWithdrawalDestination(const CScript& script)
+std::pair<bool, CAmount> NativeWithdrawalParentPolicy(const CScript& script)
 {
-    TxoutType type;
-    if (!IsStandard(script, std::nullopt, type)) return false;
-    switch (type) {
-    case TxoutType::PUBKEY:
-    case TxoutType::PUBKEYHASH:
-    case TxoutType::SCRIPTHASH:
-    case TxoutType::MULTISIG:
-    case TxoutType::WITNESS_V0_SCRIPTHASH:
-    case TxoutType::WITNESS_V0_KEYHASH:
-    case TxoutType::WITNESS_V1_TAPROOT:
-        return true;
-    default:
-        return false;
-    }
-}
-
-CAmount NativeWithdrawalParentDustThreshold(const CScript& script)
-{
+    static_assert(static_cast<int>(TxoutType::PUBKEY) == 2 && static_cast<int>(TxoutType::PUBKEYHASH) == 3 &&
+        static_cast<int>(TxoutType::SCRIPTHASH) == 4 && static_cast<int>(TxoutType::MULTISIG) == 5 &&
+        static_cast<int>(TxoutType::WITNESS_V0_SCRIPTHASH) == 7 && static_cast<int>(TxoutType::WITNESS_V0_KEYHASH) == 8 &&
+        static_cast<int>(TxoutType::WITNESS_V1_TAPROOT) == 9 && DUST_RELAY_TX_FEE_BITCOIN == 3000);
+    TxoutType type{TxoutType::NONSTANDARD};
+    std::array<unsigned char, 10> facts{};
+    facts[4] = IsStandard(script, std::nullopt, type);
+    WriteLE32(facts.data(), static_cast<uint32_t>(type));
     int witness_version{0};
     std::vector<unsigned char> witness_program;
-    const bool witness = script.IsWitnessProgram(
-        witness_version, witness_program);
-    const size_t output_size = ::GetSerializeSize(
-        Sidechain::Bitcoin::CTxOut(0, script));
-    return CFeeRate(DUST_RELAY_TX_FEE_BITCOIN).GetFee(
-        static_cast<uint32_t>(output_size) + (witness ? 67 : 148));
+    facts[9] = script.IsWitnessProgram(witness_version, witness_program);
+    WriteLE32(facts.data() + 5, static_cast<uint32_t>(::GetSerializeSize(Sidechain::Bitcoin::CTxOut(0, script))));
+    std::vector<unsigned char> policy;
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::PARENT_POLICY, facts, policy, nullptr))
+        throw std::runtime_error("Haskell withdrawal parent policy failed");
+    return {policy[0] == 1, static_cast<CAmount>(ReadLE64(policy.data() + 1))};
+}
+
+enum class WithdrawalAdmission : uint8_t { OPTIONS, INITIAL, BEFORE_REPLAY, AFTER_REPLAY };
+
+void CheckWithdrawalPolicy(drivechain::haskell::WithdrawalOp op, std::span<const unsigned char> input)
+{
+    std::vector<unsigned char> result;
+    if (!drivechain::haskell::WithdrawalBytes(op,input,result,nullptr))
+        throw std::runtime_error("Haskell withdrawal RPC admission failed");
+    const auto code = static_cast<int32_t>(ReadLE32(result.data()));
+    if (code) throw JSONRPCError(code,std::string(result.begin()+4,result.end()));
+}
+
+int CheckWithdrawalAdmission(WithdrawalAdmission stage, uint8_t flags, int depth, int required)
+{
+    std::array<unsigned char,10> input{static_cast<uint8_t>(stage),flags};
+    WriteLE32(input.data()+2,depth);
+    WriteLE32(input.data()+6,required);
+    CheckWithdrawalPolicy(drivechain::haskell::WithdrawalOp::RPC_ADMISSION,input);
+    return depth;
+}
+
+void CheckWithdrawalProofBounds(uint8_t stage, uint64_t index, uint64_t count = 0)
+{
+    std::array<unsigned char,17> input{stage};
+    WriteLE64(input.data()+1,index);
+    WriteLE64(input.data()+9,count);
+    CheckWithdrawalPolicy(drivechain::haskell::WithdrawalOp::PROOF_BOUNDS,input);
+}
+
+int RecheckWithdrawalAnchor(ChainstateManager& chainman, const CBlockIndex& index,
+                           const uint256& hash, WithdrawalAdmission stage, int required)
+{
+    LOCK(cs_main);
+    const auto& active = chainman.ActiveChain();
+    const bool anchored = drivechain::haskell::ParentReplayAll<2>({
+        [&] { return active.Contains(&index); }, [&] { return index.GetBlockHash() == hash; },
+    });
+    return CheckWithdrawalAdmission(stage,anchored,anchored ? active.Height()-index.nHeight+1 : 0,required);
 }
 
 AuthenticatedNativeWithdrawal LoadNativeWithdrawal(
@@ -4743,17 +4777,7 @@ AuthenticatedNativeWithdrawal LoadNativeWithdrawal(
     const int min_confirmations)
 {
     const Consensus::Params& consensus = Params().GetConsensus();
-    if (!consensus.drivechain_slot.has_value() ||
-        !consensus.DrivechainWithdrawalValidationEnabled()) {
-        throw JSONRPCError(
-            RPC_METHOD_NOT_FOUND,
-            "Native BIP300 withdrawals are not enabled on this network");
-    }
-    if (min_confirmations < 1 || min_confirmations > 100000) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "minconfirmations must be between 1 and 100000");
-    }
+    CheckWithdrawalAdmission(WithdrawalAdmission::OPTIONS,consensus.DrivechainWithdrawalValidationEnabled(),0,min_confirmations);
 
     const CBlockIndex* block_index{nullptr};
     int confirmations{0};
@@ -4761,23 +4785,13 @@ AuthenticatedNativeWithdrawal LoadNativeWithdrawal(
         LOCK(cs_main);
         block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
         const CChain& active = chainman.ActiveChain();
-        if (!block_index || !active.Contains(block_index)) {
-            throw JSONRPCError(
-                RPC_INVALID_ADDRESS_OR_KEY,
-                "Confirming block is not in the active Elements chain");
-        }
-        if (!(block_index->nStatus & BLOCK_HAVE_DATA)) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "Confirming block data is unavailable on this pruned node");
-        }
-        confirmations = active.Height() - block_index->nHeight + 1;
-        if (confirmations < min_confirmations) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                strprintf("Native withdrawal burn has %d confirmation(s); %d required",
-                          confirmations, min_confirmations));
-        }
+        const bool anchored = drivechain::haskell::ParentReplayAll<2>({
+            [&] { return block_index != nullptr; }, [&] { return active.Contains(block_index); }});
+        const bool available = drivechain::haskell::ParentReplayAll<2>({
+            [&] { return block_index != nullptr; },
+            [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return (block_index->nStatus & BLOCK_HAVE_DATA) != 0; }});
+        confirmations = CheckWithdrawalAdmission(WithdrawalAdmission::INITIAL,anchored | (available << 1),
+            anchored ? active.Height()-block_index->nHeight+1 : 0,min_confirmations);
     }
 
     CBlock block;
@@ -4794,159 +4808,101 @@ AuthenticatedNativeWithdrawal LoadNativeWithdrawal(
                       block_state.ToString()));
     }
     CTransactionRef transaction;
-    for (const CTransactionRef& candidate : block.vtx) {
-        if (candidate && candidate->GetHash() == txid) {
-            if (transaction) {
-                throw JSONRPCError(
-                    RPC_INTERNAL_ERROR,
-                    "Confirming block contains the withdrawal txid more than once");
-            }
-            transaction = candidate;
-        }
-    }
-    if (!transaction) {
-        throw JSONRPCError(
-            RPC_INVALID_ADDRESS_OR_KEY,
-            "Withdrawal transaction is not in the specified confirming block");
-    }
-    if (vout >= transaction->vout.size()) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER,
-                           "Withdrawal vout is outside the transaction");
-    }
-
     // A native V1 withdrawal is exactly one canonical parent-genesis peg-out
     // output in its transaction. Its explicit pegged-asset value is destroyed
     // by ordinary Elements consensus because OP_RETURN is never added to the
     // UTXO set. Nothing in this RPC can turn the burn back into a spendable
     // output.
     std::optional<uint32_t> canonical_vout;
-    drivechain::NativeWithdrawal withdrawal;
-    for (uint32_t index = 0; index < transaction->vout.size(); ++index) {
-        const CTxOut& output = transaction->vout[index];
-        if (!output.scriptPubKey.IsPegoutScript(
-                Params().ParentGenesisBlockHash())) {
-            continue;
+    drivechain::NativeWithdrawal withdrawal, parsed;
+    size_t candidate_index{0};
+    uint32_t output_index{0};
+    CAmount parent_dust{0};
+    std::string parse_error;
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_RPC_BURN,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return candidate_index < block.vtx.size();
+        case 2: {
+            const auto& candidate = block.vtx.at(candidate_index);
+            return drivechain::haskell::ParentReplayAll<2>({
+                [&] { return bool(candidate); }, [&] { return candidate->GetHash() == txid; }});
         }
-        const CTxOutWitness* output_witness =
-            index < transaction->witness.vtxoutwit.size()
-            ? &transaction->witness.vtxoutwit[index]
-            : nullptr;
-        drivechain::NativeWithdrawal parsed;
-        std::string parse_error;
-        if (!drivechain::ParseNativeWithdrawalOutput(
-                output, output_witness, consensus.pegged_asset,
-                Params().ParentGenesisBlockHash(), parsed, &parse_error)) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                strprintf("Malformed native withdrawal output %u: %s",
-                          index, parse_error));
+        case 3: return bool{transaction};
+        case 4: throw JSONRPCError(RPC_INTERNAL_ERROR,"Confirming block contains the withdrawal txid more than once");
+        case 5: transaction = block.vtx.at(candidate_index); break;
+        case 6: ++candidate_index; break;
+        case 7: return bool{transaction};
+        case 8: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,"Withdrawal transaction is not in the specified confirming block");
+        case 9: return vout < transaction->vout.size();
+        case 10: throw JSONRPCError(RPC_INVALID_PARAMETER,"Withdrawal vout is outside the transaction");
+        case 11: return output_index < transaction->vout.size();
+        case 12: return transaction->vout.at(output_index).scriptPubKey.IsPegoutScript(Params().ParentGenesisBlockHash());
+        case 13: {
+            parsed = {};
+            parse_error.clear();
+            const auto* witness = output_index < transaction->witness.vtxoutwit.size() ?
+                &transaction->witness.vtxoutwit[output_index] : nullptr;
+            return drivechain::ParseNativeWithdrawalOutput(transaction->vout.at(output_index),witness,
+                consensus.pegged_asset,Params().ParentGenesisBlockHash(),parsed,&parse_error);
         }
-        if (canonical_vout.has_value()) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                "Native withdrawal V1 permits exactly one withdrawal burn per Elements transaction");
+        case 14: throw JSONRPCError(RPC_VERIFY_ERROR,strprintf("Malformed native withdrawal output %u: %s",output_index,parse_error));
+        case 15: return canonical_vout.has_value();
+        case 16: throw JSONRPCError(RPC_VERIFY_ERROR,"Native withdrawal V1 permits exactly one withdrawal burn per Elements transaction");
+        case 17: canonical_vout = output_index; withdrawal = std::move(parsed); break;
+        case 18: ++output_index; break;
+        case 19: return canonical_vout == vout;
+        case 20: throw JSONRPCError(RPC_VERIFY_ERROR,"Requested outpoint is not the transaction's sole canonical native withdrawal burn");
+        case 21: return transaction->vout.at(vout).scriptPubKey.IsUnspendable();
+        case 22: throw JSONRPCError(RPC_INTERNAL_ERROR,"Canonical native withdrawal output is unexpectedly spendable");
+        case 23: {
+            const auto policy = NativeWithdrawalParentPolicy(withdrawal.destination);
+            parent_dust = policy.second;
+            return policy.first;
         }
-        canonical_vout = index;
-        withdrawal = std::move(parsed);
-    }
-    if (!canonical_vout.has_value() || *canonical_vout != vout) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
-            "Requested outpoint is not the transaction's sole canonical native withdrawal burn");
-    }
-    if (!transaction->vout[vout].scriptPubKey.IsUnspendable()) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR,
-                           "Canonical native withdrawal output is unexpectedly spendable");
-    }
-    if (!IsSupportedNativeWithdrawalDestination(withdrawal.destination)) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
-            "Native withdrawal Bitcoin destination is not a recognized, currently spendable standard script");
-    }
-    if (withdrawal.payout_amount <
-        NativeWithdrawalParentDustThreshold(withdrawal.destination)) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
-            "Native withdrawal Bitcoin payout is dust for its destination");
-    }
+        case 24: throw JSONRPCError(RPC_VERIFY_ERROR,"Native withdrawal Bitcoin destination is not a recognized, currently spendable standard script");
+        case 25: return withdrawal.payout_amount >= parent_dust;
+        case 26: throw JSONRPCError(RPC_VERIFY_ERROR,"Native withdrawal Bitcoin payout is dust for its destination");
+        default: throw std::logic_error("Invalid Haskell withdrawal burn scan action");
+        }
+        return 1;
+    });
 
-    drivechain::NativeWithdrawalM6 m6;
-    std::string m6_error;
-    if (!drivechain::BuildNativeWithdrawalM6(
-            consensus.hashGenesisBlock,
-            static_cast<uint8_t>(*consensus.drivechain_slot),
-            txid, vout, withdrawal, m6, &m6_error)) {
-        throw JSONRPCError(RPC_VERIFY_ERROR, m6_error);
-    }
-    drivechain::NativeWithdrawalM6 reparsed_m6;
-    if (!drivechain::ParseNativeWithdrawalM6(
-            m6.blinded_transaction, consensus.hashGenesisBlock,
-            static_cast<uint8_t>(*consensus.drivechain_slot), txid, vout,
-            reparsed_m6, &m6_error) ||
-        reparsed_m6.m6id != m6.m6id ||
-        reparsed_m6.legacy_serialization != m6.legacy_serialization) {
-        throw JSONRPCError(
-            RPC_INTERNAL_ERROR,
-            m6_error.empty()
-                ? "Internally generated native withdrawal M6 failed canonical round-trip"
-                : m6_error);
-    }
-
-    // Close the disk-read/reorg race immediately before returning an object
-    // that may be submitted to the enforcer.
-    {
-        LOCK(cs_main);
-        const CChain& active = chainman.ActiveChain();
-        if (!active.Contains(block_index) ||
-            block_index->GetBlockHash() != block_hash) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                "Confirming block left the active Elements chain while the withdrawal was authenticated");
-        }
-        confirmations = active.Height() - block_index->nHeight + 1;
-        if (confirmations < min_confirmations) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                "Withdrawal no longer has the required active-chain depth");
-        }
-    }
-
+    drivechain::NativeWithdrawalM6 m6, reparsed_m6;
+    std::string m6_error, parent_error;
     AuthenticatedNativeWithdrawal result;
-    result.txid = txid;
-    result.vout = vout;
-    result.block_hash = block_hash;
-    result.block_height = block_index->nHeight;
-    result.confirmations = confirmations;
-    result.withdrawal = std::move(withdrawal);
-    result.m6 = std::move(m6);
-    std::string parent_error;
-    if (!GetDrivechainSuccessfulWithdrawal(
-            *consensus.drivechain_slot, result.m6.m6id,
-            result.successful_parent_withdrawal, &parent_error)) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            strprintf("Unable to authenticate completed BIP300 withdrawals on the active parent chain: %s",
-                      parent_error));
-    }
-
-    // Parent replay can be slow on a cold node. Recheck the Elements anchor
-    // after that work so an orphaned burn is never reported as valid.
-    {
-        LOCK(cs_main);
-        const CChain& active = chainman.ActiveChain();
-        if (!active.Contains(block_index) ||
-            block_index->GetBlockHash() != block_hash) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                "Confirming block left the active Elements chain during parent withdrawal replay");
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_RPC_CLAIM,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return drivechain::BuildNativeWithdrawalM6(consensus.hashGenesisBlock,
+            *consensus.drivechain_slot,txid,vout,withdrawal,m6,&m6_error);
+        case 2: throw JSONRPCError(RPC_VERIFY_ERROR,m6_error);
+        case 3: return drivechain::ParseNativeWithdrawalM6(m6.blinded_transaction,consensus.hashGenesisBlock,
+            *consensus.drivechain_slot,txid,vout,reparsed_m6,&m6_error);
+        case 4: return reparsed_m6.m6id == m6.m6id;
+        case 5: return reparsed_m6.legacy_serialization == m6.legacy_serialization;
+        case 6: throw JSONRPCError(RPC_INTERNAL_ERROR,m6_error.empty() ?
+            "Internally generated native withdrawal M6 failed canonical round-trip" : m6_error);
+        // Both checks are required: parent replay may be slow on a cold node.
+        case 7: confirmations = RecheckWithdrawalAnchor(chainman,*block_index,block_hash,WithdrawalAdmission::BEFORE_REPLAY,min_confirmations); break;
+        case 8:
+            result.txid = txid;
+            result.vout = vout;
+            result.block_hash = block_hash;
+            result.block_height = block_index->nHeight;
+            result.confirmations = confirmations;
+            result.withdrawal = std::move(withdrawal);
+            result.m6 = std::move(m6);
+            break;
+        case 9: return GetDrivechainSuccessfulWithdrawal(*consensus.drivechain_slot,result.m6.m6id,
+            result.successful_parent_withdrawal,&parent_error);
+        case 10: throw JSONRPCError(RPC_MISC_ERROR,strprintf(
+            "Unable to authenticate completed BIP300 withdrawals on the active parent chain: %s",parent_error));
+        case 11: result.confirmations = RecheckWithdrawalAnchor(chainman,*block_index,block_hash,WithdrawalAdmission::AFTER_REPLAY,min_confirmations); break;
+        default: throw std::logic_error("Invalid Haskell withdrawal claim action");
         }
-        result.confirmations = active.Height() - block_index->nHeight + 1;
-        if (result.confirmations < min_confirmations) {
-            throw JSONRPCError(
-                RPC_VERIFY_ERROR,
-                "Withdrawal lost the required active-chain depth during parent withdrawal replay");
-        }
-    }
+        return 1;
+    });
     return result;
 }
 
@@ -4983,22 +4939,21 @@ UniValue NativeWithdrawalToJSON(const AuthenticatedNativeWithdrawal& claim)
     return result;
 }
 
-void RejectPaidNativeWithdrawal(const AuthenticatedNativeWithdrawal& claim)
+[[noreturn]] void ThrowPaidNativeWithdrawal(const AuthenticatedNativeWithdrawal& claim)
 {
-    if (!claim.successful_parent_withdrawal.has_value()) return;
+    const auto& payment = claim.successful_parent_withdrawal.value();
     throw JSONRPCError(
         RPC_VERIFY_ALREADY_IN_UTXO_SET,
         strprintf("Native withdrawal M6 %s was already paid in parent block %s at height %u",
                   claim.m6.m6id.GetHex(),
-                  claim.successful_parent_withdrawal->block_hash.GetHex(),
-                  claim.successful_parent_withdrawal->block_height));
+                  payment.block_hash.GetHex(), payment.block_height));
 }
 
 uint32_t ParseWithdrawalVout(const UniValue& value)
 {
     const int64_t parsed = value.getInt<int64_t>();
-    if (parsed < 0 ||
-        parsed >= static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    if (!drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::AMOUNT,
+            0, parsed, 0, std::numeric_limits<uint32_t>::max() - 1)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "vout is outside the canonical uint32 range");
     }
@@ -5015,7 +4970,7 @@ static RPCHelpMan getdrivechainwithdrawalbundle()
                     {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Elements burn transaction id"},
                     {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Canonical burn output index"},
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active-chain block containing the burn"},
-                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{1}, "Required active Elements confirmations"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{drivechain::WITHDRAWAL_READ_CONFIRMATIONS}, "Required active Elements confirmations"},
                 },
                 RPCResult{RPCResult::Type::OBJ, "", "Authenticated burn and exact blinded M6"},
                 RPCExamples{
@@ -5025,7 +4980,7 @@ static RPCHelpMan getdrivechainwithdrawalbundle()
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     const int min_confirmations = request.params[3].isNull()
-        ? 1
+        ? drivechain::WITHDRAWAL_READ_CONFIRMATIONS
         : request.params[3].getInt<int>();
     return NativeWithdrawalToJSON(LoadNativeWithdrawal(
         chainman,
@@ -5045,7 +5000,7 @@ static RPCHelpMan submitdrivechainwithdrawal()
                     {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Elements burn transaction id"},
                     {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Canonical burn output index"},
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active-chain block containing the burn"},
-                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{6}, "Required active Elements confirmations before proposing the M6"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{drivechain::WITHDRAWAL_SUBMIT_CONFIRMATIONS}, "Required active Elements confirmations before proposing the M6"},
                 },
                 RPCResult{RPCResult::Type::OBJ, "", "Authenticated burn, exact blinded M6, and enforcer submission result"},
                 RPCExamples{
@@ -5055,7 +5010,7 @@ static RPCHelpMan submitdrivechainwithdrawal()
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     const int min_confirmations = request.params[3].isNull()
-        ? 6
+        ? drivechain::WITHDRAWAL_SUBMIT_CONFIRMATIONS
         : request.params[3].getInt<int>();
     AuthenticatedNativeWithdrawal claim = LoadNativeWithdrawal(
         chainman,
@@ -5063,16 +5018,19 @@ static RPCHelpMan submitdrivechainwithdrawal()
         ParseWithdrawalVout(request.params[1]),
         ParseHashV(request.params[2], "blockhash"),
         min_confirmations);
-    RejectPaidNativeWithdrawal(claim);
-
     std::string response;
     std::string submission_error;
-    if (!SubmitDrivechainWithdrawalBundle(
-            EnsureAnyNodeContext(request.context),
-            *Params().GetConsensus().drivechain_slot,
-            claim.m6.legacy_serialization, &response, &submission_error)) {
-        throw JSONRPCError(RPC_MISC_ERROR, submission_error);
-    }
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return !claim.successful_parent_withdrawal.has_value();
+        case 2: ThrowPaidNativeWithdrawal(claim);
+        case 3: return SubmitDrivechainWithdrawalBundle(EnsureAnyNodeContext(request.context),
+            *Params().GetConsensus().drivechain_slot, claim.m6.legacy_serialization, &response, &submission_error);
+        case 4: throw JSONRPCError(RPC_MISC_ERROR, submission_error);
+        default: throw std::logic_error("invalid withdrawal submission action");
+        }
+    });
 
     UniValue result = NativeWithdrawalToJSON(claim);
     result.pushKV("submitted", true);
@@ -5093,7 +5051,7 @@ static RPCHelpMan verifydrivechainwithdrawalbundle()
                 {
                     {"blinded_m6", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact legacy zero-input blinded M6 serialization"},
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Active Elements block containing the burn referenced by the M6"},
-                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{6}, "Required active Elements confirmations"},
+                    {"minconfirmations", RPCArg::Type::NUM, RPCArg::Default{drivechain::WITHDRAWAL_SUBMIT_CONFIRMATIONS}, "Required active Elements confirmations"},
                 },
                 RPCResult{RPCResult::Type::OBJ, "", "Verified burn and exact blinded M6"},
                 RPCExamples{
@@ -5102,80 +5060,89 @@ static RPCHelpMan verifydrivechainwithdrawalbundle()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     const std::string encoded = request.params[0].get_str();
-    if (!IsHex(encoded)) {
-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
-                           "blinded_m6 must be canonical hexadecimal");
-    }
-    std::vector<unsigned char> serialized = ParseHex(encoded);
-    if (serialized.empty() ||
-        serialized.size() >
-            drivechain::NATIVE_WITHDRAWAL_MAX_M6_LEGACY_SIZE) {
-        throw JSONRPCError(
-            RPC_DESERIALIZATION_ERROR,
-            "blinded_m6 exceeds the canonical native-withdrawal serialization bound");
-    }
-
+    std::vector<unsigned char> serialized;
     Sidechain::Bitcoin::CMutableTransaction proposed;
     std::string parse_error;
-    if (!drivechain::DeserializeNativeWithdrawalM6Legacy(
-            serialized, proposed, &parse_error)) {
-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, parse_error);
-    }
-    if (proposed.vout.size() < 2) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
-            "blinded M6 has no native withdrawal burn reference output");
-    }
-
     uint256 referenced_genesis;
     uint8_t referenced_slot{0};
     uint256 burn_txid;
     uint32_t burn_vout{0};
-    if (!drivechain::ParseNativeWithdrawalM6Commitment(
-            proposed.vout[1].scriptPubKey, referenced_genesis,
-            referenced_slot, burn_txid, burn_vout, &parse_error)) {
-        throw JSONRPCError(RPC_VERIFY_ERROR, parse_error);
-    }
-
     const Consensus::Params& consensus = Params().GetConsensus();
-    if (!consensus.drivechain_slot.has_value() ||
-        referenced_genesis != consensus.hashGenesisBlock ||
-        referenced_slot != static_cast<uint8_t>(*consensus.drivechain_slot)) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
-            "blinded M6 references a different Elements chain or sidechain slot");
-    }
-
     drivechain::NativeWithdrawalM6 structurally_valid;
-    if (!drivechain::ParseNativeWithdrawalM6(
-            proposed, referenced_genesis, referenced_slot,
-            burn_txid, burn_vout, structurally_valid, &parse_error)) {
-        throw JSONRPCError(RPC_VERIFY_ERROR, parse_error);
-    }
-
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    const int min_confirmations = request.params[2].isNull()
-        ? 6
-        : request.params[2].getInt<int>();
-    AuthenticatedNativeWithdrawal claim = LoadNativeWithdrawal(
-        chainman, burn_txid, burn_vout,
-        ParseHashV(request.params[1], "blockhash"), min_confirmations);
-    if (claim.m6.legacy_serialization != serialized ||
-        claim.m6.m6id != drivechain::ComputeNativeWithdrawalM6Id(proposed)) {
-        throw JSONRPCError(
-            RPC_VERIFY_ERROR,
+    AuthenticatedNativeWithdrawal claim;
+    UniValue result;
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_RPC_VERIFY,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return IsHex(encoded);
+        case 2: throw JSONRPCError(RPC_DESERIALIZATION_ERROR,"blinded_m6 must be canonical hexadecimal");
+        case 3:
+            serialized = ParseHex(encoded);
+            return drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::NONEMPTY_BOUNDED,
+                0,0,serialized.size(),drivechain::NATIVE_WITHDRAWAL_MAX_M6_LEGACY_SIZE);
+        case 4: throw JSONRPCError(RPC_DESERIALIZATION_ERROR,"blinded_m6 exceeds the canonical native-withdrawal serialization bound");
+        case 5: return drivechain::DeserializeNativeWithdrawalM6Legacy(serialized,proposed,&parse_error);
+        case 6: throw JSONRPCError(RPC_DESERIALIZATION_ERROR,parse_error);
+        // The shared legacy decoder requires exactly three outputs before this action.
+        case 7: return drivechain::ParseNativeWithdrawalM6Commitment(proposed.vout.at(1).scriptPubKey,
+            referenced_genesis,referenced_slot,burn_txid,burn_vout,&parse_error);
+        case 8: throw JSONRPCError(RPC_VERIFY_ERROR,parse_error);
+        case 9: return drivechain::haskell::ParentReplayAll<3>({
+            [&] { return consensus.drivechain_slot.has_value(); },
+            [&] { return referenced_genesis == consensus.hashGenesisBlock; },
+            [&] { return referenced_slot == static_cast<uint8_t>(*consensus.drivechain_slot); }});
+        case 10: throw JSONRPCError(RPC_VERIFY_ERROR,"blinded M6 references a different Elements chain or sidechain slot");
+        case 11: return drivechain::ParseNativeWithdrawalM6(proposed,referenced_genesis,referenced_slot,
+            burn_txid,burn_vout,structurally_valid,&parse_error);
+        case 12: {
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const int min_confirmations = request.params[2].isNull()
+                ? drivechain::WITHDRAWAL_SUBMIT_CONFIRMATIONS : request.params[2].getInt<int>();
+            claim = LoadNativeWithdrawal(chainman,burn_txid,burn_vout,
+                ParseHashV(request.params[1],"blockhash"),min_confirmations);
+            break;
+        }
+        case 13: return claim.m6.legacy_serialization == serialized;
+        case 14: return claim.m6.m6id == drivechain::ComputeNativeWithdrawalM6Id(proposed);
+        case 15: throw JSONRPCError(RPC_VERIFY_ERROR,
             "blinded M6 payout, fee, reference, or canonical encoding does not match the confirmed Elements burn");
-    }
-    RejectPaidNativeWithdrawal(claim);
-
-    UniValue result = NativeWithdrawalToJSON(claim);
-    result.pushKV("valid", true);
-    result.pushKV(
-        "security_model",
-        "verified against the active Elements chain; BIP300 payout still requires miner approval");
+        case 16: return !claim.successful_parent_withdrawal.has_value();
+        case 17:
+            result = NativeWithdrawalToJSON(claim);
+            result.pushKV("valid",true);
+            result.pushKV("security_model",
+                "verified against the active Elements chain; BIP300 payout still requires miner approval");
+            break;
+        case 18: ThrowPaidNativeWithdrawal(claim);
+        default: throw std::logic_error("Invalid Haskell withdrawal verification action");
+        }
+        return 1;
+    });
     return result;
 },
     };
+}
+
+static const CBlockIndex* ReadWithdrawalAccumulator(ChainstateManager& chainman, const UniValue& hash,
+    usdd::WithdrawalAccumulatorState& accumulator) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    const CChain& active = chainman.ActiveChain();
+    const auto* index = hash.isNull() ? active.Tip() : chainman.m_blockman.LookupBlockIndex(ParseHashV(hash, "blockhash"));
+    AssertLockHeld(cs_main);
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
+        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+        switch (step) {
+        case 1: return drivechain::haskell::ParentReplayAll<2>({
+            [&] { return index != nullptr; },
+            [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return active.Contains(index); }});
+        case 2: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,"Block is not in the active chain");
+        case 3: return index->m_usdd_withdrawal_accumulator.has_value();
+        case 4: throw JSONRPCError(RPC_INTERNAL_ERROR,"Withdrawal accumulator unavailable; reindex required");
+        default: throw std::logic_error("invalid withdrawal accumulator admission action");
+        }
+    });
+    accumulator = *index->m_usdd_withdrawal_accumulator;
+    return index;
 }
 
 static RPCHelpMan getusddwithdrawalaccumulator()
@@ -5208,17 +5175,7 @@ static RPCHelpMan getusddwithdrawalaccumulator()
     usdd::WithdrawalAccumulatorState accumulator;
     {
         LOCK(cs_main);
-        const CChain& active = chainman.ActiveChain();
-        blockindex = request.params[0].isNull()
-            ? active.Tip()
-            : chainman.m_blockman.LookupBlockIndex(ParseHashV(request.params[0], "blockhash"));
-        if (!blockindex || !active.Contains(blockindex)) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
-        }
-        if (!blockindex->m_usdd_withdrawal_accumulator.has_value()) {
-            throw JSONRPCError(RPC_INTERNAL_ERROR, "Withdrawal accumulator unavailable; reindex required");
-        }
-        accumulator = *blockindex->m_usdd_withdrawal_accumulator;
+        blockindex = ReadWithdrawalAccumulator(chainman, request.params[0], accumulator);
     }
 
     UniValue result(UniValue::VOBJ);
@@ -5268,19 +5225,15 @@ static RPCHelpMan getusddwithdrawalproof()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     const int64_t requested_index = request.params[0].getInt<int64_t>();
-    if (requested_index < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Withdrawal index must not be negative");
-    }
+    CheckWithdrawalProofBounds(0, static_cast<uint64_t>(requested_index));
     const uint64_t index = static_cast<uint64_t>(requested_index);
-    static constexpr uint64_t MAX_RECONSTRUCTION_LEAVES{10'000};
-    static constexpr auto MAX_RECONSTRUCTION_TIME{std::chrono::seconds{10}};
     std::unique_lock<std::mutex> proof_lock(
         g_usdd_withdrawal_proof_mutex, std::defer_lock);
     if (!proof_lock.try_lock()) {
         throw JSONRPCError(
             RPC_MISC_ERROR, "A withdrawal-proof reconstruction is already running");
     }
-    const auto deadline = std::chrono::steady_clock::now() + MAX_RECONSTRUCTION_TIME;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{drivechain::WITHDRAWAL_PROOF_SECONDS};
     const auto interruption_point = [&] {
         RpcInterruptionPoint();
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -5296,42 +5249,35 @@ static RPCHelpMan getusddwithdrawalproof()
     {
         LOCK(cs_main);
         const CChain& active = chainman.ActiveChain();
-        target = request.params[1].isNull()
-            ? active.Tip()
-            : chainman.m_blockman.LookupBlockIndex(ParseHashV(request.params[1], "blockhash"));
-        if (!target || !active.Contains(target)) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
-        }
-        if (!target->m_usdd_withdrawal_accumulator.has_value()) {
-            throw JSONRPCError(RPC_INTERNAL_ERROR, "Withdrawal accumulator unavailable; reindex required");
-        }
-        accumulator = *target->m_usdd_withdrawal_accumulator;
-        if (index >= accumulator.count) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Withdrawal index is outside this accumulator");
-        }
-        if (accumulator.count > MAX_RECONSTRUCTION_LEAVES) {
-            throw JSONRPCError(RPC_MISC_ERROR,
-                "Proof reconstruction exceeds the safe RPC limit; use a dedicated permissionless indexer");
-        }
+        target = ReadWithdrawalAccumulator(chainman, request.params[1], accumulator);
+        CheckWithdrawalProofBounds(1,index,accumulator.count);
         uint64_t prior_count{0};
-        for (int height = 1; height <= target->nHeight; ++height) {
-            if ((height & 0x0fff) == 0) interruption_point();
-            const CBlockIndex* cursor = active[height];
-            if (!cursor->m_usdd_withdrawal_accumulator.has_value()) {
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "Discontinuous withdrawal accumulator; reindex required");
-            }
-            const uint64_t count = cursor->m_usdd_withdrawal_accumulator->count;
-            if (count < prior_count) {
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "Nonmonotonic withdrawal accumulator; reindex required");
-            }
-            if (count != prior_count) blocks_with_withdrawals.push_back(cursor);
-            prior_count = count;
-        }
+        int height{1};
+        const CBlockIndex* cursor{nullptr};
+        const auto status = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::RPC_WITHDRAWAL_HISTORY,
+            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
+                switch (step) {
+                case 1: return height <= target->nHeight;
+                case 2:
+                    if (height % drivechain::WITHDRAWAL_PROOF_INTERRUPT_INTERVAL == 0) interruption_point();
+                    cursor = active[height];
+                    return 1;
+                case 3: return cursor->m_usdd_withdrawal_accumulator.has_value();
+                case 4: return cursor->m_usdd_withdrawal_accumulator->count >= prior_count;
+                case 5: return cursor->m_usdd_withdrawal_accumulator->count != prior_count;
+                case 6: blocks_with_withdrawals.push_back(cursor); return 1;
+                case 7: prior_count = cursor->m_usdd_withdrawal_accumulator->count; ++height; return 1;
+                default: throw std::logic_error("invalid withdrawal history scan action");
+                }
+            });
+        if (status == 1) throw JSONRPCError(RPC_INTERNAL_ERROR, "Discontinuous withdrawal accumulator; reindex required");
+        if (status == 2) throw JSONRPCError(RPC_INTERNAL_ERROR, "Nonmonotonic withdrawal accumulator; reindex required");
     }
 
     std::vector<usdd::EthereumWithdrawalClaim> claims;
     claims.reserve(static_cast<size_t>(accumulator.count));
-    for (const CBlockIndex* blockindex : blocks_with_withdrawals) {
+    drivechain::haskell::ParentReplayEach(blocks_with_withdrawals, [&](const CBlockIndex* blockindex) {
         interruption_point();
         CBlock block;
         if (!chainman.m_blockman.ReadBlock(block, *blockindex)) {
@@ -5346,22 +5292,25 @@ static RPCHelpMan getusddwithdrawalproof()
             throw JSONRPCError(RPC_INTERNAL_ERROR, extraction_error);
         }
         claims.insert(claims.end(), appended.begin(), appended.end());
-    }
+        return true;
+    });
     interruption_point();
-    if (claims.size() != accumulator.count) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR,
-            "Reconstructed withdrawal count disagrees with the persisted accumulator");
-    }
-
     usdd::WithdrawalInclusionProof proof;
     usdd::WithdrawalHash reconstructed_root;
     std::string proof_error;
-    if (!usdd::BuildWithdrawalInclusionProof(
-            claims, index, proof, reconstructed_root, &proof_error) ||
-        reconstructed_root != accumulator.root) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR,
-            proof_error.empty() ? "Reconstructed withdrawal root mismatch" : proof_error);
-    }
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::RPC_WITHDRAWAL_PROOF,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return claims.size() == accumulator.count;
+        case 2: throw JSONRPCError(RPC_INTERNAL_ERROR, "Reconstructed withdrawal count disagrees with the persisted accumulator");
+        case 3: return usdd::BuildWithdrawalInclusionProof(claims, index, proof, reconstructed_root, &proof_error);
+        case 4: return reconstructed_root == accumulator.root;
+        case 5: return !proof_error.empty();
+        case 6: throw JSONRPCError(RPC_INTERNAL_ERROR, proof_error);
+        case 7: throw JSONRPCError(RPC_INTERNAL_ERROR, "Reconstructed withdrawal root mismatch");
+        default: throw std::logic_error("invalid withdrawal proof action");
+        }
+    });
 
     UniValue siblings(UniValue::VARR);
     for (const auto& sibling : proof.siblings) siblings.push_back(HexStr(sibling));

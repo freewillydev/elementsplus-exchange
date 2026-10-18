@@ -116,6 +116,7 @@ target_link_libraries(elementssimplicity
   PRIVATE
     core_interface
 )
+target_link_libraries(elementssimplicity PUBLIC elements_haskell)
 
 # macOS Apple Clang is stricter than Linux GCC on this vendored code
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
@@ -156,6 +157,7 @@ add_subdirectory(util)
 if(WITH_MULTIPROCESS)
   add_subdirectory(ipc)
 endif()
+add_subdirectory(haskell)
 add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   arith_uint256.cpp
   asset.cpp
@@ -178,6 +180,7 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
 )
 target_link_libraries(bitcoin_consensus
   PUBLIC
+    elements_haskell
     core_interface
     bitcoin_crypto
     elementssimplicity
@@ -304,6 +307,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   dbwrapper.cpp
   deploymentstatus.cpp
   drivechain_bmm.cpp
+  utreexo.cpp
   drivechain_peg.cpp
   drivechain_parent_replay.cpp
   drivechain_rpc_security.cpp

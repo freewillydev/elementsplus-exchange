@@ -9,6 +9,7 @@
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/networkstyle.h>
+#include <qt/paymentserver.h>
 #include <qt/walletmodel.h>
 
 #include <QScopedPointer>
@@ -16,6 +17,15 @@
 
 void URITests::uriTests()
 {
+    QCOMPARE(ElementsIpcPrefix(), QString("elements:"));
+    for (const QString& input : {QString("elements:abc"),QString("ELEMENTS:abc"),
+            QString("elements://abc"),QString("bitcoin:abc"),QString("liquidnetwork:abc"),
+            QString(" elements:abc"),QString("elements"),QString("")}) {
+        QCOMPARE(input.startsWith(ElementsIpcPrefix(),Qt::CaseInsensitive),
+            input.startsWith("elements:",Qt::CaseInsensitive));
+        QCOMPARE(input.startsWith(ElementsIpcPrefix()+"//",Qt::CaseInsensitive),
+            input.startsWith("elements://",Qt::CaseInsensitive));
+    }
     QCOMPARE(QString(QAPP_ORG_NAME), QString("Elements"));
     QCOMPARE(QString(QAPP_ORG_DOMAIN), QString("elementsproject.org"));
     QCOMPARE(QString(QAPP_APP_NAME_DEFAULT), QString("Elements"));
@@ -37,6 +47,31 @@ void URITests::uriTests()
     QVERIFY(GUIUtil::parseBitcoinURI(elements_uri, &elements_rcv));
     QVERIFY(!GUIUtil::parseBitcoinURI(
         QString("liquidnetwork:canonical-elements-address"), &elements_rcv));
+
+    for (const auto* chain : {"elements", "elementsregtest", "liquidtestnet", "main"}) {
+        SelectParams(std::string{chain});
+        QCOMPARE(ElementsIpcPrefix(), QString("elements:"));
+        for (const bool elements_mode : {false, true}) {
+            g_con_elementsmode = elements_mode;
+            const QString output_scheme = !elements_mode ? "bitcoin" :
+                QString(chain) == "elements" ? "elements" :
+                QString(chain) == "liquidtestnet" ? "liquidtestnet" : "liquidnetwork";
+            QCOMPARE(GUIUtil::formatBitcoinURI(elements_info).section(':', 0, 0), output_scheme);
+            for (const auto* scheme : {"bitcoin", "elements", "liquidnetwork", "liquidtestnet", "unknown", "ELEMENTS"}) {
+                const QUrl uri{QString("%1:destination?label=label&amount=0.00000001").arg(scheme)};
+                const QString normalized = uri.scheme();
+                const bool expected = !elements_mode ? normalized == "bitcoin" :
+                    QString(chain) == "elements" ? normalized == "elements" :
+                    normalized == "liquidnetwork" || normalized == "liquidtestnet";
+                SendCoinsRecipient result{"unchanged", "sentinel", 7, "message"};
+                QCOMPARE(GUIUtil::parseBitcoinURI(uri, &result), expected);
+                QCOMPARE(GUIUtil::parseBitcoinURI(uri, nullptr), expected);
+                QCOMPARE(result.address, expected ? QString("destination") : QString("unchanged"));
+                QCOMPARE(result.label, expected ? QString("label") : QString("sentinel"));
+                QCOMPARE(result.amount, expected ? CAmount{1} : CAmount{7});
+            }
+        }
+    }
 
     // Legacy codecs remain available only to the internal test context.
     SelectParams(CBaseChainParams::REGTEST);

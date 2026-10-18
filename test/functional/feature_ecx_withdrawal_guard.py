@@ -20,17 +20,13 @@ class EcxWithdrawalGuardTest(FedPegTest):
         super().skip_test_if_missing_module()
         if self.options.usecli:
             raise SkipTest("This test checks structured RPC errors")
-        if not all(shutil.which(tool) for tool in ("bash", "openssl", "grpcurl")):
-            raise SkipTest("Mutual-TLS preflight requires bash, openssl, and grpcurl")
+        if not all(shutil.which(tool) for tool in ("bash", "openssl")):
+            raise SkipTest("Mutual-TLS preflight requires bash and openssl")
 
     def setup_network(self, split=False):
         self.tls_dir = Path(self.options.tmpdir) / "enforcer-tls"
         generator = Path(__file__).resolve().parents[2] / "contrib/drivechain-mtls/generate-certs.sh"
         subprocess.run(["bash", str(generator), str(self.tls_dir)], check=True, capture_output=True)
-        # Use the real executable in a private, owned directory, as production requires.
-        self.grpcurl = self.tls_dir / "grpcurl"
-        shutil.copyfile(shutil.which("grpcurl"), self.grpcurl)
-        self.grpcurl.chmod(0o700)
         super().setup_network(split)
 
     def sidechain_extra_args(self, node_index):
@@ -39,7 +35,6 @@ class EcxWithdrawalGuardTest(FedPegTest):
             f"-drivechainbmmgrpcca={self.tls_dir / 'ca.pem'}",
             f"-drivechainbmmgrpccert={self.tls_dir / 'elements-client.pem'}",
             f"-drivechainbmmgrpckey={self.tls_dir / 'elements-client-key.pem'}",
-            f"-drivechainbmmgrpcurl={self.grpcurl}",
         ]
 
     def run_test(self):

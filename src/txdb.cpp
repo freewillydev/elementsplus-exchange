@@ -7,6 +7,7 @@
 
 #include <coins.h>
 #include <dbwrapper.h>
+#include <haskell/bridge.h>
 #include <logging.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -201,23 +202,53 @@ struct ExactCoinKey {
             throw std::ios_base::failure("Malformed checkpoint coin key");
     }
 };
+
+bool ReadCheckpointKey(CDBIterator& cursor, uint8_t expected,
+    drivechain::haskell::ReplayStoreFlow flow, const std::function<bool(uint32_t)>& decode,
+    const char* prefix_error, const char* record_error)
+{
+    cursor.CheckStatus();
+    uint8_t prefix{};
+    const auto result = drivechain::haskell::ParentReplayStore(flow, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return cursor.Valid();
+        case 2: return cursor.GetKey(prefix);
+        case 3: return prefix == expected;
+        default: return decode(step);
+        }
+    });
+    if (result == 2) throw dbwrapper_error(prefix_error);
+    if (result == 3) throw dbwrapper_error(record_error);
+    return result == 1;
+}
 }
 
 CSpentPeginCursor::CSpentPeginCursor(std::unique_ptr<CDBIterator> cursor)
     : m_cursor(std::move(cursor))
 {
     // Read metadata using the same LevelDB iterator snapshot as the claims.
-    m_cursor->Seek(DB_HEAD_BLOCKS);
-    m_cursor->CheckStatus();
     uint8_t prefix{};
-    if (m_cursor->Valid() && (!m_cursor->GetKey(prefix) || prefix == DB_HEAD_BLOCKS))
-        throw dbwrapper_error("Cannot snapshot an incomplete chainstate transition");
-    m_cursor->Seek(DB_BEST_BLOCK);
-    m_cursor->CheckStatus();
     ExactDBRecord<uint8_t> key;
     ExactDBRecord<uint256> value;
-    if (!m_cursor->Valid() || !m_cursor->GetKey(key) || key.value != DB_BEST_BLOCK ||
-        !m_cursor->GetValue(value) || value.value.IsNull())
+    const auto admission = drivechain::haskell::ParentReplayStore(
+        drivechain::haskell::ReplayStoreFlow::CHECKPOINT_METADATA, [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: case 4:
+                m_cursor->Seek(step == 1 ? DB_HEAD_BLOCKS : DB_BEST_BLOCK);
+                m_cursor->CheckStatus();
+                return m_cursor->Valid();
+            case 2: return m_cursor->GetKey(prefix);
+            case 3: return prefix != DB_HEAD_BLOCKS;
+            case 5: return m_cursor->GetKey(key);
+            case 6: return key.value == DB_BEST_BLOCK;
+            case 7: return m_cursor->GetValue(value);
+            case 8: return !value.value.IsNull();
+            default: throw std::logic_error("Invalid checkpoint metadata step");
+            }
+        });
+    if (admission == 1)
+        throw dbwrapper_error("Cannot snapshot an incomplete chainstate transition");
+    if (admission != 0)
         throw dbwrapper_error("Missing or malformed checkpoint best block");
     m_best_block = value.value;
     m_cursor->Seek(DB_PEGIN_FLAG);
@@ -227,16 +258,17 @@ CSpentPeginCursor::CSpentPeginCursor(std::unique_ptr<CDBIterator> cursor)
 void CSpentPeginCursor::ReadKey()
 {
     m_key.reset();
-    m_cursor->CheckStatus();
-    if (!m_cursor->Valid()) return;
-    uint8_t prefix{};
-    if (!m_cursor->GetKey(prefix)) throw dbwrapper_error("Malformed spent-claim prefix");
-    if (prefix != DB_PEGIN_FLAG) return;
     ExactDBRecord<std::pair<uint8_t, std::pair<uint256, COutPoint>>> key;
     ExactDBRecord<int> value;
-    if (!m_cursor->GetKey(key) || !m_cursor->GetValue(value) || value.value != 1)
-        throw dbwrapper_error("Malformed spent-claim record");
-    m_key = key.value.second;
+    if (ReadCheckpointKey(*m_cursor, DB_PEGIN_FLAG, drivechain::haskell::ReplayStoreFlow::CHECKPOINT_CLAIM,
+        [&](uint32_t step) {
+            switch (step) {
+            case 4: return m_cursor->GetKey(key);
+            case 5: return m_cursor->GetValue(value);
+            case 6: return value.value == 1;
+            default: throw std::logic_error("Invalid checkpoint claim step");
+            }
+        }, "Malformed spent-claim prefix", "Malformed spent-claim record")) m_key = key.value.second;
 }
 
 void CSpentPeginCursor::Next()
@@ -279,14 +311,12 @@ private:
 void CCoinsViewDBCursor::ReadStrictKey()
 {
     keyTmp.first = 0;
-    pcursor->CheckStatus();
-    if (!pcursor->Valid()) return;
-    uint8_t prefix{};
-    if (!pcursor->GetKey(prefix)) throw dbwrapper_error("Malformed checkpoint coin prefix");
-    if (prefix != DB_COIN) return;
     ExactCoinKey key;
-    if (!pcursor->GetKey(key)) throw dbwrapper_error("Malformed checkpoint coin key");
-    keyTmp = {DB_COIN, key.outpoint};
+    if (ReadCheckpointKey(*pcursor, DB_COIN, drivechain::haskell::ReplayStoreFlow::CHECKPOINT_COIN_KEY,
+        [&](uint32_t step) {
+            if (step != 4) throw std::logic_error("Invalid checkpoint coin key step");
+            return pcursor->GetKey(key);
+        }, "Malformed checkpoint coin prefix", "Malformed checkpoint coin key")) keyTmp = {DB_COIN, key.outpoint};
 }
 
 std::unique_ptr<CCoinsViewCursor> CCoinsViewDB::CheckpointCoinCursor() const
@@ -329,11 +359,19 @@ bool CCoinsViewDBCursor::GetKey(COutPoint &key) const
 bool CCoinsViewDBCursor::GetValue(Coin &coin) const
 {
     if (m_strict) {
-        if (!Valid()) return false;
-        pcursor->CheckStatus();
         ExactDBRecord<Coin> record;
-        if (!pcursor->GetValue(record) || record.value.IsSpent())
-            throw dbwrapper_error("Malformed checkpoint coin value");
+        const auto result = drivechain::haskell::ParentReplayStore(
+            drivechain::haskell::ReplayStoreFlow::CHECKPOINT_COIN_VALUE, [&](uint32_t step) -> uint32_t {
+                switch (step) {
+                case 1: return Valid();
+                case 2: pcursor->CheckStatus(); return 1;
+                case 3: return pcursor->GetValue(record);
+                case 4: return !record.value.IsSpent();
+                default: throw std::logic_error("Invalid checkpoint coin value step");
+                }
+            });
+        if (result == 0) return false;
+        if (result != 1) throw dbwrapper_error("Malformed checkpoint coin value");
         coin = std::move(record.value);
         return true;
     }

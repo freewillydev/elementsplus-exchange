@@ -44,18 +44,11 @@ All active enforcer operations, including BMM, withdrawal submission and
 validation-data queries, use the same authenticated unary gRPC path. There is
 no plaintext ConnectJSON fallback, bearer-cookie alternative, or PATH search.
 
-Install a verified grpcurl binary into a private directory:
-
-```sh
-install -d -m 700 "$HOME/.local/libexec/elements"
-install -m 700 /absolute/path/to/verified/grpcurl "$HOME/.local/libexec/elements/grpcurl"
-```
-
-The configured path must be absolute, regular, non-symlink, executable, owned
-by the Elements user and inaccessible to group/others. Its immediate parent
-directory must be owned by that user and not group/other writable. Protect the
-whole ancestor tree too. The node checks permissions, not a published binary
-checksum; verify provenance/hash before installation.
+The Haskell client is linked into the node and uses the gRPC C core directly.
+No grpcurl executable, subprocess, shell, or server reflection is needed.
+Remove the obsolete `drivechainbmmgrpcurl` setting from existing configurations.
+Requests use generated bindings for the pinned enforcer protocol. Transport
+retries are disabled; application retry policy remains with the caller.
 
 If the enforcer serves plaintext gRPC, bind it to `127.0.0.1:50051` and use
 the bundled mTLS proxy on `127.0.0.1:55051`. The proxy-to-enforcer hop is
@@ -72,7 +65,6 @@ data directory):
 
 ```ini
 drivechainbmmgrpcaddr=127.0.0.1:55051
-drivechainbmmgrpcurl=/absolute/private/path/to/grpcurl
 drivechainbmmgrpcca=/absolute/path/to/elements-v11/enforcer-tls/ca.pem
 drivechainbmmgrpccert=/absolute/path/to/elements-v11/enforcer-tls/elements-client.pem
 drivechainbmmgrpckey=/absolute/path/to/elements-v11/enforcer-tls/elements-client-key.pem
@@ -84,28 +76,30 @@ Elements user and not group/other writable; files must not be symlinks. The
 client private key requires mode 0600. The endpoint must be numeric loopback,
 even with TLS. An optional deprecated `drivechainbmmwalletaddr` must exactly
 match it; `drivechainbmmconnectauthcookie` is unsupported.
-The external authenticated process path fails closed on Windows pending an
-equivalent secure executable/credential implementation.
+The overall Haskell migration still requires a native macOS/Linux toolchain;
+Windows packaging is not qualified. This transport change does not change that.
+The configured authority is used for TLS server-name verification as well as
+the request authority, including when connecting to a numeric loopback endpoint.
 
-Verify with the installed executable:
+Run isolated transport regression tests (no live enforcer or funds):
 
 ```sh
-/absolute/private/path/to/grpcurl \
-  -cacert /absolute/path/to/elements-v11/enforcer-tls/ca.pem \
-  -cert /absolute/path/to/elements-v11/enforcer-tls/elements-client.pem \
-  -key /absolute/path/to/elements-v11/enforcer-tls/elements-client-key.pem \
-  -authority enforcer.local 127.0.0.1:55051 list
+cmake --build build --target haskell_grpc_probe -j1
+python3 src/haskell/test/grpc_transport.py build/bin/haskell_grpc_probe /path/to/temporary-directory
 ```
 
-Reflection must be enabled for this diagnostic; a service-method call can
-instead be used with its descriptors. Missing/wrong client credentials must
-fail the TLS handshake. No `-plaintext` or `-insecure` flag is appropriate.
+Tests require Python grpcio/protobuf, protoc, bash, and openssl. The build needs
+Cabal and gRPC C-core development libraries; Haskell dependency sources are pinned
+in `src/haskell/GrpcDependencies.cmake`. Match native dependency deployment targets
+to the intended release OS; locally installed libraries are not portable releases.
+Missing/wrong client credentials must fail the TLS handshake. No plaintext or
+insecure-certificate fallback is provided.
 
 ## Production and rotation
 
 Automatic `drivechainl1blocksync` currently defaults **on**. Explicitly set it
 to 0 during read-only setup. Enforcer calls fail closed at use when credentials
-or the executable are invalid; this is not a guarantee of a startup TLS probe.
+are invalid; this is not a guarantee of a startup TLS probe.
 A native `sendtomainchain` burn can be created without an available enforcer,
 so verify the submission path before burning coins.
 

@@ -7,8 +7,10 @@
 
 #include <primitives/block.h>
 #include <script/script.h>
+#include <script/interpreter.h>
 #include <serialize.h>
 #include <uint256.h>
+#include <haskell/bmm_constants.h>
 
 #include <cstdint>
 #include <string>
@@ -17,13 +19,39 @@
 class CBlockIndex;
 class CCoinsView;
 class CCoinsViewCache;
+namespace Sidechain::Bitcoin { class CTransaction; struct CMutableTransaction; class CBlockHeader; class CTxOut; }
 
 namespace drivechain {
 
-static constexpr uint8_t BMM_PROOF_SCHEMA_VERSION{1};
-static constexpr int BMM_SIDECHAIN_SLOT{24};
-static constexpr size_t MAX_BMM_PROOF_ENTRIES{128};
-static constexpr size_t MAX_BMM_PROOF_BYTES{1'000'000};
+class BitcoinSignetSignatureChecker final : public BaseSignatureChecker
+{
+public:
+    enum class Mode { BMM, PARENT };
+    // PARENT requires input zero of the constructed, nonempty synthetic transaction.
+    BitcoinSignetSignatureChecker(const Sidechain::Bitcoin::CTransaction& transaction,
+        unsigned int index, Mode mode = Mode::BMM)
+        : m_transaction(transaction), m_input_index(index), m_mode(mode) {}
+    bool CheckECDSASignature(const std::vector<unsigned char>& signature,
+        const std::vector<unsigned char>& key, const CScript& script,
+        SigVersion version, unsigned int flags) const override;
+private:
+    const Sidechain::Bitcoin::CTransaction& m_transaction;
+    const unsigned int m_input_index;
+    const Mode m_mode;
+};
+
+int BitcoinWitnessCommitmentIndex(const std::vector<Sidechain::Bitcoin::CTxOut>& outputs);
+bool ExtractTaggedParentCommitment(const std::vector<CTxOut>& outputs, uint256& parent, std::string& error);
+// Call with fresh transactions; native serialization follows Haskell action plans.
+void BuildBitcoinSignetTransactions(const CScript& challenge,
+    Sidechain::Bitcoin::CMutableTransaction& spend, Sidechain::Bitcoin::CMutableTransaction& sign);
+std::vector<unsigned char> BitcoinSignetBlockData(const Sidechain::Bitcoin::CBlockHeader& header,
+    const uint256& modified_merkle_root);
+
+// Bitcoin witness-v0 preimage for the zero-valued synthetic signet spend.
+// The caller must supply an existing input index.
+uint256 BitcoinWitnessV0SignatureHash(const CScript& script_code,
+    const Sidechain::Bitcoin::CTransaction& transaction, unsigned int input_index, int hash_type);
 
 struct BmmL1State
 {
@@ -47,16 +75,7 @@ struct BmmL1State
             obj.recent_times);
     }
 
-    bool operator==(const BmmL1State& other) const
-    {
-        return block_hash == other.block_hash &&
-            height == other.height &&
-            block_time == other.block_time &&
-            n_bits == other.n_bits &&
-            period_start_height == other.period_start_height &&
-            period_start_time == other.period_start_time &&
-            recent_times == other.recent_times;
-    }
+    bool operator==(const BmmL1State&) const = default;
 };
 
 /**
@@ -96,20 +115,17 @@ struct BmmProof
 struct BmmConsensus
 {
     uint256 pow_limit;
-    int64_t target_timespan{14 * 24 * 60 * 60};
-    int64_t target_spacing{10 * 60};
+    int64_t target_timespan{BMM_TARGET_TIMESPAN};
+    int64_t target_spacing{BMM_TARGET_SPACING};
     CScript signet_challenge;
     int sidechain_slot{BMM_SIDECHAIN_SLOT};
     size_t max_entries{MAX_BMM_PROOF_ENTRIES};
     size_t max_proof_bytes{MAX_BMM_PROOF_BYTES};
     // Appended so legacy seven-field aggregate initializers retain their
     // original field mapping and safely default to public signet validation.
-    bool require_signet_solution{true};
+    bool require_signet_solution{BMM_REQUIRE_SIGNET_SOLUTION};
 
-    int64_t DifficultyAdjustmentInterval() const
-    {
-        return target_timespan / target_spacing;
-    }
+    int64_t DifficultyAdjustmentInterval() const;
 };
 
 /** Fixed LayerTwoLabs public-signet consensus values and immutable bootstrap. */

@@ -20,7 +20,8 @@ static constexpr unsigned int MAX_BLOCK_WEIGHT =
 /** The maximum allowed number of signature check operations in a block (network rule) */
 static const int64_t MAX_BLOCK_SIGOPS_COST = 80000;
 /** Maximum number of native BIP300 deposit imports in one child block. */
-static constexpr unsigned int MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK = 64;
+static constexpr unsigned int MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK =
+    ElementsDrivechainIdentity::MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK;
 /** Coinbase transaction outputs can only be spent after this number of new blocks (network rule) */
 static const int COINBASE_MATURITY = 100;
 

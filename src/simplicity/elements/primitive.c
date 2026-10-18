@@ -104,6 +104,7 @@ static simplicity_err decodePrimitive(jetName* result, bitstream* stream) {
 static dag_node jetNode(jetName name) {
   static const dag_node jet_node[] = {
     #include "primitiveJetNode.inc"
+    #include "drivechainPrimitiveJetNode.inc"
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
     #include "ecxPrivateE2ePrimitiveJetNode.inc"
 #endif

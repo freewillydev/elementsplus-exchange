@@ -31,8 +31,12 @@ libBitcoinSimplicity.a: $(CORE_OBJS) $(BITCOIN_OBJS)
 libElementsSimplicity.a: $(CORE_OBJS) $(ELEMENTS_OBJS)
 	ar rcs $@ $^
 
-test: $(TEST_OBJS) libElementsSimplicity.a
-	$(CC) $^ -o $@ $(LDFLAGS)
+# Supply the Haskell bridge archive, runtime library and its runtime search path.
+test: $(TEST_OBJS) libElementsSimplicity.a | check-haskell-link
+	$(CXX) $^ -o $@ $(LDFLAGS) $(HASKELL_LIBS)
+
+check-haskell-link:
+	@test -n "$(strip $(HASKELL_LIBS))" || { echo "Set HASKELL_LIBS to the built Haskell bridge/runtime link flags."; exit 1; }
 
 install: libBitcoinSimplicity.a libElementsSimplicity.a
 	mkdir -p $(out)/lib
@@ -45,4 +49,4 @@ check: test
 clean:
 	-rm -f test libElementsSimplicity.a $(TEST_OBJS) $(OBJS)
 
-.PHONY: install check clean
+.PHONY: install check clean check-haskell-link

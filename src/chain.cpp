@@ -4,6 +4,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chain.h>
+#include <haskell/bridge.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <util/time.h>
 #include <validation.h>
@@ -11,6 +13,20 @@
 
 
 node::NodeContext *CBlockIndex::m_pcontext;
+
+bool DrivechainAnchor::IsSane() const
+{
+    DataStream bytes;
+    bytes << *this;
+    return drivechain::haskell::AnchorRule({bytes.data(),bytes.size()});
+}
+
+bool DrivechainAnchor::Follows(const DrivechainAnchor& previous) const
+{
+    DataStream bytes;
+    bytes << *this << previous;
+    return drivechain::haskell::AnchorRule({bytes.data(),bytes.size()});
+}
 
 std::string CBlockFileInfo::ToString() const
 {

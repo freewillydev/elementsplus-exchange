@@ -4,6 +4,8 @@
 #ifndef BITCOIN_NODE_ECX_DEPLOYMENT_IDENTITY_H
 #define BITCOIN_NODE_ECX_DEPLOYMENT_IDENTITY_H
 
+#include <kernel/cs_main.h>
+#include <threadsafety.h>
 #include <string>
 
 class ChainstateManager;
@@ -30,7 +32,7 @@ bool CheckEcxDeploymentResetAllowed(
 bool BindEcxDeploymentIdentityIfNeeded(
     ChainstateManager& chainman,
     bool databases_in_memory,
-    std::string& error);
+    std::string& error) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 } // namespace node
 

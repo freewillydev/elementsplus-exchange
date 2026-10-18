@@ -8,8 +8,7 @@
 #endif
 
 #include <rpc/request.h>
-
-#include <chainparamsbase.h>
+#include <haskell/bridge.h>
 
 #include <common/args.h>
 #include <logging.h>
@@ -19,12 +18,11 @@
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
 
-#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
-#include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -185,12 +183,7 @@ bool GetAuthCookie(std::string *cookie_out)
 
 std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
 {
-    // Native Elements freezes mainnet ancestry, not historical L2L Signet.
-    if (chain == CBaseChainParams::ELEMENTS) return ".cookie";
-
-    // These paths exist only for inherited unit/functional-test contexts.
-    if (chain == CBaseChainParams::LIQUID1) return ".cookie";
-    return "regtest/.cookie";
+    return drivechain::haskell::MainchainCookieAtRoot(chain) ? ".cookie" : "regtest/.cookie";
 }
 
 /** Get name mainchain RPC authentication cookie file */
@@ -212,113 +205,109 @@ bool ReadPrivateRpcAuthFile(
     cookie.clear();
     if (error) error->clear();
     const std::string native_path = fs::PathToString(path);
-    if (!path.is_absolute()) {
-        if (error) *error = "RPC authentication file path must be absolute";
-        return false;
-    }
-
+    std::array<char,4097> contents{};
 #ifndef WIN32
-    const int descriptor = open(
-        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (descriptor < 0) {
-        if (error) {
-            *error = strprintf(
-                "cannot securely open mainchain RPC cookie %s: %s",
-                native_path, std::strerror(errno));
-        }
-        return false;
-    }
-
+    int descriptor=-1, saved_errno=0;
+    const auto close_descriptor = [](int* fd) noexcept {
+        if (*fd>=0) close(*fd);
+        *fd=-1;
+    };
+    std::unique_ptr<int,decltype(close_descriptor)> descriptor_guard(&descriptor,close_descriptor);
     struct stat metadata {};
-    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode)) {
-        if (error) *error = "mainchain RPC cookie is not a regular file: " + native_path;
-        close(descriptor);
-        return false;
-    }
-    if (metadata.st_uid != geteuid()) {
-        if (error) {
-            *error = "mainchain RPC cookie must be owned by the Elements process user: " +
-                native_path;
-        }
-        close(descriptor);
-        return false;
-    }
-    if ((metadata.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        if (error) {
-            *error = "mainchain RPC cookie permissions must deny all group and other access: " +
-                native_path;
-        }
-        close(descriptor);
-        return false;
-    }
-
-    static constexpr size_t MAX_COOKIE_FILE_SIZE{4096};
-    std::array<char, MAX_COOKIE_FILE_SIZE + 1> contents{};
-    size_t used{0};
-    while (used < contents.size()) {
-        const ssize_t count = read(
-            descriptor, contents.data() + used, contents.size() - used);
-        if (count > 0) {
-            used += static_cast<size_t>(count);
-            continue;
-        }
-        if (count == 0) break;
-        if (errno == EINTR) continue;
-        if (error) {
-            *error = strprintf(
-                "cannot read mainchain RPC cookie %s: %s",
-                native_path, std::strerror(errno));
-        }
-        close(descriptor);
-        return false;
-    }
-    close(descriptor);
-    if (used == contents.size()) {
-        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
-        return false;
-    }
-    cookie.assign(contents.data(), used);
+    uint64_t used=0;
+    uint32_t read_status=0;
 #else
-    if (fs::is_symlink(path) || !fs::exists(path) || !fs::is_regular_file(path)) {
-        if (error) *error = "mainchain RPC cookie is not a regular file: " + native_path;
-        return false;
-    }
-    std::ifstream input(path, std::ios::binary);
-    if (!input.good()) {
-        if (error) *error = "cannot read mainchain RPC cookie: " + native_path;
-        return false;
-    }
-    std::array<char, 4097> contents{};
-    input.read(contents.data(), contents.size());
-    cookie.assign(contents.data(), input.gcount());
-    if (input.bad() || cookie.size() > 4096) {
-        cookie.clear();
-        if (error) *error = "mainchain RPC cookie file is unexpectedly large";
-        return false;
-    }
+    std::ifstream input;
 #endif
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CREDENTIAL_FILE,[&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return path.is_absolute();
+        case 2: if (error) *error="RPC authentication file path must be absolute"; return 1;
+#ifndef WIN32
+        case 3: return 1;
+        case 4:
+            descriptor=open(native_path.c_str(),O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            saved_errno=errno; return descriptor>=0;
+        case 5:
+            if (error) *error=strprintf("cannot securely open mainchain RPC cookie %s: %s",native_path,std::strerror(saved_errno));
+            return 1;
+        case 6:
+            return drivechain::haskell::AdmitPrivateCredentialFile([&](uint32_t action) -> int64_t {
+                switch (action) {
+                case 1: return drivechain::haskell::ParentReplayAll<2>({
+                    [&] { return fstat(descriptor,&metadata)==0; },
+                    [&] { return S_ISREG(metadata.st_mode); },
+                });
+                case 3: return metadata.st_uid;
+                case 4: return geteuid();
+                case 6: return metadata.st_mode & (S_IRWXG | S_IRWXO);
+                case 2: case 5: case 7:
+                    if (error) *error=std::string(action==2 ? "mainchain RPC cookie is not a regular file: " :
+                        action==5 ? "mainchain RPC cookie must be owned by the Elements process user: " :
+                        "mainchain RPC cookie permissions must deny all group and other access: ")+native_path;
+                    descriptor_guard.reset(); return 1;
+                default: throw std::logic_error("invalid private credential admission action");
+                }
+            });
+        case 7:
+            read_status=drivechain::haskell::ReadCredentialBytes(contents.size(),[&](uint64_t offset,uint64_t available) {
+                const ssize_t count=read(descriptor,contents.data()+offset,available);
+                saved_errno=errno;
+                return count>=0 ? static_cast<uint64_t>(count) : saved_errno==EINTR ? UINT64_MAX : UINT64_MAX-1;
+            },used);
+            return read_status;
+        case 8:
+            if (error) *error=strprintf("cannot read mainchain RPC cookie %s: %s",native_path,std::strerror(saved_errno));
+            descriptor_guard.reset(); return 1;
+        case 9: descriptor_guard.reset(); return read_status;
+        case 10: if (error) *error="mainchain RPC cookie file is unexpectedly large"; return 1;
+        case 11: cookie.assign(contents.data(),used); return 1;
+#else
+        case 3: return 0;
+        case 12: return fs::is_symlink(path);
+        case 13: return fs::exists(path);
+        case 14: return fs::is_regular_file(path);
+        case 15: if (error) *error="mainchain RPC cookie is not a regular file: "+native_path; return 1;
+        case 16: input.open(path,std::ios::binary); return input.good();
+        case 17: if (error) *error="cannot read mainchain RPC cookie: "+native_path; return 1;
+        case 18: input.read(contents.data(),contents.size()); cookie.assign(contents.data(),input.gcount()); return 1;
+        case 19: return input.bad();
+        case 20: return cookie.size();
+        case 22:
+            cookie.clear();
+            if (error) *error="mainchain RPC cookie file is unexpectedly large";
+            return 1;
+#endif
+        case 23: case 25: return cookie.empty() ? 256 : static_cast<unsigned char>(cookie.back());
+        case 24: case 26: cookie.pop_back(); return 1;
+        default: throw std::logic_error("invalid credential file action");
+        }
+    })!=0;
+}
 
-    if (!cookie.empty() && cookie.back() == '\n') cookie.pop_back();
-    if (!cookie.empty() && cookie.back() == '\r') cookie.pop_back();
-    return true;
+static bool ReadRpcAuthRecord(
+    const fs::path& path, std::string& record, bool rotating_cookie, std::string* error)
+{
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CREDENTIAL_RECORD,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return ReadPrivateRpcAuthFile(path, record, error);
+        case 2: return drivechain::haskell::IsRpcCredentialRecord(record,rotating_cookie);
+        case 3:
+            record.clear();
+            if (error) *error = rotating_cookie
+                ? "mainchain RPC cookie is not a canonical rotating Bitcoin Core cookie"
+                : "parent credential file must contain one bounded username:password record";
+            return 1;
+        default: throw std::logic_error("invalid credential record action");
+        }
+    }) != 0;
 }
 
 bool ReadMainchainAuthCookieFile(
     const fs::path& path, std::string& cookie, std::string* error)
 {
-    if (!ReadPrivateRpcAuthFile(path, cookie, error)) return false;
-    static constexpr const char* COOKIE_PREFIX{"__cookie__:"};
-    static constexpr size_t COOKIE_PREFIX_SIZE{11};
-    if (cookie.rfind(COOKIE_PREFIX, 0) != 0 ||
-        cookie.size() != COOKIE_PREFIX_SIZE + 64 ||
-        !IsHex(cookie.substr(COOKIE_PREFIX_SIZE))) {
-        cookie.clear();
-        if (error) {
-            *error = "mainchain RPC cookie is not a canonical rotating Bitcoin Core cookie";
-        }
-        return false;
-    }
-    return true;
+    return ReadRpcAuthRecord(path,cookie,true,error);
 }
 
 bool ReadNativeDrivechainCookieFile(
@@ -337,19 +326,7 @@ bool ReadMainchainRpcCredentialFile(
     if (error) *error = "private static parent credential files require POSIX file permissions";
     return false;
 #else
-    if (!ReadPrivateRpcAuthFile(path, credentials, error)) return false;
-    const auto separator = credentials.find(':');
-    if (credentials.size() > 1024 || separator == std::string::npos ||
-        separator == 0 || separator + 1 == credentials.size() ||
-        credentials.find(':', separator + 1) != std::string::npos ||
-        credentials.compare(0, separator, "__cookie__") == 0 ||
-        !std::all_of(credentials.begin(), credentials.end(),
-                     [](unsigned char c) { return c >= 33 && c <= 126; })) {
-        credentials.clear();
-        if (error) *error = "parent credential file must contain one bounded username:password record";
-        return false;
-    }
-    return true;
+    return ReadRpcAuthRecord(path,credentials,false,error);
 #endif
 }
 

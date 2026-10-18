@@ -606,18 +606,16 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.29)
   set(CMAKE_SKIP_TEST_ALL_DEPENDENCY FALSE)
 endif()
 
-# TODO: The `CMAKE_SKIP_BUILD_RPATH` variable setting can be deleted
-#       in the future after reordering Guix script commands to
-#       perform binary checks after the installation step.
-# Relevant discussions:
-# - https://github.com/hebasto/bitcoin/pull/236#issuecomment-2183120953
-# - https://github.com/bitcoin/bitcoin/pull/30312#issuecomment-2191235833
-# NetBSD always requires runtime paths to be set for executables.
+# The embedded Haskell library requires runtime lookup paths, including from
+# the build tree. GHC's own runtime dependencies must also be installed.
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+set(CMAKE_SKIP_INSTALL_RPATH FALSE)
 if(CMAKE_SYSTEM_NAME STREQUAL "NetBSD")
   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+elseif(APPLE)
+  list(APPEND CMAKE_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
 else()
-  set(CMAKE_SKIP_BUILD_RPATH TRUE)
-  set(CMAKE_SKIP_INSTALL_RPATH TRUE)
+  list(APPEND CMAKE_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 endif()
 add_subdirectory(test)
 add_subdirectory(doc)

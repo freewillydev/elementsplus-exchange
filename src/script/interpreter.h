@@ -243,55 +243,12 @@ struct PrecomputedTransactionData
     std::optional<uint64_t> m_prior_active_bond_inbox_count;
     std::optional<uint64_t> m_current_sidechain_height;
 
-    uint8_t EcxBondV2IdentityPresence() const
-    {
-        const unsigned int count =
-            m_bond_v2_configuration_hash.has_value() +
-            m_bond_v2_asset_id.has_value() +
-            m_bond_v2_deployment_commitment.has_value() +
-            m_bond_v2_transition_cmr.has_value() +
-            m_bond_v2_collateral_vault_script_sha256.has_value() +
-            m_bond_v2_collateral_vault_cmr.has_value() +
-            m_bond_v2_insurance_reserve_script_sha256.has_value() +
-            m_bond_v2_insurance_reserve_cmr.has_value();
-        return count == 0 ? 0 : count == 8 ? 1 : 2;
-    }
-
-    uint8_t EcxBondV2ProjectionPresence() const
-    {
-        const unsigned int count =
-            m_prior_active_bond_inbox_root.has_value() +
-            m_prior_active_bond_inbox_count.has_value() +
-            m_current_sidechain_height.has_value();
-        return count == 0 ? 0 : count == 3 ? 1 : 2;
-    }
-
-    uint8_t EcxBondV2IncrementalActivationIdentityPresence() const
-    {
-        const unsigned int count =
-            m_bond_v2_incremental_activation_program_id.has_value() +
-            m_bond_v2_incremental_activation_configuration_hash.has_value() +
-            m_bond_v2_incremental_activation_cmr.has_value() +
-            m_incremental_successor_program_id.has_value() +
-            m_bond_v2_incremental_successor_configuration_hash.has_value() +
-            m_incremental_successor_transition_cmr.has_value() +
-            m_incremental_successor_state_node_domain_sha256.has_value();
-        return count == 0 ? 0 : count == 7 ? 1 : 2;
-    }
-
-    uint8_t EcxForcedInboxPresence() const
-    {
-        const bool root{m_prior_active_forced_inbox_root.has_value()};
-        const bool cursor{m_prior_active_forced_processed_cursor.has_value()};
-        return root == cursor ? (root ? 1 : 0) : 2;
-    }
-
-    uint8_t EcxDepositInboxPresence() const
-    {
-        const bool root{m_prior_active_deposit_inbox_root.has_value()};
-        const bool cursor{m_prior_active_deposit_processed_cursor.has_value()};
-        return root == cursor ? (root ? 1 : 0) : 2;
-    }
+    uint8_t EcxBondV2IdentityPresence() const;
+    uint8_t EcxBondV2ProjectionPresence() const;
+    uint8_t EcxBondV2IncrementalActivationIdentityPresence() const;
+    uint8_t EcxForcedInboxPresence() const;
+    uint8_t EcxDepositInboxPresence() const;
+    uint8_t EcxCurrentBmmPresence() const;
     // BIP341 precomputed data.
     // These are single-SHA256, see https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#cite_note-16.
     uint256 m_prevouts_single_hash;

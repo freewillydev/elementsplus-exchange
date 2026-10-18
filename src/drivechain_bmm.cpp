@@ -3,13 +3,13 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <drivechain_bmm.h>
+#include <haskell/bridge.h>
 
 #include <arith_uint256.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
 #include <consensus/consensus.h>
-#include <crypto/sha256.h>
 #include <hash.h>
 #include <primitives/bitcoin/merkleblock.h>
 #include <primitives/bitcoin/transaction.h>
@@ -21,54 +21,69 @@
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace drivechain {
+int64_t BmmConsensus::DifficultyAdjustmentInterval() const
+{
+    return haskell::BmmDifficultyInterval(target_timespan, target_spacing);
+}
+
 namespace {
 
-const uint256 PUBLIC_SIDECHAIN_BLOCK_1{
-    uint256S("942f31cb89241342064af42a0367405eef490061d2ffe259a6f34d4939dee543")};
-const uint256 PUBLIC_SIDECHAIN_BLOCK_2{
-    uint256S("ce77dfe3b037f2e62624da0ee5e33ae3c23b8b18ddf3b87a687bb372a8406998")};
-const COutPoint BMM_STATE_OUTPOINT{
-    Txid::FromUint256(uint256S("f0bcf7ca88c8a7c66d74d5540d5458ead1a15df5a8b6b98c08032a1300579ff9")),
-    0};
-const std::vector<unsigned char> BMM_STATE_MARKER{
-    'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'b', 'm', 'm', '-', 'v', '1'};
-constexpr std::array<unsigned char, 4> SIGNET_HEADER{{0xec, 0xc7, 0xda, 0xa2}};
-constexpr std::array<unsigned char, 4> M8_MAGIC{{0xd1, 0x61, 0x73, 0x68}};
-constexpr unsigned int SIGNET_SCRIPT_FLAGS{
-    SCRIPT_VERIFY_P2SH |
-    SCRIPT_VERIFY_WITNESS |
-    SCRIPT_VERIFY_DERSIG |
-    SCRIPT_VERIFY_NULLDUMMY};
+struct BmmIdentity
+{
+    std::array<uint256, 2> blocks;
+    COutPoint outpoint;
+    std::vector<unsigned char> marker;
+    std::array<unsigned char, 4> signet_header, m8_magic;
+    uint32_t script_flags;
+};
 
-const BmmConsensus LAYER_TWO_LABS_CONSENSUS{
-    uint256S("00000377ae000000000000000000000000000000000000000000000000000000"),
-    14 * 24 * 60 * 60,
-    10 * 60,
-    [] {
-        const std::vector<unsigned char> challenge{
-            ParseHex("00148835832e28c816b7acd8fdb19772ab2199603a56")};
-        return CScript(challenge.begin(), challenge.end());
-    }(),
-    BMM_SIDECHAIN_SLOT,
-    MAX_BMM_PROOF_ENTRIES,
-    MAX_BMM_PROOF_BYTES,
-    true};
+const BmmIdentity& Identity()
+{
+    static const BmmIdentity identity = [] {
+        std::array<uint32_t, 2> fields{};
+        std::array<unsigned char, 121> bytes{};
+        haskell::BmmFixedIdentity(fields, bytes);
+        // ABI: three hashes, 17-byte marker, two four-byte magic values.
+        return BmmIdentity{
+            {uint256{bytes.data(), 32}, uint256{bytes.data() + 32, 32}},
+            {Txid::FromUint256(uint256{bytes.data() + 64, 32}), fields[0]},
+            {bytes.begin() + 96, bytes.begin() + 113},
+            {bytes[113], bytes[114], bytes[115], bytes[116]},
+            {bytes[117], bytes[118], bytes[119], bytes[120]}, fields[1]};
+    }();
+    return identity;
+}
+
+BmmConsensus MakeBmmConsensus(uint32_t mode)
+{
+    std::array<uint64_t, 6> fields{};
+    std::array<unsigned char, 32> pow_limit{};
+    std::array<unsigned char, 22> challenge{};
+    const auto size = haskell::BmmConsensusPreset(mode, fields, pow_limit, challenge);
+    return {uint256{pow_limit.data(), pow_limit.size()}, static_cast<int64_t>(fields[0]),
+        static_cast<int64_t>(fields[1]), CScript(challenge.begin(), challenge.begin() + size),
+        static_cast<int>(fields[2]), fields[3], fields[4], bool(fields[5])};
+}
+
+const BmmConsensus& PublicBmmConsensus()
+{
+    static const auto consensus = MakeBmmConsensus(0);
+    return consensus;
+}
 
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-const BmmConsensus PRIVATE_E2E_REGTEST_CONSENSUS{
-    uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
-    14 * 24 * 60 * 60,
-    10 * 60,
-    CScript{},
-    BMM_SIDECHAIN_SLOT,
-    MAX_BMM_PROOF_ENTRIES,
-    MAX_BMM_PROOF_BYTES,
-    false};
+const BmmConsensus& PrivateBmmConsensus()
+{
+    static const auto consensus = MakeBmmConsensus(1);
+    return consensus;
+}
 
 bool PrivateE2eBmmEnabled()
 {
@@ -76,111 +91,30 @@ bool PrivateE2eBmmEnabled()
 }
 #endif
 
-const BmmL1State LAYER_TWO_LABS_INITIAL_STATE{
-    uint256S("0000031bb69e844ed1ebd48cc0ab6cee90de29fb98ff7fb439d49b0b19747665"),
-    6400,
-    1784826005,
-    0x1e0376cc,
-    6048,
-    1784614805,
-    {
-        1784820005,
-        1784820605,
-        1784821205,
-        1784821805,
-        1784822405,
-        1784823005,
-        1784823605,
-        1784824205,
-        1784824805,
-        1784825405,
-        1784826005,
-    }};
+BmmL1State MakeBmmCheckpoint(uint32_t mode)
+{
+    std::array<uint32_t, 16> fields{};
+    std::array<unsigned char, 32> hash{};
+    haskell::BmmCheckpointPreset(mode, fields, hash);
+    return {uint256{hash.data(), hash.size()}, fields[0], fields[1], fields[2],
+        fields[3], fields[4], {fields.begin() + 5, fields.end()}};
+}
+
+const BmmL1State& PublicBmmCheckpoint()
+{
+    static const auto state = MakeBmmCheckpoint(0);
+    return state;
+}
 
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-// Test-only checkpoint matching the independently replayed private Truthcoin
-// witness used by the Windows full-covenant E2E.  This is deliberately behind
-// the same compile-time boundary as the private jet catalogue and additionally
-// requires an explicit runtime flag.  Public builds cannot select it.
-const BmmL1State PRIVATE_E2E_REPLAY_CHECKPOINT{
-    // uint256 stores consensus bytes little-endian. This visual value is the
-    // reverse of ProofBindingV1's raw 9f8d...4f63 byte record.
-    uint256S("634fe8d468190cd24fee51a626f17aa7435723503fc389ce6c1af778f9728d9f"),
-    2096,
-    1802055061,
-    0x207fffff,
-    2016,
-    1786323045,
-    {
-        1802055058,
-        1802055058,
-        1802055059,
-        1802055058,
-        1802055059,
-        1802055059,
-        1802055060,
-        1802055059,
-        1802055060,
-        1802055060,
-        1802055061,
-    }};
+// Private checkpoint selection remains compile-time and runtime gated.
+const BmmL1State& PrivateBmmCheckpoint()
+{
+    static const auto state = MakeBmmCheckpoint(1);
+    return state;
+}
 #endif
 
-void FingerprintU32(std::vector<unsigned char>& bytes, uint32_t value)
-{
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        bytes.push_back(static_cast<unsigned char>(value >> shift));
-    }
-}
-
-void FingerprintU64(std::vector<unsigned char>& bytes, uint64_t value)
-{
-    for (int shift = 56; shift >= 0; shift -= 8) {
-        bytes.push_back(static_cast<unsigned char>(value >> shift));
-    }
-}
-
-void FingerprintBytes(
-    std::vector<unsigned char>& output,
-    const unsigned char* begin,
-    const size_t size)
-{
-    FingerprintU64(output, size);
-    if (size != 0) output.insert(output.end(), begin, begin + size);
-}
-
-void FingerprintState(
-    std::vector<unsigned char>& bytes,
-    const BmmL1State& state)
-{
-    bytes.insert(bytes.end(), state.block_hash.begin(), state.block_hash.end());
-    FingerprintU32(bytes, state.height);
-    FingerprintU32(bytes, state.block_time);
-    FingerprintU32(bytes, state.n_bits);
-    FingerprintU32(bytes, state.period_start_height);
-    FingerprintU32(bytes, state.period_start_time);
-    FingerprintU64(bytes, state.recent_times.size());
-    for (const uint32_t time : state.recent_times) FingerprintU32(bytes, time);
-}
-
-uint256 FingerprintTagged(
-    const std::string& tag,
-    const std::vector<unsigned char>& payload)
-{
-    uint256 tag_hash;
-    CSHA256 tag_hasher;
-    tag_hasher.Write(
-        reinterpret_cast<const unsigned char*>(tag.data()), tag.size());
-    tag_hasher.Finalize(tag_hash.begin());
-
-    uint256 result;
-    CSHA256 hasher;
-    hasher.Write(tag_hash.begin(), tag_hash.size());
-    hasher.Write(tag_hash.begin(), tag_hash.size());
-    if (!payload.empty()) hasher.Write(payload.data(), payload.size());
-    hasher.Finalize(result.begin());
-    return result;
-}
 
 template <typename T>
 bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
@@ -206,53 +140,45 @@ std::vector<unsigned char> SerializeValue(const T& value)
 
 bool ValidState(const BmmL1State& state, const BmmConsensus& consensus, std::string& error)
 {
-    const int64_t interval = consensus.DifficultyAdjustmentInterval();
-    if (state.block_hash.IsNull() ||
-        state.height == 0 ||
-        state.block_time == 0 ||
-        state.n_bits == 0 ||
-        interval <= 0 ||
-        state.period_start_height > state.height ||
-        state.period_start_height % interval != 0 ||
-        state.height - state.period_start_height >= static_cast<uint32_t>(interval) ||
-        state.period_start_time == 0 ||
-        state.recent_times.size() != 11 ||
-        state.recent_times.back() != state.block_time) {
-        error = "BMM parent-chain state is malformed";
-        return false;
-    }
-    return true;
+    return haskell::BmmState(!state.block_hash.IsNull(), consensus.DifficultyAdjustmentInterval(),
+        state.height, state.block_time, state.n_bits, state.period_start_height, state.period_start_time,
+        state.recent_times.size(), state.recent_times.empty() ? 0 : state.recent_times.back(), error);
 }
 
-uint32_t MedianTimePast(const std::vector<uint32_t>& times)
+bool IsPublicBmmCheckpoint(const CBlock& block, const CBlockIndex* previous)
 {
-    std::vector<uint32_t> sorted{times};
-    std::sort(sorted.begin(), sorted.end());
-    return sorted[sorted.size() / 2];
+    return haskell::ParentReplayAll<3>({
+        [&] { return block.GetHash() == Identity().blocks[1]; },
+        [&] { return previous != nullptr; },
+        [&] { return previous->GetBlockHash() == Identity().blocks[0]; }});
 }
 
 uint32_t ExpectedNextBits(
     const BmmL1State& previous,
-    const Sidechain::Bitcoin::CBlockHeader& header,
     const BmmConsensus& consensus)
 {
-    const int64_t interval = consensus.DifficultyAdjustmentInterval();
-    if ((static_cast<int64_t>(previous.height) + 1) % interval != 0) {
-        return previous.n_bits;
-    }
-
-    int64_t actual_timespan =
-        static_cast<int64_t>(previous.block_time) - previous.period_start_time;
-    actual_timespan = std::max(consensus.target_timespan / 4, actual_timespan);
-    actual_timespan = std::min(consensus.target_timespan * 4, actual_timespan);
-
-    arith_uint256 next;
-    next.SetCompact(previous.n_bits);
-    next *= actual_timespan;
-    next /= consensus.target_timespan;
-    const arith_uint256 limit = UintToArith256(consensus.pow_limit);
-    if (next > limit) next = limit;
-    return next.GetCompact();
+    using Step = haskell::BmmStateStep;
+    int64_t actual_timespan{0};
+    uint32_t bits = previous.n_bits;
+    haskell::RunBmmStateFlow(Step::RETARGET_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::RETARGET_SPAN:
+            actual_timespan = haskell::BmmRetarget(previous.height,
+                consensus.DifficultyAdjustmentInterval(), consensus.target_timespan,
+                previous.block_time, previous.period_start_time);
+            return actual_timespan != -1;
+        case Step::RETARGET_SCALE: {
+            uint256 next = ArithToUint256(arith_uint256{}.SetCompact(previous.n_bits));
+            haskell::BmmScaleTarget(actual_timespan, consensus.target_timespan,
+                std::span<unsigned char, 32>{next.begin(), 32},
+                std::span<const unsigned char, 32>{consensus.pow_limit.begin(), 32});
+            bits = UintToArith256(next).GetCompact();
+            return 1;
+        }
+        default: throw std::logic_error("unexpected BMM retarget step");
+        }
+    });
+    return bits;
 }
 
 bool CheckParentProofOfWork(
@@ -260,69 +186,73 @@ bool CheckParentProofOfWork(
     const BmmConsensus& consensus,
     std::string& error)
 {
-    bool negative{false};
-    bool overflow{false};
+    using Step = haskell::BmmStateStep;
     arith_uint256 target;
-    target.SetCompact(header.nBits, &negative, &overflow);
-    if (negative || target == 0 || overflow ||
-        target > UintToArith256(consensus.pow_limit) ||
-        UintToArith256(header.GetHash()) > target) {
-        error = "BMM proof contains an invalid parent-chain proof-of-work header";
-        return false;
-    }
-    return true;
-}
-
-int WitnessCommitmentIndex(const Sidechain::Bitcoin::CMutableTransaction& coinbase)
-{
-    int result{-1};
-    for (size_t i = 0; i < coinbase.vout.size(); ++i) {
-        const CScript& script = coinbase.vout[i].scriptPubKey;
-        if (script.size() >= 38 &&
-            script[0] == OP_RETURN &&
-            script[1] == 0x24 &&
-            script[2] == 0xaa &&
-            script[3] == 0x21 &&
-            script[4] == 0xa9 &&
-            script[5] == 0xed) {
-            result = i;
+    return haskell::RunBmmStateFlow(Step::POW_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::POW_TARGET: {
+            bool negative{false}, overflow{false};
+            target.SetCompact(header.nBits, &negative, &overflow);
+            const uint32_t facts = negative | ((target == 0) << 1) | (overflow << 2) |
+                ((target > UintToArith256(consensus.pow_limit)) << 3);
+            return haskell::BmmProof(haskell::BmmProofPhase::POW_TARGET, facts, 0, 0, 0, error);
         }
-    }
-    return result;
+        case Step::POW_HASH:
+            return haskell::BmmProof(haskell::BmmProofPhase::POW_HASH,
+                UintToArith256(header.GetHash()) <= target, 0, 0, 0, error);
+        default: throw std::logic_error("unexpected BMM PoW step");
+        }
+    });
 }
 
 bool FetchAndClearSignetSolution(CScript& witness_commitment, std::vector<unsigned char>& result)
 {
-    CScript replacement;
-    bool found{false};
     result.clear();
-
-    opcodetype opcode;
-    CScript::const_iterator cursor = witness_commitment.begin();
-    std::vector<unsigned char> pushdata;
-    while (witness_commitment.GetOp(cursor, opcode, pushdata)) {
-        if (!pushdata.empty()) {
-            if (!found &&
-                pushdata.size() > SIGNET_HEADER.size() &&
-                std::equal(SIGNET_HEADER.begin(), SIGNET_HEADER.end(), pushdata.begin())) {
-                result.insert(
-                    result.end(),
-                    pushdata.begin() + SIGNET_HEADER.size(),
-                    pushdata.end());
-                pushdata.erase(
-                    pushdata.begin() + SIGNET_HEADER.size(),
-                    pushdata.end());
-                found = true;
+    struct Context {
+        CScript& script;
+        std::vector<unsigned char>& solution;
+        CScript::const_iterator cursor;
+        CScript replacement;
+        opcodetype opcode{OP_INVALIDOPCODE};
+        std::vector<unsigned char> pushdata;
+        std::exception_ptr exception;
+    } context{witness_commitment, result, witness_commitment.begin(), {}, OP_INVALIDOPCODE, {}, {}};
+    auto step = +[](void* opaque, uint32_t action, int64_t* fields) -> int32_t {
+        auto& ctx = *static_cast<Context*>(opaque);
+        try {
+            switch (action) {
+            case 0:
+                fields[0] = ctx.script.GetOp(ctx.cursor, ctx.opcode, ctx.pushdata);
+                fields[1] = ctx.cursor == ctx.script.end();
+                fields[2] = ctx.pushdata.size();
+                fields[3] = 0;
+                for (size_t i = 0; i < std::min<size_t>(4, ctx.pushdata.size()); ++i) fields[3] |= int64_t(ctx.pushdata[i]) << (8 * i);
+                break;
+            case 1:
+                if (ctx.pushdata.size() < 4) throw std::runtime_error("invalid signet adapter capture");
+                ctx.solution.assign(ctx.pushdata.begin() + 4, ctx.pushdata.end());
+                ctx.pushdata.resize(4);
+                break;
+            case 2: ctx.replacement << ctx.pushdata; break;
+            case 3: ctx.replacement << ctx.opcode; break;
+            case 4: ctx.script = ctx.replacement; break;
+            default: return 0;
             }
-            replacement << pushdata;
-        } else {
-            replacement << opcode;
+            return 1;
+        } catch (...) {
+            ctx.exception = std::current_exception();
+            return 0;
         }
+    };
+    try {
+        return haskell::ExtractSignet(step, &context);
+    } catch (...) {
+        if (context.exception) std::rethrow_exception(context.exception);
+        throw;
     }
-    if (cursor != witness_commitment.end()) return false;
-    if (found) witness_commitment = replacement;
-    return true;
 }
+
+} // namespace
 
 uint256 BitcoinWitnessV0SignatureHash(
     const CScript& script_code,
@@ -333,83 +263,89 @@ uint256 BitcoinWitnessV0SignatureHash(
     uint256 hash_prevouts;
     uint256 hash_sequence;
     uint256 hash_outputs;
-    const int base_type = hash_type & 0x1f;
+    const uint32_t plan = haskell::BmmSigHashPlan(hash_type, input_index, transaction.vout.size());
+    const auto hash_items = [](const auto& items, auto field) {
+        HashWriter writer;
+        for (const auto& item : items) writer << field(item);
+        return writer.GetHash();
+    };
 
-    if (!(hash_type & SIGHASH_ANYONECANPAY)) {
-        HashWriter writer;
-        for (const auto& input : transaction.vin) writer << input.prevout;
-        hash_prevouts = writer.GetHash();
-    }
-    if (!(hash_type & SIGHASH_ANYONECANPAY) &&
-        base_type != SIGHASH_SINGLE &&
-        base_type != SIGHASH_NONE) {
-        HashWriter writer;
-        for (const auto& input : transaction.vin) writer << input.nSequence;
-        hash_sequence = writer.GetHash();
-    }
-    if (base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        HashWriter writer;
-        for (const auto& output : transaction.vout) writer << output;
-        hash_outputs = writer.GetHash();
-    } else if (base_type == SIGHASH_SINGLE && input_index < transaction.vout.size()) {
-        hash_outputs = (HashWriter{} << transaction.vout[input_index]).GetHash();
-    }
+    haskell::BmmSignatureActions(plan, [&](uint32_t action) {
+        switch (action) {
+        case 0:
+            hash_prevouts = hash_items(transaction.vin, [](const auto& input) -> const auto& { return input.prevout; });
+            break;
+        case 1:
+            hash_sequence = hash_items(transaction.vin, [](const auto& input) { return input.nSequence; });
+            break;
+        case 2:
+            hash_outputs = hash_items(transaction.vout, [](const auto& output) -> const auto& { return output; });
+            break;
+        case 3:
+            hash_outputs = (HashWriter{} << transaction.vout[input_index]).GetHash();
+            break;
+        default: throw std::logic_error("invalid BMM signature hash action");
+        }
+    });
 
     HashWriter writer;
-    writer << transaction.version;
-    writer << hash_prevouts;
-    writer << hash_sequence;
-    writer << transaction.vin[input_index].prevout;
-    writer << script_code;
-    writer << int64_t{0};
-    writer << transaction.vin[input_index].nSequence;
-    writer << hash_outputs;
-    writer << transaction.nLockTime;
-    writer << hash_type;
+    haskell::BmmPreimage(0, [&](uint32_t field) {
+        switch (field) {
+        case 0: writer << transaction.version; break;
+        case 1: writer << hash_prevouts; break;
+        case 2: writer << hash_sequence; break;
+        case 3: writer << transaction.vin[input_index].prevout; break;
+        case 4: writer << script_code; break;
+        case 5: writer << int64_t{0}; break;
+        case 6: writer << transaction.vin[input_index].nSequence; break;
+        case 7: writer << hash_outputs; break;
+        case 8: writer << transaction.nLockTime; break;
+        case 9: writer << hash_type; break;
+        default: throw std::logic_error("invalid BMM signature field");
+        }
+    });
     return writer.GetHash();
 }
 
-class BitcoinSignatureChecker final : public BaseSignatureChecker
+bool BitcoinSignetSignatureChecker::CheckECDSASignature(
+    const std::vector<unsigned char>& signature_with_type,
+    const std::vector<unsigned char>& public_key, const CScript& script_code,
+    const SigVersion sigversion, unsigned int flags) const
 {
-private:
-    const Sidechain::Bitcoin::CTransaction& m_transaction;
-    const unsigned int m_input_index;
-
-public:
-    BitcoinSignatureChecker(
-        const Sidechain::Bitcoin::CTransaction& transaction,
-        const unsigned int input_index)
-        : m_transaction{transaction}, m_input_index{input_index}
-    {
-    }
-
-    bool CheckECDSASignature(
-        const std::vector<unsigned char>& signature_with_type,
-        const std::vector<unsigned char>& public_key,
-        const CScript& script_code,
-        const SigVersion sigversion,
-        unsigned int) const override
-    {
-        if (sigversion != SigVersion::WITNESS_V0 ||
-            signature_with_type.empty() ||
-            m_input_index >= m_transaction.vin.size()) {
-            return false;
+    using Step = haskell::BmmStateStep;
+    ScriptError script_error{SCRIPT_ERR_OK};
+    std::optional<CPubKey> pubkey;
+    std::vector<unsigned char> signature;
+    int hash_type{0};
+    uint256 digest;
+    const auto start = static_cast<Step>(haskell::BmmStateFlow(Step::SIGNATURE_MODE, static_cast<int32_t>(m_mode)));
+    return haskell::RunBmmStateFlow(start, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::SIGNATURE_GATE:
+            return haskell::BmmSignatureGate(sigversion == SigVersion::WITNESS_V0,
+                signature_with_type.size(), m_input_index, m_transaction.vin.size());
+        case Step::PARENT_SIGNATURE_GATE:
+            return haskell::BmmSignatureGate(sigversion == SigVersion::WITNESS_V0,
+                signature_with_type.size(), 0, 1);
+        case Step::PARENT_SIGNATURE_ENCODING:
+            return CheckSignatureEncoding(signature_with_type, flags, &script_error);
+        case Step::SIGNATURE_KEY:
+            pubkey.emplace(public_key);
+            return pubkey->IsValid();
+        case Step::SIGNATURE_SPLIT:
+            signature = signature_with_type;
+            hash_type = haskell::BmmSplitSignature(signature);
+            return 1;
+        case Step::SIGNATURE_HASH:
+            digest = BitcoinWitnessV0SignatureHash(script_code, m_transaction, m_input_index, hash_type);
+            return 1;
+        case Step::SIGNATURE_VERIFY: return pubkey->Verify(digest, signature);
+        default: throw std::logic_error("unexpected BMM signature step");
         }
-        const CPubKey pubkey{public_key};
-        if (!pubkey.IsValid()) return false;
+    });
+}
 
-        std::vector<unsigned char> signature{signature_with_type};
-        const int hash_type = signature.back();
-        signature.pop_back();
-        return pubkey.Verify(
-            BitcoinWitnessV0SignatureHash(
-                script_code,
-                m_transaction,
-                m_input_index,
-                hash_type),
-            signature);
-    }
-};
+namespace {
 
 bool CheckSignetSolution(
     const Sidechain::Bitcoin::CMutableTransaction& original_coinbase,
@@ -418,337 +354,449 @@ bool CheckSignetSolution(
     std::string& error)
 {
     Sidechain::Bitcoin::CMutableTransaction modified_coinbase{original_coinbase};
-    const int commitment_index = WitnessCommitmentIndex(modified_coinbase);
-    if (commitment_index < 0) {
-        error = "BMM parent block has no Bitcoin witness commitment";
-        return false;
-    }
-
+    int commitment_index{-1};
     std::vector<unsigned char> signet_solution;
-    if (!FetchAndClearSignetSolution(
-            modified_coinbase.vout[commitment_index].scriptPubKey,
-            signet_solution)) {
-        error = "BMM parent block has a malformed signet commitment script";
-        return false;
-    }
-
     Sidechain::Bitcoin::CMutableTransaction transaction_to_spend;
-    transaction_to_spend.version = 0;
-    transaction_to_spend.nLockTime = 0;
-    transaction_to_spend.vin.emplace_back(
-        Sidechain::Bitcoin::COutPoint(),
-        CScript(OP_0),
-        0);
-    transaction_to_spend.vout.emplace_back(0, consensus.signet_challenge);
-
     Sidechain::Bitcoin::CMutableTransaction transaction_spending;
-    transaction_spending.version = 0;
-    transaction_spending.nLockTime = 0;
-    transaction_spending.vin.emplace_back(
-        Sidechain::Bitcoin::COutPoint(),
-        CScript(),
-        0);
-    transaction_spending.vout.emplace_back(0, CScript(OP_RETURN));
-
-    if (!signet_solution.empty()) {
-        try {
-            DataStream stream{signet_solution};
-            stream >> transaction_spending.vin[0].scriptSig;
-            stream >> transaction_spending.vin[0].scriptWitness.stack;
-            if (!stream.empty()) {
-                error = "BMM parent block signet solution contains trailing data";
-                return false;
-            }
-        } catch (...) {
-            error = "BMM parent block signet solution cannot be decoded";
-            return false;
-        }
-    }
-
     std::vector<uint256> matches;
     std::vector<unsigned int> indices;
-    const uint256 modified_merkle_root = proof.txn.ExtractMatchesWithReplacement(
-        matches,
-        indices,
-        0,
-        modified_coinbase.GetHash());
-    if (modified_merkle_root.IsNull() ||
-        matches.size() != 1 ||
-        indices.size() != 1 ||
-        indices[0] != 0 ||
-        matches[0] != original_coinbase.GetHash()) {
-        error = "BMM signet proof does not authenticate exactly the coinbase";
-        return false;
-    }
-
-    std::vector<unsigned char> block_data;
-    VectorWriter writer{block_data, 0};
-    writer << proof.header.nVersion;
-    writer << proof.header.hashPrevBlock;
-    writer << modified_merkle_root;
-    writer << proof.header.nTime;
-    transaction_to_spend.vin[0].scriptSig << block_data;
-    transaction_spending.vin[0].prevout = {
-        transaction_to_spend.GetHash(),
-        0};
-
-    const Sidechain::Bitcoin::CTransaction immutable_to_spend{
-        transaction_to_spend};
-    const Sidechain::Bitcoin::CTransaction immutable_spending{
-        transaction_spending};
-    const BitcoinSignatureChecker checker{immutable_spending, 0};
-    if (!VerifyScript(
-            immutable_spending.vin[0].scriptSig,
-            immutable_to_spend.vout[0].scriptPubKey,
-            &immutable_spending.vin[0].scriptWitness,
-            SIGNET_SCRIPT_FLAGS,
-            checker)) {
-        error = "BMM parent block signet solution is invalid";
-        return false;
-    }
-    return true;
+    uint256 modified_merkle_root;
+    using Step = haskell::SignetStep;
+    return haskell::RunSignetValidation(Step::START, [&](Step step) -> std::array<uint64_t,4> {
+        uint64_t a{0}, b{0}, c{0}, d{0};
+        switch (step) {
+        case Step::WITNESS:
+            commitment_index = BitcoinWitnessCommitmentIndex(modified_coinbase.vout);
+            a = commitment_index >= 0;
+            break;
+        case Step::EXTRACT:
+            a = FetchAndClearSignetSolution(modified_coinbase.vout[commitment_index].scriptPubKey, signet_solution);
+            break;
+        case Step::BUILD: {
+            BuildBitcoinSignetTransactions(consensus.signet_challenge, transaction_to_spend, transaction_spending);
+            a = !signet_solution.empty();
+            break;
+        }
+        case Step::DECODE:
+            try {
+                DataStream stream{signet_solution};
+                haskell::BmmSignetActions(true, [&](uint32_t action) {
+                    switch (action) {
+                    case 0: stream >> transaction_spending.vin[0].scriptSig; break;
+                    case 1: stream >> transaction_spending.vin[0].scriptWitness.stack; break;
+                    default: throw std::logic_error("invalid signet decode action");
+                    }
+                });
+                a = !stream.empty();
+            } catch (...) {
+                a = 2;
+            }
+            break;
+        case Step::MERKLE:
+            modified_merkle_root = proof.txn.ExtractMatchesWithReplacement(matches, indices, 0, modified_coinbase.GetHash());
+            a = !modified_merkle_root.IsNull();
+            b = matches.size();
+            c = indices.size();
+            d = indices.empty() ? 0 : indices[0];
+            break;
+        case Step::COINBASE:
+            a = matches[0] == original_coinbase.GetHash();
+            break;
+        case Step::VERIFY: {
+            const auto block_data = BitcoinSignetBlockData(proof.header, modified_merkle_root);
+            transaction_to_spend.vin[0].scriptSig << block_data;
+            transaction_spending.vin[0].prevout = {transaction_to_spend.GetHash(), 0};
+            const Sidechain::Bitcoin::CTransaction immutable_to_spend{transaction_to_spend};
+            const Sidechain::Bitcoin::CTransaction immutable_spending{transaction_spending};
+            const BitcoinSignetSignatureChecker checker{immutable_spending, 0};
+            a = VerifyScript(immutable_spending.vin[0].scriptSig, immutable_to_spend.vout[0].scriptPubKey,
+                &immutable_spending.vin[0].scriptWitness, Identity().script_flags, checker);
+            break;
+        }
+        default: throw std::runtime_error("invalid native signet action");
+        }
+        return {a,b,c,d};
+    },error);
 }
 
-bool ExtractM8Commitment(
-    const Sidechain::Bitcoin::CMutableTransaction& coinbase,
-    const int sidechain_slot,
-    uint256& commitment,
-    std::string& error)
+// Only upstream script decoding and byte projection live in this adapter.
+template <typename Output>
+int64_t SelectCommitmentIndex(const std::vector<Output>& outputs, uint32_t kind, int slot, std::string& error, uint256* parent = nullptr)
 {
-    bool found{false};
-    for (const auto& output : coinbase.vout) {
-        CScript::const_iterator cursor = output.scriptPubKey.begin();
-        opcodetype opcode;
+    if (outputs.size() > std::numeric_limits<uint32_t>::max()) throw std::length_error("BMM output count");
+    struct Context {
+        const std::vector<Output>& outputs;
+        CScript::const_iterator cursor{};
         std::vector<unsigned char> data;
-        if (!output.scriptPubKey.GetOp(cursor, opcode, data) || opcode != OP_RETURN) continue;
-        if (!output.scriptPubKey.GetOp(cursor, opcode, data) ||
-            opcode > OP_PUSHDATA4 ||
-            data.size() != 37 ||
-            cursor != output.scriptPubKey.end() ||
-            !std::equal(M8_MAGIC.begin(), M8_MAGIC.end(), data.begin()) ||
-            data[4] != sidechain_slot) {
-            continue;
+        std::exception_ptr exception;
+        uint256* parent;
+    } context{outputs, {}, {}, {}, parent};
+    auto inspect = +[](void* opaque, uint32_t index, uint32_t action, int64_t* fields) -> int32_t {
+        auto& ctx = *static_cast<Context*>(opaque);
+        try {
+            const auto& script = ctx.outputs.at(index).scriptPubKey;
+            std::fill_n(fields, 4, 0);
+            switch (action) {
+            case 0:
+                fields[0] = script.size();
+                for (size_t i = 0; i < std::min<size_t>(6, script.size()); ++i) fields[1] |= int64_t(script[i]) << (8 * i);
+                return 1;
+            case 1:
+                ctx.cursor = script.begin();
+                ctx.data.clear();
+                [[fallthrough]];
+            case 2: {
+                opcodetype opcode;
+                fields[0] = script.GetOp(ctx.cursor, opcode, ctx.data) ? uint32_t(opcode) : 256;
+                return 1;
+            }
+            case 3:
+                fields[0] = ctx.cursor == script.end();
+                fields[1] = ctx.data.size();
+                for (size_t i = 0; i < std::min<size_t>(4, ctx.data.size()); ++i) fields[2] |= int64_t(ctx.data[i]) << (8 * i);
+                fields[3] = ctx.data.size() > 4 ? ctx.data[4] : 0;
+                return 1;
+            case 4:
+                if (!ctx.parent || ctx.data.size() != 37) throw std::logic_error("invalid parent commitment publication");
+                *ctx.parent = uint256(ctx.data.data()+5, uint256::size());
+                return 1;
+            default: throw std::logic_error("invalid BMM script action");
+            }
+        } catch (...) {
+            ctx.exception = std::current_exception();
+            return 0;
         }
-        if (found) {
-            error = "BMM successor coinbase contains multiple M8 commitments for slot 24";
-            return false;
-        }
-        commitment = uint256S(HexStr(Span<const unsigned char>{data}.subspan(5)));
-        found = true;
+    };
+    try {
+        return haskell::BmmCommitment(kind, slot, outputs.size(), inspect, &context, error);
+    } catch (...) {
+        if (context.exception) std::rethrow_exception(context.exception);
+        throw;
     }
-    if (!found) error = "BMM successor coinbase has no M8 commitment for slot 24";
-    return found;
 }
 
-bool ExtractSidechainParentHash(
-    const CBlock& block,
-    uint256& parent_hash,
-    std::string& error)
+template <typename Output>
+bool ExtractCommitment(const std::vector<Output>& outputs, uint32_t kind, int slot,
+    uint256& commitment, std::string& error)
 {
-    if (block.vtx.empty()) {
-        error = "sidechain block has no coinbase transaction";
-        return false;
-    }
-    bool found{false};
-    for (const CTxOut& output : block.vtx[0]->vout) {
-        CScript::const_iterator cursor = output.scriptPubKey.begin();
-        opcodetype opcode;
-        std::vector<unsigned char> data;
-        if (!output.scriptPubKey.GetOp(cursor, opcode, data) || opcode != OP_RETURN) continue;
-        if (!output.scriptPubKey.GetOp(cursor, opcode, data) ||
-            opcode > OP_PUSHDATA4 ||
-            data.size() != 32 ||
-            cursor != output.scriptPubKey.end()) {
-            continue;
+    using Step = haskell::BmmStateStep;
+    int64_t selected{-1};
+    const CScript* script{nullptr};
+    CScript::const_iterator cursor{};
+    opcodetype opcode;
+    std::vector<unsigned char> data;
+    return haskell::RunBmmStateFlow(Step::EXTRACT_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::EXTRACT_SELECT:
+            selected = SelectCommitmentIndex(outputs, kind, slot, error);
+            return selected >= 0;
+        case Step::EXTRACT_FIRST:
+            script = &outputs.at(selected).scriptPubKey;
+            cursor = script->begin();
+            script->GetOp(cursor, opcode, data);
+            return 1;
+        case Step::EXTRACT_SECOND:
+            script->GetOp(cursor, opcode, data);
+            return 1;
+        case Step::EXTRACT_PUBLISH: {
+            const auto bytes = haskell::BmmCommitmentBytes(kind, data);
+            commitment = uint256{bytes.data(), bytes.size()};
+            return 1;
         }
-        if (found) {
-            error = "sidechain block has multiple L1 parent commitments";
-            return false;
+        default: throw std::logic_error("unexpected BMM extraction step");
         }
-        parent_hash = uint256{data};
-        found = true;
-    }
-    if (!found) error = "sidechain block has no L1 parent commitment";
-    return found;
+    });
+}
+
+bool ExtractM8Commitment(const Sidechain::Bitcoin::CMutableTransaction& coinbase,
+    const int sidechain_slot, uint256& commitment, std::string& error)
+{
+    return ExtractCommitment(coinbase.vout, 0, sidechain_slot, commitment, error);
+}
+
+bool ExtractSidechainParentHash(const CBlock& block, uint256& parent_hash, std::string& error)
+{
+    using Step = haskell::BmmStateStep;
+    return haskell::RunBmmStateFlow(Step::PARENT_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::PARENT_COINBASE:
+            return haskell::BmmProof(haskell::BmmProofPhase::COINBASE_PRESENT, !block.vtx.empty(), 0, 0, 0, error);
+        case Step::PARENT_EXTRACT: return ExtractCommitment(block.vtx[0]->vout, 1, 0, parent_hash, error);
+        default: throw std::logic_error("unexpected BMM parent extraction step");
+        }
+    });
 }
 
 CScript EncodeBmmState(const BmmL1State& state)
 {
     DataStream stream;
-    stream << BMM_STATE_MARKER << state;
-    return CScript()
-        << std::vector<unsigned char>(
-            UCharCast(stream.data()),
-            UCharCast(stream.data()) + stream.size())
-        << OP_DROP
-        << OP_FALSE;
+    CScript script;
+    haskell::BmmEncodeState([&](uint32_t action, uint32_t opcode) {
+        switch (action) {
+        case 0: stream << Identity().marker; break;
+        case 1: stream << state; break;
+        case 2: script << std::vector<unsigned char>(UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()); break;
+        case 3: script << static_cast<opcodetype>(opcode); break;
+        default: throw std::logic_error("invalid BMM state encoding action");
+        }
+    });
+    return script;
 }
 
 bool DecodeBmmState(const Coin& coin, BmmL1State& state, std::string& error)
 {
-    if (coin.IsSpent() ||
-        !coin.out.nAsset.IsExplicit() ||
-        coin.out.nAsset.GetAsset() != Params().GetConsensus().pegged_asset ||
-        !coin.out.nValue.IsExplicit() ||
-        coin.out.nValue.GetAmount() != 0) {
-        error = "persisted BMM state has invalid asset or value encoding";
-        return false;
-    }
-    CScript::const_iterator cursor = coin.out.scriptPubKey.begin();
-    opcodetype opcode;
-    std::vector<unsigned char> data;
-    if (!coin.out.scriptPubKey.GetOp(cursor, opcode, data) ||
-        opcode > OP_PUSHDATA4 ||
-        !coin.out.scriptPubKey.GetOp(cursor, opcode) ||
-        opcode != OP_DROP ||
-        !coin.out.scriptPubKey.GetOp(cursor, opcode) ||
-        opcode != OP_FALSE ||
-        cursor != coin.out.scriptPubKey.end()) {
-        error = "persisted BMM state script is malformed";
-        return false;
-    }
-    try {
-        DataStream stream{data};
-        std::vector<unsigned char> marker;
-        stream >> marker >> state;
-        if (!stream.empty() ||
-            marker != BMM_STATE_MARKER ||
-            !ValidState(state, LayerTwoLabsBmmConsensus(), error)) {
-            if (error.empty()) error = "persisted BMM state payload is invalid";
-            return false;
+    using Phase = haskell::BmmCodecPhase;
+    using Step = haskell::BmmStateStep;
+    const bool valid_coin = haskell::RunBmmStateFlow(Step::COIN_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::COIN_UNSPENT: return !coin.IsSpent();
+        case Step::COIN_ASSET: return coin.out.nAsset.IsExplicit();
+        case Step::COIN_PEGGED: return coin.out.nAsset.GetAsset() == Params().GetConsensus().pegged_asset;
+        case Step::COIN_VALUE: return coin.out.nValue.IsExplicit();
+        case Step::COIN_ZERO: return coin.out.nValue.GetAmount() == 0;
+        default: throw std::logic_error("invalid BMM coin preflight action");
         }
+    });
+    if (!haskell::BmmCodec(Phase::STATE_ASSET, valid_coin ? 31 : 0, 0, 0, error)) return false;
+    CScript::const_iterator cursor = coin.out.scriptPubKey.begin();
+    std::vector<unsigned char> data;
+    const auto read_opcode = [&](Phase phase) {
+        opcodetype opcode{OP_INVALIDOPCODE};
+        const bool parsed = phase == Phase::STATE_PUSH ? coin.out.scriptPubKey.GetOp(cursor, opcode, data) :
+            coin.out.scriptPubKey.GetOp(cursor, opcode);
+        const uint32_t facts = parsed | ((phase == Phase::STATE_END && cursor == coin.out.scriptPubKey.end()) << 1);
+        return haskell::BmmCodec(phase, facts, parsed ? opcode : 0, 0, error);
+    };
+    std::optional<DataStream> stream;
+    std::vector<unsigned char> marker;
+    Step current{Step::READ_START};
+    try {
+        return haskell::RunBmmStateFlow(Step::READ_START, [&](Step step) {
+            current = step;
+            switch (step) {
+            case Step::READ_PUSH: return read_opcode(Phase::STATE_PUSH);
+            case Step::READ_DROP: return read_opcode(Phase::STATE_DROP);
+            case Step::READ_END: return read_opcode(Phase::STATE_END);
+            case Step::READ_MARKER: stream.emplace(data); *stream >> marker; return true;
+            case Step::READ_STATE: *stream >> state; return true;
+            case Step::READ_PAYLOAD:
+                return haskell::BmmCodec(Phase::STATE_PAYLOAD, stream->empty() | ((marker == Identity().marker) << 1), 0, 0, error);
+            case Step::READ_VALID: return ValidState(state, LayerTwoLabsBmmConsensus(), error);
+            default: throw std::logic_error("invalid BMM state decode action");
+            }
+        });
     } catch (...) {
-        error = "persisted BMM state payload cannot be decoded";
-        return false;
+        if (current < Step::READ_MARKER) throw;
+        return haskell::BmmCodec(Phase::STATE_EXCEPTION, 0, 0, 0, error);
     }
-    return true;
 }
 
-void SetBmmState(CCoinsViewCache& view, const BmmL1State& state, const int height)
+void SetBmmState(CCoinsViewCache& view, const BmmL1State& state, const int height, bool restore = false)
 {
-    view.SpendCoin(BMM_STATE_OUTPOINT);
-    CTxOut output(
-        Params().GetConsensus().pegged_asset,
-        0,
-        EncodeBmmState(state));
-    view.AddCoin(
-        BMM_STATE_OUTPOINT,
-        Coin(std::move(output), std::max(height, 0), false),
-        true);
+    std::optional<CTxOut> output;
+    haskell::BmmStoreState(height, [&](uint32_t action, uint32_t value) {
+        switch (action) {
+        case 0: view.SpendCoin(Identity().outpoint); break;
+        case 1: output.emplace(Params().GetConsensus().pegged_asset, value, EncodeBmmState(state)); break;
+        case 2:
+            view.AddCoin(Identity().outpoint, Coin(std::move(output.value()), value, false), true);
+            break;
+        default: throw std::logic_error("invalid BMM state storage action");
+        }
+    }, restore);
 }
 
 } // namespace
 
+void BuildBitcoinSignetTransactions(const CScript& challenge,
+    Sidechain::Bitcoin::CMutableTransaction& spend, Sidechain::Bitcoin::CMutableTransaction& sign)
+{
+    const auto fields = haskell::BmmSignetTemplate();
+    haskell::BmmSignetActions(false, [&](uint32_t action) {
+        switch (action) {
+        case 0: spend.version = sign.version = fields[0]; break;
+        case 1: spend.nLockTime = sign.nLockTime = fields[1]; break;
+        case 2: spend.vin.emplace_back(Sidechain::Bitcoin::COutPoint(), CScript(static_cast<opcodetype>(fields[4])), fields[2]); break;
+        case 3: spend.vout.emplace_back(fields[3], challenge); break;
+        case 4: sign.vin.emplace_back(Sidechain::Bitcoin::COutPoint(), CScript(), fields[2]); break;
+        case 5: sign.vout.emplace_back(fields[3], CScript(static_cast<opcodetype>(fields[5]))); break;
+        default: throw std::logic_error("invalid signet assembly action");
+        }
+    });
+}
+
+std::vector<unsigned char> BitcoinSignetBlockData(const Sidechain::Bitcoin::CBlockHeader& header,
+    const uint256& modified_merkle_root)
+{
+    std::vector<unsigned char> block_data;
+    VectorWriter writer{block_data, 0};
+    haskell::BmmPreimage(1, [&](uint32_t field) {
+        switch (field) {
+        case 0: writer << header.nVersion; break;
+        case 1: writer << header.hashPrevBlock; break;
+        case 2: writer << modified_merkle_root; break;
+        case 3: writer << header.nTime; break;
+        default: throw std::logic_error("invalid signet header field");
+        }
+    });
+    return block_data;
+}
+
+int BitcoinWitnessCommitmentIndex(const std::vector<Sidechain::Bitcoin::CTxOut>& outputs)
+{
+    std::string error;
+    return SelectCommitmentIndex(outputs, 2, 0, error);
+}
+
+bool ExtractTaggedParentCommitment(const std::vector<CTxOut>& outputs, uint256& parent, std::string& error)
+{
+    return SelectCommitmentIndex(outputs, 3, 0, error, &parent) >= 0;
+}
+
 const BmmConsensus& LayerTwoLabsBmmConsensus()
 {
+    using Step = haskell::BmmStateStep;
+    const BmmConsensus* selected = nullptr;
+    haskell::RunBmmStateFlow(Step::CONSENSUS_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::MODE_SELECT:
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    if (PrivateE2eBmmEnabled()) return PRIVATE_E2E_REGTEST_CONSENSUS;
+            return PrivateE2eBmmEnabled();
+#else
+            return 0;
 #endif
-    return LAYER_TWO_LABS_CONSENSUS;
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+        case Step::MODE_PRIVATE: selected = &PrivateBmmConsensus(); return 1;
+#endif
+        case Step::MODE_PUBLIC: selected = &PublicBmmConsensus(); return 1;
+        default: throw std::logic_error("unexpected BMM consensus step");
+        }
+    });
+    if (!selected) throw std::logic_error("missing BMM consensus selection");
+    return *selected;
 }
 
 const BmmL1State& LayerTwoLabsInitialBmmState()
 {
-    return LAYER_TWO_LABS_INITIAL_STATE;
+    return PublicBmmCheckpoint();
 }
 
 const uint256& LayerTwoLabsPublicSidechainBlock1()
 {
-    return PUBLIC_SIDECHAIN_BLOCK_1;
+    return Identity().blocks[0];
 }
 
 const uint256& LayerTwoLabsPublicSidechainBlock2()
 {
-    return PUBLIC_SIDECHAIN_BLOCK_2;
+    return Identity().blocks[1];
 }
 
 uint256 RuntimeBmmConsensusFingerprint()
 {
     const BmmConsensus& consensus{LayerTwoLabsBmmConsensus()};
-    std::vector<unsigned char> payload;
-    FingerprintU32(payload, 4);
-    payload.push_back(BMM_PROOF_SCHEMA_VERSION);
-    FingerprintU32(payload, CBlockHeader::BMM_PROOF_HF_MASK);
+    const BmmL1State* states[]{&PublicBmmCheckpoint(),
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    payload.push_back(PrivateE2eBmmEnabled() ? 1 : 0);
+        &PrivateBmmCheckpoint()
 #else
-    payload.push_back(0);
+        nullptr
 #endif
-    payload.insert(payload.end(), consensus.pow_limit.begin(), consensus.pow_limit.end());
-    FingerprintU64(payload, static_cast<uint64_t>(consensus.target_timespan));
-    FingerprintU64(payload, static_cast<uint64_t>(consensus.target_spacing));
-    FingerprintBytes(
-        payload,
-        consensus.signet_challenge.data(),
-        consensus.signet_challenge.size());
-    payload.push_back(consensus.require_signet_solution ? 1 : 0);
-    FingerprintU32(payload, static_cast<uint32_t>(consensus.sidechain_slot));
-    FingerprintU64(payload, consensus.max_entries);
-    FingerprintU64(payload, consensus.max_proof_bytes);
-    // The immutable public checkpoint branch remains reachable even in a
-    // private-E2E build, so always bind it. Private mode adds (rather than
-    // substitutes) its selected replay checkpoint.
-    FingerprintState(payload, LAYER_TWO_LABS_INITIAL_STATE);
+    };
+    const bool private_mode =
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    if (PrivateE2eBmmEnabled()) {
-        FingerprintState(payload, PRIVATE_E2E_REPLAY_CHECKPOINT);
-    }
+        PrivateE2eBmmEnabled();
+#else
+        false;
 #endif
-    payload.insert(
-        payload.end(), PUBLIC_SIDECHAIN_BLOCK_1.begin(), PUBLIC_SIDECHAIN_BLOCK_1.end());
-    payload.insert(
-        payload.end(), PUBLIC_SIDECHAIN_BLOCK_2.begin(), PUBLIC_SIDECHAIN_BLOCK_2.end());
-    payload.insert(
-        payload.end(), BMM_STATE_OUTPOINT.hash.ToUint256().begin(), BMM_STATE_OUTPOINT.hash.ToUint256().end());
-    FingerprintU32(payload, BMM_STATE_OUTPOINT.n);
-    FingerprintBytes(payload, BMM_STATE_MARKER.data(), BMM_STATE_MARKER.size());
-    payload.insert(payload.end(), SIGNET_HEADER.begin(), SIGNET_HEADER.end());
-    payload.insert(payload.end(), M8_MAGIC.begin(), M8_MAGIC.end());
-    FingerprintU32(payload, SIGNET_SCRIPT_FLAGS);
-    return FingerprintTagged("ECX/BMM-runtime-consensus/v4", payload);
+    const std::array<uint64_t, 11> numbers{
+        BMM_PROOF_SCHEMA_VERSION, CBlockHeader::BMM_PROOF_HF_MASK, private_mode,
+        static_cast<uint64_t>(consensus.target_timespan), static_cast<uint64_t>(consensus.target_spacing),
+        consensus.require_signet_solution, static_cast<uint32_t>(consensus.sidechain_slot),
+        consensus.max_entries, consensus.max_proof_bytes, Identity().outpoint.n, Identity().script_flags};
+    const std::array<std::span<const unsigned char>, 8> blobs{{
+        {consensus.pow_limit.begin(), consensus.pow_limit.size()},
+        {consensus.signet_challenge.data(), consensus.signet_challenge.size()},
+        {Identity().blocks[0].begin(), Identity().blocks[0].size()},
+        {Identity().blocks[1].begin(), Identity().blocks[1].size()},
+        {Identity().outpoint.hash.ToUint256().begin(), Identity().outpoint.hash.ToUint256().size()},
+        Identity().marker, Identity().signet_header, Identity().m8_magic}};
+    const auto payload = haskell::BmmFingerprint(
+        [&](uint32_t group, uint32_t index, uint64_t& value, const unsigned char*& bytes) {
+            if (group == 0) {
+                if (index >= numbers.size()) return false;
+                value = numbers[index];
+            } else if (group == 1) {
+                if (index < blobs.size()) {
+                    value = blobs[index].size();
+                    bytes = blobs[index].data();
+                } else {
+                    if (index > 9 || !states[index - 8]) return false;
+                    value = states[index - 8]->block_hash.size();
+                    bytes = states[index - 8]->block_hash.begin();
+                }
+            } else {
+                if (group > 5 || !states[(group - 2) / 2]) return false;
+                const auto& state = *states[(group - 2) / 2];
+                if (group & 1) {
+                    if (index >= state.recent_times.size()) return false;
+                    value = state.recent_times[index];
+                } else {
+                    const std::array<uint64_t, 6> fields{state.height, state.block_time, state.n_bits,
+                        state.period_start_height, state.period_start_time, state.recent_times.size()};
+                    if (index >= fields.size()) return false;
+                    value = fields[index];
+                }
+            }
+            return true;
+        });
+    auto writer = TaggedHash(BMM_FINGERPRINT_TAG);
+    writer.write(AsBytes(Span{payload}));
+    return writer.GetSHA256();
 }
 
 bool HasPersistedBmmConsensusState(const CCoinsView& view)
 {
-    const auto coin = view.GetCoin(BMM_STATE_OUTPOINT);
-    return coin && !coin->IsSpent();
+    const auto coin = view.GetCoin(Identity().outpoint);
+    std::string unused;
+    return haskell::BmmStateSource(4, coin && !coin->IsSpent(), {}, unused) != 0;
 }
 
 bool IsBmmStateInternalOutpoint(const COutPoint& outpoint)
 {
-    return outpoint == BMM_STATE_OUTPOINT;
+    return outpoint == Identity().outpoint;
 }
 
 bool BmmProofRequiredAfter(const CBlockIndex* previous)
 {
-    // Native Elements authenticates BMM through the frozen parent replay, not
-    // this historical public-signet proof namespace.
-    if (Params().GetConsensus().drivechain_slot) return false;
+    using Step = haskell::BmmStateStep;
+    bool required = false;
+    haskell::RunBmmStateFlow(Step::ACTIVATION_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::ACTIVATION_PREFLIGHT:
+            return haskell::BmmActivation(0, bool(Params().GetConsensus().drivechain_slot) |
+                ((previous != nullptr) << 1));
+        case Step::MODE_SELECT:
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    // The private replay checkpoint is an explicit test-only substitute for
-    // the immutable public sidechain height-2 checkpoint.  Selecting it must
-    // activate the same header/proof branch at an explicit sidechain height;
-    // otherwise loading an existing private E2E chain would retroactively
-    // invalidate its pre-BMM history during VerifyDB.
-    if (previous && PrivateE2eBmmEnabled()) {
-        if (!gArgs.IsArgSet("-ecxprivatebmmactivationheight")) {
-            throw std::runtime_error(
-                "-ecxprivatebmmcheckpoint requires an explicit "
-                "-ecxprivatebmmactivationheight");
-        }
-        const int64_t activation_height{
-            gArgs.GetIntArg("-ecxprivatebmmactivationheight", -1)};
-        if (activation_height <= 0 ||
-            activation_height >= std::numeric_limits<int>::max()) {
-            throw std::runtime_error("invalid -ecxprivatebmmactivationheight");
-        }
-        return static_cast<int64_t>(previous->nHeight) + 1 >= activation_height;
-    }
+            return PrivateE2eBmmEnabled();
+#else
+            return 0;
 #endif
-    return previous != nullptr &&
-        (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2 ||
-         (static_cast<uint32_t>(previous->nVersion) &
-          CBlockHeader::BMM_PROOF_HF_MASK) != 0);
+#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
+        case Step::MODE_PRIVATE: {
+            const bool present = gArgs.IsArgSet("-ecxprivatebmmactivationheight");
+            required = haskell::BmmActivation(1, present, previous->nHeight,
+                present ? gArgs.GetIntArg("-ecxprivatebmmactivationheight", -1) : -1) == 1;
+            return 1;
+        }
+#endif
+        case Step::MODE_PUBLIC:
+            required = haskell::BmmActivation(2,
+                (previous->GetBlockHash() == Identity().blocks[1]) |
+                (((static_cast<uint32_t>(previous->nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) << 1)) == 1;
+            return 1;
+        default: throw std::logic_error("unexpected BMM activation step");
+        }
+    });
+    return required;
 }
 
 namespace {
@@ -762,37 +810,15 @@ bool CheckBmmHeaderCommitments(
     const bool allow_incomplete_candidate)
 {
     error.clear();
-    if (Params().GetConsensus().drivechain_slot) {
-        if ((static_cast<uint32_t>(version) & CBlockHeader::BMM_PROOF_HF_MASK) != 0 ||
-            !proof_commitment.IsNull()) {
-            error = "historical signet BMM proof is not valid on native Elements";
-            return false;
-        }
-        return true;
-    }
-    if (!previous) return true;
-    if (previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1 &&
-        block_hash != PUBLIC_SIDECHAIN_BLOCK_2) {
-        error = "public-signet height 2 does not match its immutable checkpoint";
-        return false;
-    }
-
-    const bool has_bmm_proof =
-        (static_cast<uint32_t>(version) & CBlockHeader::BMM_PROOF_HF_MASK) != 0;
-    const bool required = BmmProofRequiredAfter(previous);
-    if (required && !has_bmm_proof) {
-        error = "public-signet descendant does not signal deterministic BMM proof";
-        return false;
-    }
-    if (required && proof_commitment.IsNull() && !allow_incomplete_candidate) {
-        error = "deterministic BMM header has no proof commitment";
-        return false;
-    }
-    if (!required && has_bmm_proof) {
-        error = "deterministic BMM proof cannot activate outside the public-signet checkpoint";
-        return false;
-    }
-    return true;
+    const bool native = bool(Params().GetConsensus().drivechain_slot);
+    const uint32_t facts = native | ((previous != nullptr) << 1) |
+        ((!native && previous && previous->GetBlockHash() == Identity().blocks[0]) << 2) |
+        ((block_hash == Identity().blocks[1]) << 3) |
+        (((static_cast<uint32_t>(version) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) << 4) |
+        ((!proof_commitment.IsNull()) << 5) | (allow_incomplete_candidate << 7);
+    const auto preflight = haskell::BmmHeader(facts, error);
+    if (preflight != 6) return preflight == 0;
+    return haskell::BmmHeader(facts | (BmmProofRequiredAfter(previous) << 6) | 256, error) == 0;
 }
 
 } // namespace
@@ -833,11 +859,7 @@ bool SerializeBmmProof(
     error.clear();
     try {
         bytes = SerializeValue(proof);
-        if (bytes.empty() || bytes.size() > MAX_BMM_PROOF_BYTES) {
-            error = "serialized BMM proof exceeds its consensus size bound";
-            return false;
-        }
-        return true;
+        return haskell::BmmCodec(haskell::BmmCodecPhase::ENCODE_SIZE, 0, bytes.size(), MAX_BMM_PROOF_BYTES, error);
     } catch (const std::exception& exception) {
         error = exception.what();
         return false;
@@ -850,19 +872,22 @@ bool DeserializeBmmProof(
     std::string& error)
 {
     error.clear();
-    if (bytes.empty() || bytes.size() > MAX_BMM_PROOF_BYTES) {
-        error = "BMM proof is empty or exceeds its consensus size bound";
-        return false;
-    }
-    if (!DeserializeExactly(bytes, proof) ||
-        proof.version != BMM_PROOF_SCHEMA_VERSION ||
-        proof.entries.empty() ||
-        proof.entries.size() > MAX_BMM_PROOF_ENTRIES ||
-        SerializeValue(proof) != bytes) {
-        error = "BMM proof is malformed or non-canonical";
-        return false;
-    }
-    return true;
+    using Phase = haskell::BmmCodecPhase;
+    using Step = haskell::BmmStateStep;
+    bool decoded{false};
+    return haskell::RunBmmStateFlow(Step::PROOF_START, [&](Step action) {
+        switch (action) {
+        case Step::PROOF_SIZE: return haskell::BmmCodec(Phase::DECODE_SIZE, 0, bytes.size(), MAX_BMM_PROOF_BYTES, error);
+        case Step::PROOF_DECODE: decoded = DeserializeExactly(bytes, proof); return decoded;
+        case Step::PROOF_SHAPE: {
+            const bool version = decoded && proof.version == BMM_PROOF_SCHEMA_VERSION;
+            return haskell::BmmCodec(Phase::DECODE_SHAPE, decoded | (version << 1),
+                version ? proof.entries.size() : 0, MAX_BMM_PROOF_ENTRIES, error);
+        }
+        case Step::PROOF_CANONICAL: return haskell::BmmCodec(Phase::CANONICAL, SerializeValue(proof) == bytes, 0, 0, error);
+        default: throw std::logic_error("invalid BMM proof decode action");
+        }
+    });
 }
 
 uint256 BmmProofCommitment(const std::vector<unsigned char>& bytes)
@@ -873,13 +898,15 @@ uint256 BmmProofCommitment(const std::vector<unsigned char>& bytes)
 bool AttachBmmProof(CBlock& block, const BmmProof& proof, std::string& error)
 {
     error.clear();
-    if (!block.HasBmmProof()) {
-        error = "cannot attach BMM proof without the header version bit";
-        return false;
-    }
-    if (!SerializeBmmProof(proof, block.m_bmm_proof, error)) return false;
-    block.hashBmmProof = BmmProofCommitment(block.m_bmm_proof);
-    return true;
+    using Step = haskell::BmmStateStep;
+    return haskell::RunBmmStateFlow(Step::ATTACH_START, [&](Step action) {
+        switch (action) {
+        case Step::ATTACH_GATE: return haskell::BmmCodec(haskell::BmmCodecPhase::ATTACH, block.HasBmmProof(), 0, 0, error);
+        case Step::ATTACH_SERIALIZE: return SerializeBmmProof(proof, block.m_bmm_proof, error);
+        case Step::ATTACH_PUBLISH: block.hashBmmProof = BmmProofCommitment(block.m_bmm_proof); return true;
+        default: throw std::logic_error("invalid BMM attachment action");
+        }
+    });
 }
 
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
@@ -890,53 +917,65 @@ bool BuildPrivateE2eBmmProof(
     std::string& error)
 {
     error.clear();
-    if (!PrivateE2eBmmEnabled()) {
-        error = "private BMM proof construction is disabled";
-        return false;
-    }
-    if (!ValidState(previous, PRIVATE_E2E_REGTEST_CONSENSUS, error)) return false;
-
     Sidechain::Bitcoin::CMutableTransaction coinbase;
-    coinbase.version = 2;
-    coinbase.vin.resize(1);
-    coinbase.vin[0].prevout.SetNull();
-    coinbase.vin[0].scriptSig = CScript() << static_cast<int64_t>(previous.height + 1);
-
-    std::vector<unsigned char> m8{
-        M8_MAGIC.begin(), M8_MAGIC.end()};
-    m8.push_back(static_cast<unsigned char>(BMM_SIDECHAIN_SLOT));
-    const std::vector<unsigned char> critical_bytes{ParseHex(critical_hash.GetHex())};
-    m8.insert(m8.end(), critical_bytes.begin(), critical_bytes.end());
-    coinbase.vout.emplace_back(0, CScript() << OP_RETURN << m8);
-
     Sidechain::Bitcoin::CBlockHeader header;
-    header.nVersion = 0x20000000;
-    header.hashPrevBlock = previous.block_hash;
-    header.hashMerkleRoot = coinbase.GetHash();
-    header.nTime = std::max(previous.block_time + 1, MedianTimePast(previous.recent_times) + 1);
-    header.nBits = ExpectedNextBits(previous, header, PRIVATE_E2E_REGTEST_CONSENSUS);
     arith_uint256 target;
-    target.SetCompact(header.nBits);
-    while (UintToArith256(header.GetHash()) > target) {
-        ++header.nNonce;
-    }
+    using Step = haskell::BmmStateStep;
+    std::array<uint32_t, 4> fields{};
+    return haskell::RunBmmStateFlow(Step::PRIVATE_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::PRIVATE_ENABLED: {
+            const bool enabled = PrivateE2eBmmEnabled();
+            if (!enabled) error = "private BMM proof construction is disabled";
+            return enabled;
+        }
+        case Step::PRIVATE_VALID:
+            return ValidState(previous, PrivateBmmConsensus(), error);
+        case Step::PRIVATE_COINBASE: {
+            std::array<unsigned char, 37> m8{};
+            haskell::BmmPrivateTemplate(previous.height, previous.block_time,
+                haskell::BmmMedian(previous.recent_times), BMM_SIDECHAIN_SLOT,
+                std::span<const unsigned char, 32>{critical_hash.begin(), 32}, fields, m8);
+            coinbase.version = fields[0];
+            coinbase.vin.resize(1);
+            coinbase.vin[0].prevout.SetNull();
+            coinbase.vin[0].scriptSig = CScript() << static_cast<int64_t>(fields[1]);
+            coinbase.vout.emplace_back(0, CScript() << OP_RETURN << std::vector<unsigned char>(m8.begin(), m8.end()));
 
-    Sidechain::Bitcoin::CMerkleBlock merkle;
-    merkle.header = header;
-    merkle.txn = Sidechain::Bitcoin::CPartialMerkleTree(
-        {coinbase.GetHash()}, {true});
-    proof = BmmProof{};
-    proof.previous_state = previous;
-    proof.entries.push_back({SerializeValue(coinbase), SerializeValue(merkle)});
+            return 1;
+        }
+        case Step::PRIVATE_HEADER:
+            header.nVersion = fields[2];
+            header.hashPrevBlock = previous.block_hash;
+            header.hashMerkleRoot = coinbase.GetHash();
+            header.nTime = fields[3];
+            header.nBits = ExpectedNextBits(previous, PrivateBmmConsensus());
+            target.SetCompact(header.nBits);
+            return 1;
+        case Step::PRIVATE_POW:
+            return UintToArith256(header.GetHash()) <= target;
+        case Step::PRIVATE_NONCE:
+            ++header.nNonce;
+            return 1;
+        case Step::PRIVATE_ASSEMBLE: {
+            Sidechain::Bitcoin::CMerkleBlock merkle;
+            merkle.header = header;
+            merkle.txn = Sidechain::Bitcoin::CPartialMerkleTree(
+                {coinbase.GetHash()}, {true});
+            proof = BmmProof{};
+            proof.previous_state = previous;
+            proof.entries.push_back({SerializeValue(coinbase), SerializeValue(merkle)});
 
-    BmmL1State next;
-    return VerifyBmmProofEntries(
-        proof,
-        critical_hash,
-        previous.block_hash,
-        next,
-        error,
-        PRIVATE_E2E_REGTEST_CONSENSUS);
+            return 1;
+        }
+        case Step::PRIVATE_VERIFY: {
+            BmmL1State next;
+            return VerifyBmmProofEntries(proof, critical_hash, previous.block_hash,
+                next, error, PrivateBmmConsensus());
+        }
+        default: throw std::logic_error("invalid private BMM construction action");
+        }
+    });
 }
 #endif
 
@@ -949,99 +988,125 @@ bool VerifyBmmProofEntries(
     const BmmConsensus& consensus)
 {
     error.clear();
-    if (proof.version != BMM_PROOF_SCHEMA_VERSION ||
-        proof.entries.empty() ||
-        proof.entries.size() > consensus.max_entries ||
-        !ValidState(proof.previous_state, consensus, error)) {
-        if (error.empty()) error = "BMM proof envelope is invalid";
-        return false;
-    }
-
-    BmmL1State state{proof.previous_state};
-    Sidechain::Bitcoin::CMutableTransaction final_coinbase;
-    Sidechain::Bitcoin::CBlockHeader final_header;
-    for (size_t i = 0; i < proof.entries.size(); ++i) {
-        const BmmProofEntry& entry = proof.entries[i];
-        if (entry.coinbase_tx.empty() ||
-            entry.coinbase_tx.size() > MAX_BLOCK_WEIGHT / WITNESS_SCALE_FACTOR ||
-            entry.coinbase_proof.empty() ||
-            entry.coinbase_proof.size() > MAX_BLOCK_WEIGHT / WITNESS_SCALE_FACTOR) {
-            error = "BMM proof entry exceeds its transaction or Merkle proof bound";
-            return false;
-        }
-
-        Sidechain::Bitcoin::CMutableTransaction coinbase;
-        Sidechain::Bitcoin::CMerkleBlock merkle_proof;
-        if (!DeserializeExactly(entry.coinbase_tx, coinbase) ||
-            !DeserializeExactly(entry.coinbase_proof, merkle_proof) ||
-            SerializeValue(coinbase) != entry.coinbase_tx ||
-            SerializeValue(merkle_proof) != entry.coinbase_proof ||
-            coinbase.vin.size() != 1 ||
-            !coinbase.vin[0].prevout.IsNull()) {
-            error = "BMM proof entry has a malformed or non-canonical coinbase proof";
-            return false;
-        }
-
-        std::vector<uint256> matches;
-        std::vector<unsigned int> indices;
-        if (merkle_proof.txn.ExtractMatches(matches, indices) !=
-                merkle_proof.header.hashMerkleRoot ||
-            matches.size() != 1 ||
-            indices.size() != 1 ||
-            indices[0] != 0 ||
-            matches[0] != coinbase.GetHash()) {
-            error = "BMM Merkle proof does not authenticate exactly the parent coinbase";
-            return false;
-        }
-
-        const auto& header = merkle_proof.header;
-        if (header.hashPrevBlock != state.block_hash ||
-            header.nBits != ExpectedNextBits(state, header, consensus) ||
-            header.nTime <= MedianTimePast(state.recent_times) ||
-            !CheckParentProofOfWork(header, consensus, error) ||
-            (consensus.require_signet_solution &&
-             !CheckSignetSolution(coinbase, merkle_proof, consensus, error))) {
-            if (error.empty()) {
-                error = "BMM parent header does not extend the authenticated state";
-            }
-            return false;
-        }
-
-        ++state.height;
-        state.block_hash = header.GetHash();
-        state.block_time = header.nTime;
-        state.n_bits = header.nBits;
-        state.recent_times.erase(state.recent_times.begin());
-        state.recent_times.push_back(header.nTime);
-        if (state.height % consensus.DifficultyAdjustmentInterval() == 0) {
-            state.period_start_height = state.height;
-            state.period_start_time = state.block_time;
-        }
-        if (i + 1 == proof.entries.size()) {
-            final_coinbase = std::move(coinbase);
-            final_header = header;
-        }
-    }
-
-    if (final_header.hashPrevBlock != expected_parent_hash) {
-        error = "BMM proof final header is not the successor of the committed L1 parent";
-        return false;
-    }
+    BmmL1State state;
+    Sidechain::Bitcoin::CMutableTransaction coinbase;
+    Sidechain::Bitcoin::CMerkleBlock merkle_proof;
+    std::vector<uint256> matches;
+    std::vector<unsigned int> indices;
     uint256 mined_commitment;
-    if (!ExtractM8Commitment(
-            final_coinbase,
-            consensus.sidechain_slot,
-            mined_commitment,
-            error)) {
-        return false;
-    }
-    if (mined_commitment != expected_critical_hash) {
-        error = "BMM successor commitment does not match the sidechain critical hash";
-        return false;
-    }
-
-    next_state = std::move(state);
-    return true;
+    size_t index{0};
+    using Step = haskell::BmmTraversalStep;
+    return haskell::RunBmmTraversal(Step::START, [&](Step step) -> std::array<uint64_t,2> {
+        uint64_t a{0}, b{0};
+        switch (step) {
+        case Step::PREFLIGHT:
+            a = haskell::RunBmmStateFlow(haskell::BmmStateStep::PREFLIGHT_START, [&](auto action) {
+                switch (action) {
+                case haskell::BmmStateStep::PREFLIGHT_ENVELOPE:
+                    return haskell::BmmProof(haskell::BmmProofPhase::ENVELOPE, proof.version == BMM_PROOF_SCHEMA_VERSION,
+                        proof.entries.size(), consensus.max_entries, 0, error);
+                case haskell::BmmStateStep::PREFLIGHT_STATE: return ValidState(proof.previous_state, consensus, error);
+                default: throw std::logic_error("invalid BMM preflight action");
+                }
+            });
+            break;
+        case Step::INITIALIZE_ENTRIES:
+            state = proof.previous_state;
+            a = 1;
+            break;
+        case Step::ENTRY_BOUNDS: {
+            const auto& entry = proof.entries.at(index);
+            a = haskell::BmmProof(haskell::BmmProofPhase::BOUNDS, 0, entry.coinbase_tx.size(),
+                entry.coinbase_proof.size(), MAX_BLOCK_WEIGHT / WITNESS_SCALE_FACTOR, error);
+            break;
+        }
+        case Step::PREPARE_ENTRY: {
+            const auto& entry = proof.entries.at(index);
+            coinbase = {};
+            merkle_proof = {};
+            using Decode = haskell::BmmStateStep;
+            uint32_t canonical{0};
+            haskell::RunBmmStateFlow(Decode::ENTRY_START, [&](auto action) {
+                bool accepted;
+                switch (action) {
+                case Decode::ENTRY_TX: accepted = DeserializeExactly(entry.coinbase_tx, coinbase); break;
+                case Decode::ENTRY_PROOF: accepted = DeserializeExactly(entry.coinbase_proof, merkle_proof); break;
+                case Decode::ENTRY_TX_CANONICAL: accepted = SerializeValue(coinbase) == entry.coinbase_tx; break;
+                case Decode::ENTRY_PROOF_CANONICAL: accepted = SerializeValue(merkle_proof) == entry.coinbase_proof; break;
+                default: throw std::logic_error("invalid BMM entry decode action");
+                }
+                canonical |= uint32_t{accepted} << (static_cast<uint32_t>(action) - static_cast<uint32_t>(Decode::ENTRY_TX));
+                return accepted;
+            });
+            canonical |= (!coinbase.vin.empty() && coinbase.vin[0].prevout.IsNull()) << 4;
+            a = haskell::BmmProof(haskell::BmmProofPhase::CANONICAL, canonical, coinbase.vin.size(), 0, 0, error);
+            break;
+        }
+        case Step::MERKLE: {
+            matches.clear();
+            indices.clear();
+            const bool root = merkle_proof.txn.ExtractMatches(matches, indices) == merkle_proof.header.hashMerkleRoot;
+            a = haskell::BmmProof(haskell::BmmProofPhase::MERKLE, root, matches.size(), indices.size(),
+                indices.empty() ? UINT32_MAX : indices[0], error);
+            break;
+        }
+        case Step::COINBASE:
+            a = haskell::BmmProof(haskell::BmmProofPhase::MERKLE_HASH, matches.at(0) == coinbase.GetHash(), 0, 0, 0, error);
+            break;
+        case Step::EXTENSION: {
+            const auto& header = merkle_proof.header;
+            using Extend = haskell::BmmStateStep;
+            uint32_t facts{0};
+            a = haskell::RunBmmStateFlow(Extend::EXTEND_START, [&](auto action) {
+                bool accepted;
+                switch (action) {
+                case Extend::EXTEND_PARENT: accepted = header.hashPrevBlock == state.block_hash; break;
+                case Extend::EXTEND_DIFFICULTY: accepted = header.nBits == ExpectedNextBits(state, consensus); break;
+                case Extend::EXTEND_TIME: accepted = header.nTime > haskell::BmmMedian(state.recent_times); break;
+                case Extend::EXTEND_CHECK: return haskell::BmmProof(haskell::BmmProofPhase::EXTENSION, facts, 0, 0, 0, error);
+                case Extend::EXTEND_POW: return CheckParentProofOfWork(header, consensus, error);
+                default: throw std::logic_error("invalid BMM extension action");
+                }
+                facts |= uint32_t{accepted} << (static_cast<uint32_t>(action) - static_cast<uint32_t>(Extend::EXTEND_PARENT));
+                return accepted;
+            });
+            b = consensus.require_signet_solution;
+            break;
+        }
+        case Step::SIGNET:
+            a = CheckSignetSolution(coinbase, merkle_proof, consensus, error);
+            break;
+        case Step::ADVANCE: {
+            const auto& header = merkle_proof.header;
+            std::array<uint32_t, 16> fields{state.height, state.block_time, state.n_bits, state.period_start_height, state.period_start_time};
+            if (state.recent_times.size() != 11) throw std::runtime_error("invalid native BMM history size");
+            std::copy(state.recent_times.begin(), state.recent_times.end(), fields.begin() + 5);
+            haskell::BmmAdvance(consensus.DifficultyAdjustmentInterval(), header.nTime, header.nBits, fields);
+            state.block_hash = header.GetHash();
+            state.height = fields[0]; state.block_time = fields[1]; state.n_bits = fields[2];
+            state.period_start_height = fields[3]; state.period_start_time = fields[4];
+            std::copy(fields.begin() + 5, fields.end(), state.recent_times.begin());
+            a = index++;
+            b = proof.entries.size();
+            break;
+        }
+        case Step::PARENT:
+            a = haskell::BmmProof(haskell::BmmProofPhase::PARENT,
+                merkle_proof.header.hashPrevBlock == expected_parent_hash, 0, 0, 0, error);
+            break;
+        case Step::COMMITMENT:
+            a = ExtractM8Commitment(coinbase, consensus.sidechain_slot, mined_commitment, error);
+            break;
+        case Step::CRITICAL:
+            a = haskell::BmmProof(haskell::BmmProofPhase::CRITICAL, mined_commitment == expected_critical_hash, 0, 0, 0, error);
+            break;
+        case Step::PUBLISH_ENTRIES:
+            next_state = std::move(state);
+            break;
+        default: throw std::runtime_error("invalid native BMM traversal action");
+        }
+        return {a,b};
+    },error);
 }
 
 bool VerifyBmmProof(
@@ -1052,29 +1117,36 @@ bool VerifyBmmProof(
     const BmmConsensus& consensus)
 {
     error.clear();
-    if (!block.HasBmmProof() ||
-        block.hashBmmProof.IsNull() ||
-        block.m_bmm_proof.empty() ||
-        block.m_bmm_proof.size() > consensus.max_proof_bytes ||
-        BmmProofCommitment(block.m_bmm_proof) != block.hashBmmProof) {
-        error = "sidechain block does not commit its exact BMM proof bytes";
-        return false;
-    }
     BmmProof proof;
-    if (!DeserializeBmmProof(block.m_bmm_proof, proof, error)) return false;
-    if (!(proof.previous_state == expected_previous)) {
-        error = "BMM proof does not extend the locally authenticated parent-chain state";
-        return false;
-    }
     uint256 parent_hash;
-    if (!ExtractSidechainParentHash(block, parent_hash, error)) return false;
-    return VerifyBmmProofEntries(
-        proof,
-        block.GetBmmCriticalHash(),
-        parent_hash,
-        next_state,
-        error,
-        consensus);
+    using Step = haskell::BmmTraversalStep;
+    return haskell::RunBmmTraversal(Step::BLOCK_START, [&](Step step) -> std::array<uint64_t,2> {
+        bool accepted;
+        switch (step) {
+        case Step::BLOCK_BOUNDS:
+            accepted = haskell::BmmProof(haskell::BmmProofPhase::BLOCK_BOUNDS,
+                block.HasBmmProof() | ((!block.hashBmmProof.IsNull()) << 1), block.m_bmm_proof.size(), consensus.max_proof_bytes, 0, error);
+            break;
+        case Step::BLOCK_HASH:
+            accepted = haskell::BmmProof(haskell::BmmProofPhase::BLOCK_HASH,
+                BmmProofCommitment(block.m_bmm_proof) == block.hashBmmProof, 0, 0, 0, error);
+            break;
+        case Step::BLOCK_DECODE:
+            accepted = DeserializeBmmProof(block.m_bmm_proof, proof, error);
+            break;
+        case Step::BLOCK_PRIOR:
+            accepted = haskell::BmmProof(haskell::BmmProofPhase::PRIOR, proof.previous_state == expected_previous, 0, 0, 0, error);
+            break;
+        case Step::BLOCK_PARENT:
+            accepted = ExtractSidechainParentHash(block, parent_hash, error);
+            break;
+        case Step::BLOCK_ENTRIES:
+            accepted = VerifyBmmProofEntries(proof, block.GetBmmCriticalHash(), parent_hash, next_state, error, consensus);
+            break;
+        default: throw std::runtime_error("invalid native BMM block action");
+        }
+        return {accepted,0};
+    },error);
 }
 
 bool GetBmmState(
@@ -1082,14 +1154,12 @@ bool GetBmmState(
     BmmL1State& state,
     std::string* error)
 {
-    const Coin& coin = view.AccessCoin(BMM_STATE_OUTPOINT);
-    if (coin.IsSpent()) return false;
+    const Coin& coin = view.AccessCoin(Identity().outpoint);
     std::string decode_error;
-    if (!DecodeBmmState(coin, state, decode_error)) {
-        if (error) *error = decode_error;
-        return false;
-    }
-    return true;
+    if (haskell::BmmStateSource(4, !coin.IsSpent(), {}, decode_error) == 0) return false;
+    const bool decoded = DecodeBmmState(coin, state, decode_error);
+    std::string ignored;
+    return haskell::BmmStateSource(5, decoded, decode_error, error ? *error : ignored) == 0;
 }
 
 bool GetBmmParentContext(
@@ -1099,16 +1169,22 @@ bool GetBmmParentContext(
 {
     error.clear();
     context = {};
-    if (!ValidState(state, LayerTwoLabsBmmConsensus(), error)) return false;
-    const uint32_t median_time_past{MedianTimePast(state.recent_times)};
-    if (median_time_past == 0) {
-        error = "authenticated BMM parent median time past is zero";
-        return false;
-    }
-    context.block_hash = state.block_hash;
-    context.height = state.height;
-    context.median_time_past = median_time_past;
-    return true;
+    using Step = haskell::BmmStateStep;
+    int64_t median_time_past{0};
+    return haskell::RunBmmStateFlow(Step::CONTEXT_START, [&](Step action) {
+        switch (action) {
+        case Step::CONTEXT_VALID: return ValidState(state, LayerTwoLabsBmmConsensus(), error);
+        case Step::CONTEXT_MEDIAN:
+            median_time_past = haskell::BmmParentMedian(state.recent_times, error);
+            return median_time_past >= 0;
+        case Step::CONTEXT_PUBLISH:
+            context.block_hash = state.block_hash;
+            context.height = state.height;
+            context.median_time_past = median_time_past;
+            return true;
+        default: throw std::logic_error("invalid BMM parent context action");
+        }
+    });
 }
 
 bool GetEffectiveBmmState(
@@ -1117,28 +1193,28 @@ bool GetEffectiveBmmState(
     BmmL1State& state,
     std::string& error)
 {
-    if (Params().GetConsensus().drivechain_slot) {
-        error = "native Elements requires its authenticated parent replay, not signet BMM state";
-        return false;
-    }
     std::string state_error;
-    if (GetBmmState(view, state, &state_error)) return true;
-    if (!state_error.empty()) {
-        error = state_error;
-        return false;
-    }
-    if (previous && previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_2) {
-        state = LAYER_TWO_LABS_INITIAL_STATE;
-        return true;
-    }
+    using Step = haskell::BmmStateStep;
+    return haskell::RunBmmStateFlow(Step::EFFECTIVE_START, [&](Step action) -> int32_t {
+        switch (action) {
+        case Step::EFFECTIVE_NETWORK: return haskell::BmmStateSource(0, bool(Params().GetConsensus().drivechain_slot), {}, error);
+        case Step::EFFECTIVE_LOAD: {
+            const bool found = GetBmmState(view, state, &state_error);
+            return haskell::BmmStateSource(1, found | ((!state_error.empty()) << 1), state_error, error);
+        }
+        case Step::EFFECTIVE_PUBLIC:
+            return haskell::BmmStateSource(2, previous && previous->GetBlockHash() == Identity().blocks[1], {}, error);
+        case Step::EFFECTIVE_PUBLISH_PUBLIC: state = PublicBmmCheckpoint(); return 1;
+        case Step::EFFECTIVE_PRIVATE:
 #ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    if (PrivateE2eBmmEnabled()) {
-        state = PRIVATE_E2E_REPLAY_CHECKPOINT;
-        return true;
-    }
+            return haskell::BmmStateSource(3, PrivateE2eBmmEnabled(), {}, error);
+        case Step::EFFECTIVE_PUBLISH_PRIVATE: state = PrivateBmmCheckpoint(); return 1;
+#else
+            return haskell::BmmStateSource(3, 0, {}, error);
 #endif
-    error = "authenticated BMM parent-chain state is missing";
-    return false;
+        default: throw std::logic_error("invalid BMM effective state action");
+        }
+    });
 }
 
 bool ConnectBmmState(
@@ -1149,52 +1225,55 @@ bool ConnectBmmState(
     const bool allow_incomplete_candidate,
     std::string& error)
 {
-    if (Params().GetConsensus().drivechain_slot) {
-        if (!CheckBmmHeader(block, previous, error, false)) return false;
-        if (!block.m_bmm_proof.empty() || HasPersistedBmmConsensusState(view)) {
-            error = "historical signet BMM state is not valid on native Elements";
-            return false;
+    using Phase = haskell::BmmLifecyclePhase;
+    using Step = haskell::BmmStateStep;
+    BmmL1State previous_state, next_state;
+    std::string state_error;
+    return haskell::RunBmmStateFlow(Step::CONNECT_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::CONNECT_KIND:
+            return haskell::BmmLifecycle(Phase::CONNECT_KIND, bool(Params().GetConsensus().drivechain_slot), {}, error);
+        case Step::NATIVE_HEADER:
+            return CheckBmmHeader(block, previous, error, false);
+        case Step::NATIVE_STATE: {
+            bool has_state{false};
+            return haskell::RunBmmStateFlow(Step::NATIVE_CHECK_START, [&](Step action) -> int32_t {
+                switch (action) {
+                case Step::NATIVE_CHECK_PROOF: has_state = !block.m_bmm_proof.empty(); return has_state;
+                case Step::NATIVE_CHECK_LOOKUP: has_state = HasPersistedBmmConsensusState(view); return has_state;
+                case Step::NATIVE_CHECK_RESULT: return haskell::BmmLifecycle(Phase::NATIVE_STATE, has_state, {}, error);
+                default: throw std::logic_error("invalid native BMM state check");
+                }
+            }) ? 0 : -1;
         }
-        return true;
-    }
-    if (block.GetHash() == PUBLIC_SIDECHAIN_BLOCK_2 &&
-        previous &&
-        previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1) {
-        BmmL1State existing;
-        std::string state_error;
-        if (GetBmmState(view, existing, &state_error)) {
-            error = "public BMM checkpoint cannot overwrite existing parent-chain state";
-            return false;
+        case Step::CHECKPOINT:
+            return haskell::BmmLifecycle(Phase::CONNECT_CHECKPOINT, IsPublicBmmCheckpoint(block, previous), {}, error);
+        case Step::INITIALIZE: {
+            const bool found = GetBmmState(view, previous_state, &state_error);
+            return haskell::BmmLifecycle(Phase::INITIALIZE, found | ((!state_error.empty()) << 1), state_error, error);
         }
-        if (!state_error.empty()) {
-            error = state_error;
-            return false;
+        case Step::STORE_INITIAL:
+            SetBmmState(view, PublicBmmCheckpoint(), height);
+            return 1;
+        case Step::REQUIRED: {
+            const bool required = BmmProofRequiredAfter(previous);
+            return haskell::BmmLifecycle(Phase::REQUIRED, required | ((!required && block.HasBmmProof()) << 1), {}, error);
         }
-        SetBmmState(view, LAYER_TWO_LABS_INITIAL_STATE, height);
-        return true;
-    }
-
-    if (!BmmProofRequiredAfter(previous) && !block.HasBmmProof()) return true;
-    if (allow_incomplete_candidate &&
-        block.HasBmmProof() &&
-        block.hashBmmProof.IsNull() &&
-        block.m_bmm_proof.empty()) {
-        return true;
-    }
-
-    BmmL1State previous_state;
-    if (!GetEffectiveBmmState(view, previous, previous_state, error)) return false;
-    BmmL1State next_state;
-    if (!VerifyBmmProof(
-            block,
-            previous_state,
-            next_state,
-            error,
-            LayerTwoLabsBmmConsensus())) {
-        return false;
-    }
-    SetBmmState(view, next_state, height);
-    return true;
+        case Step::INCOMPLETE: {
+            return haskell::BmmLifecycle(Phase::INCOMPLETE, allow_incomplete_candidate |
+                (block.HasBmmProof() << 1) | (block.hashBmmProof.IsNull() << 2) |
+                (block.m_bmm_proof.empty() << 3), {}, error);
+        }
+        case Step::EFFECTIVE:
+            return GetEffectiveBmmState(view, previous, previous_state, error);
+        case Step::VERIFY:
+            return VerifyBmmProof(block, previous_state, next_state, error, LayerTwoLabsBmmConsensus());
+        case Step::STORE_NEXT:
+            SetBmmState(view, next_state, height);
+            return 1;
+        default: throw std::runtime_error("invalid native BMM connect action");
+        }
+    });
 }
 
 bool DisconnectBmmState(
@@ -1204,51 +1283,47 @@ bool DisconnectBmmState(
     const int height,
     std::string& error)
 {
-    if (block.GetHash() == PUBLIC_SIDECHAIN_BLOCK_2 &&
-        previous &&
-        previous->GetBlockHash() == PUBLIC_SIDECHAIN_BLOCK_1) {
-        BmmL1State current;
-        std::string state_error;
-        if (GetBmmState(view, current, &state_error) &&
-            current == LAYER_TWO_LABS_INITIAL_STATE) {
-            if (!view.SpendCoin(BMM_STATE_OUTPOINT)) {
-                error = "public BMM checkpoint state could not be removed";
-                return false;
-            }
-            return true;
-        }
-        if (!state_error.empty()) error = state_error;
-        else error = "public BMM checkpoint state is inconsistent during disconnect";
-        return false;
-    }
-    if (!block.HasBmmProof()) return true;
-
+    using Phase = haskell::BmmLifecyclePhase;
+    using Step = haskell::BmmStateStep;
     BmmProof proof;
-    if (!DeserializeBmmProof(block.m_bmm_proof, proof, error)) return false;
-    BmmL1State current;
+    BmmL1State current, expected_next;
     std::string state_error;
-    if (!GetBmmState(view, current, &state_error)) {
-        error = state_error.empty()
-            ? "cannot disconnect BMM proof without authenticated state"
-            : state_error;
-        return false;
-    }
-    BmmL1State expected_next;
     uint256 parent_hash;
-    if (!ExtractSidechainParentHash(block, parent_hash, error) ||
-        !VerifyBmmProofEntries(
-            proof,
-            block.GetBmmCriticalHash(),
-            parent_hash,
-            expected_next,
-            error,
-            LayerTwoLabsBmmConsensus()) ||
-        !(current == expected_next)) {
-        if (error.empty()) error = "BMM state is inconsistent during disconnect";
-        return false;
-    }
-    SetBmmState(view, proof.previous_state, height - 1);
-    return true;
+    return haskell::RunBmmStateFlow(Step::DISCONNECT_START, [&](Step step) -> int32_t {
+        switch (step) {
+        case Step::DISCONNECT_KIND:
+            return haskell::BmmLifecycle(Phase::DISCONNECT_KIND, IsPublicBmmCheckpoint(block, previous), {}, error);
+        case Step::REMOVE_CHECKPOINT: {
+            const bool found = GetBmmState(view, current, &state_error);
+            const bool same = found && current == PublicBmmCheckpoint();
+            return haskell::BmmLifecycle(Phase::REMOVE_CHECKPOINT, found | (same << 1) |
+                ((!state_error.empty()) << 2), state_error, error);
+        }
+        case Step::REMOVE:
+            return haskell::BmmLifecycle(Phase::REMOVED, view.SpendCoin(Identity().outpoint), {}, error);
+        case Step::HAS_PROOF:
+            return haskell::BmmLifecycle(Phase::DISCONNECT_PROOF, block.HasBmmProof(), {}, error);
+        case Step::DECODE_PROOF:
+            return DeserializeBmmProof(block.m_bmm_proof, proof, error);
+        case Step::LOAD_CURRENT: {
+            const bool found = GetBmmState(view, current, &state_error);
+            return haskell::BmmLifecycle(Phase::LOAD_CURRENT, found | ((!state_error.empty()) << 1), state_error, error);
+        }
+        case Step::EXTRACT_PARENT:
+            return ExtractSidechainParentHash(block, parent_hash, error);
+        case Step::VERIFY_ENTRIES:
+            return VerifyBmmProofEntries(proof, block.GetBmmCriticalHash(), parent_hash,
+                expected_next, error, LayerTwoLabsBmmConsensus());
+        case Step::COMPARE_CURRENT:
+            return haskell::BmmLifecycle(Phase::RESTORE, current == expected_next, {}, error);
+        case Step::REJECT_PRIOR:
+            return haskell::BmmLifecycle(Phase::RESTORE, false, {}, error);
+        case Step::STORE_PRIOR:
+            SetBmmState(view, proof.previous_state, height, true);
+            return 1;
+        default: throw std::runtime_error("invalid native BMM disconnect action");
+        }
+    });
 }
 
 } // namespace drivechain

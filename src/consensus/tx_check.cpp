@@ -7,6 +7,7 @@
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
 #include <consensus/validation.h>
+#include <haskell/bridge.h>
 #include <map>
 
 static bool CheckTransactionImpl(const CTransaction&, TxValidationState&, bool, bool);
@@ -51,13 +52,17 @@ static bool CheckTransactionImpl(const CTransaction& tx, TxValidationState& stat
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-negative");
         if (txout.nValue.GetAmount() > MAX_MONEY)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-toolarge");
-        if (defer_totals) continue;
+        using TotalMode = drivechain::haskell::OutputTotalMode;
+        const auto mode = drivechain::haskell::SelectOutputTotalMode(
+            defer_totals, explicit_asset_totals, txout.nAsset.IsExplicit());
+        if (mode == TotalMode::DEFERRED) continue;
         // The activated explicit-only rule supplies public asset identities.
         // Never treat an unknown/confidential asset as a distinct public asset.
-        if (explicit_asset_totals && !txout.nAsset.IsExplicit())
+        if (mode == TotalMode::REJECT)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-asset-not-explicit");
-        CAmount& total = explicit_asset_totals ? asset_totals[txout.nAsset.GetAsset()] : nValueOutExplicit;
-        if (txout.nValue.GetAmount() > MAX_MONEY - total)
+        CAmount& total = mode == TotalMode::PER_ASSET ? asset_totals[txout.nAsset.GetAsset()] : nValueOutExplicit;
+        if (!drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::AMOUNT_SUM,
+                0, txout.nValue.GetAmount(), total, MAX_MONEY))
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-txouttotal-toolarge");
         total += txout.nValue.GetAmount();
     }

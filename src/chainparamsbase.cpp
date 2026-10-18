@@ -10,6 +10,8 @@
 #include <chainparamsbase.h>
 
 #include <elements_drivechain_identity.h>
+#include <haskell/bridge.h>
+#include <haskell/network_defaults.h>
 
 #include <common/args.h>
 #include <tinyformat.h>
@@ -17,16 +19,16 @@
 
 #include <assert.h>
 
-const std::string CBaseChainParams::MAIN = "main";
-const std::string CBaseChainParams::TESTNET = "test";
-const std::string CBaseChainParams::SIGNET = "signet";
-const std::string CBaseChainParams::REGTEST = "regtest";
-const std::string CBaseChainParams::LIQUID1 = "liquidv1";
-const std::string CBaseChainParams::LIQUID1TEST = "liquidv1test";
-const std::string CBaseChainParams::LIQUIDTESTNET = "liquidtestnet";
-const std::string CBaseChainParams::ELEMENTS = "elements";
+const std::string CBaseChainParams::MAIN = ChainTypeToString(ChainType::MAIN);
+const std::string CBaseChainParams::TESTNET = ChainTypeToString(ChainType::TESTNET);
+const std::string CBaseChainParams::SIGNET = ChainTypeToString(ChainType::SIGNET);
+const std::string CBaseChainParams::REGTEST = ChainTypeToString(ChainType::REGTEST);
+const std::string CBaseChainParams::LIQUID1 = ChainTypeToString(ChainType::LIQUID1);
+const std::string CBaseChainParams::LIQUID1TEST = ChainTypeToString(ChainType::LIQUID1TEST);
+const std::string CBaseChainParams::LIQUIDTESTNET = ChainTypeToString(ChainType::LIQUIDTESTNET);
+const std::string CBaseChainParams::ELEMENTS = drivechain::PRODUCTION_CHAIN_NAME;
 
-const std::string CBaseChainParams::DEFAULT = CBaseChainParams::ELEMENTS;
+const std::string CBaseChainParams::DEFAULT = ChainTypeToString(drivechain::DEFAULT_CHAIN);
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 void SetupChainParamsBaseOptions(ArgsManager& argsman)
@@ -77,10 +79,7 @@ void SetupChainParamsBaseOptions(ArgsManager& argsman)
 
 void EnsureElementsProductionChain(const ArgsManager& args)
 {
-    if (args.GetChainTypeString() != CBaseChainParams::ELEMENTS) {
-        throw std::runtime_error(
-            "This program only supports the canonical -chain=elements production network");
-    }
+    drivechain::haskell::ValidateNetworkSelection(drivechain::haskell::NetworkSelection::PRODUCTION, args.GetChainTypeString());
 }
 
 static std::unique_ptr<CBaseChainParams> globalChainBaseParams;
@@ -97,9 +96,7 @@ const CBaseChainParams& BaseParams()
  */
 std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainTypeMeta chain)
 {
-    if (chain.chain_name == "usdd") {
-        throw std::runtime_error("The pre-launch 'usdd' chain identity is unsupported; use -chain=elements");
-    }
+    drivechain::haskell::ValidateNetworkSelection(drivechain::haskell::NetworkSelection::CHAIN_NAME, chain.chain_name);
     switch (chain.chain_type) {
     case ChainType::ELEMENTS:
         return std::make_unique<CBaseChainParams>(

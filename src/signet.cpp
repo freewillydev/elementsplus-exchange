@@ -9,13 +9,14 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <drivechain_bmm.h>
 #include <hash.h>
+#include <haskell/bridge.h>
 #include <logging.h>
 #include <primitives/block.h>
 #include <primitives/bitcoin/block.h>
 #include <primitives/bitcoin/transaction.h>
 #include <primitives/transaction.h>
-#include <pubkey.h>
 #include <script/interpreter.h>
 #include <span.h>
 #include <streams.h>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 static constexpr uint8_t SIGNET_HEADER[4] = {0xec, 0xc7, 0xda, 0xa2};
@@ -157,105 +159,29 @@ bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& cons
     return true;
 }
 
-namespace {
-
-int GetBitcoinWitnessCommitmentIndex(const Bitcoin::CBlock& block)
-{
-    int commit_pos{-1};
-    if (block.vtx.empty()) return commit_pos;
-    for (size_t i = 0; i < block.vtx[0]->vout.size(); ++i) {
-        const CScript& script = block.vtx[0]->vout[i].scriptPubKey;
-        if (script.size() >= 38 && script[0] == OP_RETURN && script[1] == 0x24 &&
-            script[2] == 0xaa && script[3] == 0x21 && script[4] == 0xa9 && script[5] == 0xed) {
-            commit_pos = static_cast<int>(i);
-        }
-    }
-    return commit_pos;
-}
-
 uint256 ComputeBitcoinModifiedMerkleRoot(const Bitcoin::CMutableTransaction& coinbase,
                                          const Bitcoin::CBlock& block)
 {
     std::vector<uint256> leaves;
-    leaves.reserve(block.vtx.size());
-    leaves.push_back(coinbase.GetHash());
-    for (size_t i = 1; i < block.vtx.size(); ++i) leaves.push_back(block.vtx[i]->GetHash());
-    return ComputeMerkleRoot(std::move(leaves));
+    size_t index{0};
+    uint256 root;
+    namespace hs = drivechain::haskell;
+    hs::ParentReplayStore(hs::ReplayStoreFlow::SIGNET_MERKLE, [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: leaves.reserve(block.vtx.size()); return 1;
+        case 2: leaves.push_back(coinbase.GetHash()); return 1;
+        case 3: index = 1; return 1;
+        case 4: return hs::ParentReplayRecord(hs::ReplayRecordKind::LESS, 0, 0, index, block.vtx.size());
+        case 5: leaves.push_back(block.vtx[index]->GetHash()); return 1;
+        case 6: ++index; return 1;
+        case 7: root = ComputeMerkleRoot(std::move(leaves)); return 1;
+        default: throw std::logic_error("invalid parent signet Merkle action");
+        }
+    });
+    return root;
 }
 
-uint256 BitcoinWitnessV0SignatureHash(const CScript& script_code,
-                                      const Bitcoin::CTransaction& transaction,
-                                      const unsigned int input_index,
-                                      const int hash_type)
-{
-    uint256 hash_prevouts;
-    uint256 hash_sequence;
-    uint256 hash_outputs;
-    const int base_type = hash_type & 0x1f;
-
-    if (!(hash_type & SIGHASH_ANYONECANPAY)) {
-        HashWriter writer;
-        for (const auto& input : transaction.vin) writer << input.prevout;
-        hash_prevouts = writer.GetHash();
-    }
-    if (!(hash_type & SIGHASH_ANYONECANPAY) && base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        HashWriter writer;
-        for (const auto& input : transaction.vin) writer << input.nSequence;
-        hash_sequence = writer.GetHash();
-    }
-    if (base_type != SIGHASH_SINGLE && base_type != SIGHASH_NONE) {
-        HashWriter writer;
-        for (const auto& output : transaction.vout) writer << output;
-        hash_outputs = writer.GetHash();
-    } else if (base_type == SIGHASH_SINGLE && input_index < transaction.vout.size()) {
-        HashWriter writer;
-        writer << transaction.vout[input_index];
-        hash_outputs = writer.GetHash();
-    }
-
-    HashWriter writer;
-    writer << transaction.version;
-    writer << hash_prevouts;
-    writer << hash_sequence;
-    writer << transaction.vin[input_index].prevout;
-    writer << script_code;
-    writer << int64_t{0};
-    writer << transaction.vin[input_index].nSequence;
-    writer << hash_outputs;
-    writer << transaction.nLockTime;
-    writer << static_cast<uint32_t>(hash_type);
-    return writer.GetHash();
-}
-
-class BitcoinSignetSignatureChecker final : public BaseSignatureChecker
-{
-private:
-    const Bitcoin::CTransaction& m_transaction;
-
-public:
-    explicit BitcoinSignetSignatureChecker(const Bitcoin::CTransaction& transaction)
-        : m_transaction(transaction) {}
-
-    bool CheckECDSASignature(const std::vector<unsigned char>& signature_with_hash_type,
-                             const std::vector<unsigned char>& public_key,
-                             const CScript& script_code,
-                             const SigVersion sig_version,
-                             const unsigned int flags) const override
-    {
-        if (sig_version != SigVersion::WITNESS_V0 || signature_with_hash_type.empty()) return false;
-        ScriptError script_error{SCRIPT_ERR_OK};
-        if (!CheckSignatureEncoding(signature_with_hash_type, flags, &script_error)) return false;
-
-        CPubKey pubkey(public_key);
-        if (!pubkey.IsValid()) return false;
-
-        std::vector<unsigned char> signature(signature_with_hash_type.begin(), signature_with_hash_type.end() - 1);
-        const int hash_type = signature_with_hash_type.back();
-        const uint256 signature_hash = BitcoinWitnessV0SignatureHash(script_code, m_transaction, 0, hash_type);
-        return pubkey.Verify(signature_hash, signature);
-    }
-};
-
+namespace {
 bool SetSignetError(std::string* error, const std::string& message)
 {
     if (error) *error = message;
@@ -269,64 +195,63 @@ bool CheckBitcoinSignetBlockSolution(const Bitcoin::CBlock& block,
                                      const uint256& genesis_hash,
                                      std::string* error)
 {
-    if (block.GetHash() == genesis_hash) return true;
-    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
-        return SetSignetError(error, "parent signet block has no coinbase transaction");
-    }
-
-    const int commitment_index = GetBitcoinWitnessCommitmentIndex(block);
-    if (commitment_index < 0) {
-        return SetSignetError(error, "parent signet block has no witness commitment");
-    }
-
-    Bitcoin::CMutableTransaction modified_coinbase(*block.vtx[0]);
-    CScript& witness_commitment = modified_coinbase.vout[commitment_index].scriptPubKey;
-    std::vector<uint8_t> signet_solution;
-    FetchAndClearCommitmentSection(SIGNET_HEADER, witness_commitment, signet_solution);
-
-    Bitcoin::CMutableTransaction transaction_to_spend;
-    transaction_to_spend.version = 0;
-    transaction_to_spend.nLockTime = 0;
-    transaction_to_spend.vin.emplace_back(Bitcoin::COutPoint(), CScript(OP_0), 0);
-    transaction_to_spend.vout.emplace_back(0, challenge);
-
-    Bitcoin::CMutableTransaction transaction_to_sign;
-    transaction_to_sign.version = 0;
-    transaction_to_sign.nLockTime = 0;
-    transaction_to_sign.vin.emplace_back(Bitcoin::COutPoint(), CScript(), 0);
-    transaction_to_sign.vout.emplace_back(0, CScript(OP_RETURN));
-
-    if (!signet_solution.empty()) {
-        try {
-            SpanReader reader{signet_solution};
-            reader >> transaction_to_sign.vin[0].scriptSig;
-            reader >> transaction_to_sign.vin[0].scriptWitness.stack;
-            if (!reader.empty()) return SetSignetError(error, "parent signet solution has trailing bytes");
-        } catch (const std::exception&) {
-            return SetSignetError(error, "parent signet solution is not canonically encoded");
-        }
-    }
-
-    const uint256 modified_merkle_root = ComputeBitcoinModifiedMerkleRoot(modified_coinbase, block);
-    std::vector<uint8_t> block_data;
-    VectorWriter writer(block_data, 0);
-    writer << block.nVersion;
-    writer << block.hashPrevBlock;
-    writer << modified_merkle_root;
-    writer << block.nTime;
-    transaction_to_spend.vin[0].scriptSig << block_data;
-    transaction_to_sign.vin[0].prevout = Bitcoin::COutPoint(transaction_to_spend.GetHash(), 0);
-
-    const Bitcoin::CTransaction immutable_transaction{std::move(transaction_to_sign)};
-    const BitcoinSignetSignatureChecker checker{immutable_transaction};
+    namespace hs = drivechain::haskell;
+    int commitment_index{-1};
+    std::optional<Bitcoin::CMutableTransaction> modified_coinbase, spend, sign;
+    std::optional<Bitcoin::CTransaction> immutable;
+    std::vector<uint8_t> solution, block_data;
+    uint256 merkle;
     ScriptError script_error{SCRIPT_ERR_OK};
-    if (!VerifyScript(immutable_transaction.vin[0].scriptSig,
-                      challenge,
-                      &immutable_transaction.vin[0].scriptWitness,
-                      BLOCK_SCRIPT_VERIFY_FLAGS,
-                      checker,
-                      &script_error)) {
-        return SetSignetError(error, strprintf("parent signet solution failed challenge validation: %s", ScriptErrorString(script_error)));
-    }
-    return true;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::PARENT_SIGNET, [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return block.GetHash() == genesis_hash;
+        case 2: return block.vtx.empty();
+        case 3: return block.vtx[0]->IsCoinBase();
+        case 4: return SetSignetError(error, "parent signet block has no coinbase transaction");
+        case 5:
+            commitment_index = drivechain::BitcoinWitnessCommitmentIndex(block.vtx[0]->vout);
+            return commitment_index >= 0;
+        case 6: return SetSignetError(error, "parent signet block has no witness commitment");
+        case 7: modified_coinbase.emplace(*block.vtx[0]); return 1;
+        case 8:
+            FetchAndClearCommitmentSection(SIGNET_HEADER, modified_coinbase->vout[commitment_index].scriptPubKey, solution);
+            return 1;
+        case 9:
+            spend.emplace();
+            sign.emplace();
+            drivechain::BuildBitcoinSignetTransactions(challenge, *spend, *sign);
+            return 1;
+        case 10: return solution.empty();
+        case 11:
+            try {
+                SpanReader reader{solution};
+                return hs::ParentReplayStore(hs::ReplayStoreFlow::RAW_DECODE, [&](uint32_t step) -> uint32_t {
+                    switch (step) {
+                    case 1: reader >> sign->vin[0].scriptSig; return 1;
+                    case 2: reader >> sign->vin[0].scriptWitness.stack; return 1;
+                    case 3: return !reader.empty();
+                    case 4: return SetSignetError(error, "parent signet solution has trailing bytes");
+                    default: throw std::logic_error("invalid signet decode action");
+                    }
+                });
+            } catch (const std::exception&) {
+                return SetSignetError(error, "parent signet solution is not canonically encoded");
+            }
+        case 12: merkle = ComputeBitcoinModifiedMerkleRoot(*modified_coinbase, block); return 1;
+        case 13: block_data = drivechain::BitcoinSignetBlockData(block, merkle); return 1;
+        case 14:
+            spend->vin[0].scriptSig << block_data;
+            sign->vin[0].prevout = Bitcoin::COutPoint(spend->GetHash(), 0);
+            return 1;
+        case 15: immutable.emplace(std::move(*sign)); return 1;
+        case 16: {
+            const drivechain::BitcoinSignetSignatureChecker checker{*immutable, 0,
+                drivechain::BitcoinSignetSignatureChecker::Mode::PARENT};
+            return VerifyScript(immutable->vin[0].scriptSig, challenge,
+                &immutable->vin[0].scriptWitness, BLOCK_SCRIPT_VERIFY_FLAGS, checker, &script_error);
+        }
+        case 17: return SetSignetError(error, strprintf("parent signet solution failed challenge validation: %s", ScriptErrorString(script_error)));
+        default: throw std::logic_error("invalid parent signet action");
+        }
+    }) == 1;
 }

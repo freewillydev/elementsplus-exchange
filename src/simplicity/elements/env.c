@@ -1,4 +1,5 @@
 #include <simplicity/elements/env.h>
+#include <haskell/simplicity_ffi.h>
 
 #include <stdalign.h>
 #include <stddef.h>
@@ -111,14 +112,9 @@ static void copyInput(sigInput* result, const rawElementsInput* input) {
  * legacy hash or transaction-environment construction.
  */
 static bool canCopyFullAnnex(const rawElementsInput* input) {
-  if (!input->annex || !input->fullAnnex || !input->fullAnnex->buf) return false;
-  if (0 == input->fullAnnex->len ||
-      SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE < input->fullAnnex->len ||
-      0x50 != input->fullAnnex->buf[0]) return false;
-  if (input->annex->len != input->fullAnnex->len - 1) return false;
-  if (0 == input->annex->len) return true;
-  if (!input->annex->buf) return false;
-  return 0 == memcmp(input->annex->buf, input->fullAnnex->buf + 1, input->annex->len);
+  if (!input->annex || !input->fullAnnex) return false;
+  return elements_haskell_annex_retention(input->fullAnnex->len, input->annex->len,
+    input->fullAnnex->buf, input->annex->buf);
 }
 
 /* Sum the bytes that will be retained, rejecting only allocation arithmetic

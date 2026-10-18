@@ -10,6 +10,7 @@
 #include <consensus/params.h>
 #include <ecx_bond_v2.h>
 #include <flatfile.h>
+#include <haskell/bmm_constants.h>
 #include <kernel/cs_main.h>
 #include <primitives/block.h>
 #include <serialize.h>
@@ -108,7 +109,7 @@ public:
  */
 struct DrivechainAnchor
 {
-    static constexpr uint8_t CURRENT_VERSION{1};
+    static constexpr uint8_t CURRENT_VERSION{drivechain::DRIVECHAIN_ANCHOR_VERSION};
 
     uint8_t version{CURRENT_VERSION};
     uint256 parent_block_hash{};
@@ -119,31 +120,8 @@ struct DrivechainAnchor
     uint32_t bmm_height{0};
     uint64_t parent_median_time_past{0};
 
-    bool IsSane() const
-    {
-        return version == CURRENT_VERSION &&
-               !parent_block_hash.IsNull() &&
-               !bmm_block_hash.IsNull() &&
-               !parent_chainwork.IsNull() &&
-               !bmm_chainwork.IsNull() &&
-               bmm_height == parent_height + 1 &&
-               UintToArith256(bmm_chainwork) > UintToArith256(parent_chainwork) &&
-               parent_median_time_past <= std::numeric_limits<uint32_t>::max();
-    }
-
-    bool operator==(const DrivechainAnchor& other) const
-    {
-        return version == other.version &&
-               parent_block_hash == other.parent_block_hash &&
-               bmm_block_hash == other.bmm_block_hash &&
-               parent_chainwork == other.parent_chainwork &&
-               bmm_chainwork == other.bmm_chainwork &&
-               parent_height == other.parent_height &&
-               bmm_height == other.bmm_height &&
-               parent_median_time_past == other.parent_median_time_past;
-    }
-
-    bool operator!=(const DrivechainAnchor& other) const { return !(*this == other); }
+    bool IsSane() const;
+    bool operator==(const DrivechainAnchor&) const = default;
 
     /**
      * Return whether this anchor could follow `previous` on one active parent
@@ -151,15 +129,7 @@ struct DrivechainAnchor
      * directly as its BMM parent; otherwise parent height and work must both
      * advance. Active-chain ancestry is authenticated separately.
      */
-    bool Follows(const DrivechainAnchor& previous) const
-    {
-        if (!IsSane() || !previous.IsSane() || parent_height < previous.bmm_height) return false;
-        if (parent_height == previous.bmm_height) {
-            return parent_block_hash == previous.bmm_block_hash &&
-                   parent_chainwork == previous.bmm_chainwork;
-        }
-        return UintToArith256(parent_chainwork) > UintToArith256(previous.bmm_chainwork);
-    }
+    bool Follows(const DrivechainAnchor& previous) const;
 
     SERIALIZE_METHODS(DrivechainAnchor, obj)
     {
@@ -277,6 +247,7 @@ public:
     uint256 hashMerkleRoot{};
     uint256 hashWithdrawalBundle{};
     uint256 hashBmmProof{};
+    UtreexoCommitment utreexo;
     uint256 hashExchangeStateRoot{};
     uint256 hashForcedInboxRoot{};
     uint256 hashDepositInboxRoot{};
@@ -376,6 +347,7 @@ public:
           hashMerkleRoot{block.hashMerkleRoot},
           hashWithdrawalBundle{block.hashWithdrawalBundle},
           hashBmmProof{block.hashBmmProof},
+          utreexo{block.utreexo},
           hashExchangeStateRoot{block.hashExchangeStateRoot},
           hashForcedInboxRoot{block.hashForcedInboxRoot},
           hashDepositInboxRoot{block.hashDepositInboxRoot},
@@ -424,6 +396,7 @@ public:
         block.hashMerkleRoot = hashMerkleRoot;
         block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.hashBmmProof = hashBmmProof;
+        block.utreexo = utreexo;
         block.hashExchangeStateRoot = hashExchangeStateRoot;
         block.hashForcedInboxRoot = hashForcedInboxRoot;
         block.hashDepositInboxRoot = hashDepositInboxRoot;
@@ -580,40 +553,6 @@ public:
         hashPrev = (pprev ? pprev->GetBlockHash() : uint256());
     }
 
-    // ELEMENTS: to unmask the dynafed bit on deserialization, we call one of these
-    //  these methods from SERIALIZE_METHODS, using const-overloading to select the
-    //  right one. We cannot inline them since the body of SERIALIZE_METHODS will be
-    //  called with a const object during serialization. See Core #17850 and followups.
-    bool RemoveDynaFedMaskOnSerialize(bool for_read) {
-        if (!g_con_elementsmode) return false;
-        if (for_read) {
-            bool is_dyna = nVersion < 0;
-            nVersion = (int32_t) (~CBlockHeader::DYNAFED_HF_MASK & (uint32_t)nVersion);
-            return is_dyna;
-        } else {
-            return is_dynafed_block();
-        }
-    }
-    bool RemoveDynaFedMaskOnSerialize(bool for_read) const {
-        assert(!for_read);
-        return g_con_elementsmode && is_dynafed_block();
-    }
-
-    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) {
-        if (!g_con_elementsmode) return false;
-        if (for_read) {
-            bool has_withdrawal_bundle_hash = ((uint32_t)nVersion & CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK) != 0;
-            nVersion = (int32_t) (~CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK & (uint32_t)nVersion);
-            return has_withdrawal_bundle_hash;
-        } else {
-            return !hashWithdrawalBundle.IsNull();
-        }
-    }
-    bool RemoveWithdrawalBundleMaskOnSerialize(bool for_read) const {
-        assert(!for_read);
-        return g_con_elementsmode && !hashWithdrawalBundle.IsNull();
-    }
-
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
     {
         LOCK(::cs_main);
@@ -629,70 +568,52 @@ public:
 
         // block header
 
-        // Detect dynamic federation block serialization using "HF bit",
-        // or the signed bit which is invalid in Bitcoin
         if (ser_action.ForRead()) {
             READWRITE(obj.nVersion);
-        } else {
-            int32_t nVersion = obj.nVersion;
-            if (g_con_elementsmode) {
-                nVersion = static_cast<int32_t>(
-                    static_cast<uint32_t>(nVersion) &
-                    ~(CBlockHeader::DYNAFED_HF_MASK |
-                      CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK));
-            }
-            if (g_con_elementsmode && obj.is_dynafed_block()) {
-                nVersion |= (int32_t)CBlockHeader::DYNAFED_HF_MASK;
-            }
-            if (g_con_elementsmode && !obj.hashWithdrawalBundle.IsNull()) {
-                nVersion |= (int32_t)CBlockHeader::WITHDRAWAL_BUNDLE_HF_MASK;
-            }
+        }
+        // Read mode derives flags from the wire; optional dynafed state is not initialized yet.
+        const auto layout = CBlockHeader::GetLayout(obj.nVersion,
+            !ser_action.ForRead() && !obj.hashWithdrawalBundle.IsNull(),
+            !ser_action.ForRead() && g_con_elementsmode && obj.is_dynafed_block(), ser_action.ForRead());
+        SER_READ(obj, obj.nVersion = layout.version);
+        if (!ser_action.ForRead()) {
+            int32_t nVersion = layout.version;
             READWRITE(nVersion);
         }
-        bool is_dyna = obj.RemoveDynaFedMaskOnSerialize(ser_action.ForRead());
-        const bool has_withdrawal_bundle_hash =
-            obj.RemoveWithdrawalBundleMaskOnSerialize(ser_action.ForRead());
 
         READWRITE(obj.hashPrev);
         READWRITE(obj.hashMerkleRoot);
-        if (has_withdrawal_bundle_hash) {
+        if (layout.withdrawal) {
             READWRITE(obj.hashWithdrawalBundle);
         } else {
             SER_READ(obj, obj.hashWithdrawalBundle.SetNull());
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::BMM_PROOF_HF_MASK) != 0) {
+        if (layout.bmm) {
             READWRITE(obj.hashBmmProof);
         } else {
             SER_READ(obj, obj.hashBmmProof.SetNull());
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::EXCHANGE_STATE_HF_MASK) != 0) {
+        if (layout.exchange) {
             READWRITE(obj.hashExchangeStateRoot);
         } else {
             SER_READ(obj, obj.hashExchangeStateRoot.SetNull());
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0) {
+        if (layout.forced) {
             READWRITE(obj.hashForcedInboxRoot);
         } else {
             SER_READ(obj, obj.hashForcedInboxRoot.SetNull());
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
+        if (layout.deposit) {
             READWRITE(obj.hashDepositInboxRoot);
         } else {
             SER_READ(obj, obj.hashDepositInboxRoot.SetNull());
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::FORCED_INBOX_HF_MASK) != 0 &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::DEPOSIT_INBOX_HF_MASK) != 0) {
+        if (layout.parent_height) {
             READWRITE(obj.ecxParentHeight);
         } else {
             SER_READ(obj, obj.ecxParentHeight = 0);
         }
-        if (g_con_elementsmode &&
-            (static_cast<uint32_t>(obj.nVersion) & CBlockHeader::INBOX_CURSOR_HF_MASK) != 0) {
+        if (layout.cursors) {
             READWRITE(obj.forcedProcessedCursor);
             READWRITE(obj.depositProcessedCursor);
             READWRITE(obj.sourceBacklogOldestParentHeight);
@@ -700,6 +621,11 @@ public:
             SER_READ(obj, obj.forcedProcessedCursor = 0);
             SER_READ(obj, obj.depositProcessedCursor = 0);
             SER_READ(obj, obj.sourceBacklogOldestParentHeight = 0);
+        }
+        if (g_con_elementsmode && g_con_utreexo && (uint32_t(obj.nVersion) & utreexo::HEADER_BIT)) {
+            READWRITE(obj.utreexo);
+        } else {
+            SER_READ(obj, obj.utreexo = UtreexoCommitment{});
         }
         READWRITE(obj.nTime);
 
@@ -713,7 +639,7 @@ public:
             if (!ser_action.ForRead()) {
                 obj.assert_untrimmed();
             }
-            if (is_dyna) {
+            if (layout.dynamic) {
                 READWRITE(obj.m_dynafed_params.value());
                 READWRITE(obj.m_signblock_witness.value().stack);
             } else {
@@ -723,9 +649,6 @@ public:
             READWRITE(obj.nBits);
             READWRITE(obj.nNonce);
         }
-        // Disk order need not match wire order; this branch is intentionally
-        // empty because the root was already serialized above with the other
-        // fixed header commitments.
     }
 
     uint256 ConstructBlockHash() const
@@ -737,6 +660,7 @@ public:
         block.hashMerkleRoot = hashMerkleRoot;
         block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.hashBmmProof = hashBmmProof;
+        block.utreexo = utreexo;
         block.hashExchangeStateRoot = hashExchangeStateRoot;
         block.hashForcedInboxRoot = hashForcedInboxRoot;
         block.hashDepositInboxRoot = hashDepositInboxRoot;

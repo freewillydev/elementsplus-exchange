@@ -1,4 +1,5 @@
 #include <simplicity/elements/exec.h>
+#include <haskell/simplicity_ffi.h>
 
 #include <stdalign.h>
 #include <string.h>
@@ -11,68 +12,45 @@
 #include "../simplicity_assert.h"
 #include "../typeInference.h"
 
-static bool valid_optional_ecx_root(uint8_t present, const uint8_t root[32]) {
+static bool nonzero_root(const unsigned char root[32]) {
   static const unsigned char zero[32] = {0};
-  return present <= 1 && (present ? 0 != memcmp(root, zero, sizeof(zero))
-                                  : 0 == memcmp(root, zero, sizeof(zero)));
+  return 0 != memcmp(root, zero, sizeof(zero));
+}
+
+static bool valid_optional_ecx_root(uint8_t present, const uint8_t root[32]) {
+  return elements_haskell_optional_environment(0, present, nonzero_root(root));
 }
 
 static bool valid_optional_bmm_parent(const ecx_prior_active_root_env* env) {
-  static const unsigned char zero[32] = {0};
-  if (env->current_bmm_parent_present > 1) return false;
-  if (!env->current_bmm_parent_present) {
-    return 0 == memcmp(env->current_bmm_parent_block_hash_wire, zero, sizeof(zero)) &&
-           0 == env->current_bmm_parent_height && 0 == env->current_bmm_parent_mtp;
-  }
-  return 0 != memcmp(env->current_bmm_parent_block_hash_wire, zero, sizeof(zero)) &&
-         0 != env->current_bmm_parent_height && 0 != env->current_bmm_parent_mtp;
+  return elements_haskell_optional_environment(1, env->current_bmm_parent_present,
+    nonzero_root(env->current_bmm_parent_block_hash_wire) |
+    ((env->current_bmm_parent_height != 0) << 1) | ((env->current_bmm_parent_mtp != 0) << 2));
 }
 
 static bool valid_optional_bond_v2_identity(const ecx_prior_active_root_env* env) {
-  static const unsigned char zero[32] = {0};
-  if (env->bond_v2_identity_present > 1) return false;
-  const bool config = 0 != memcmp(env->bond_v2_configuration_hash_wire, zero, sizeof(zero));
-  const bool asset = 0 != memcmp(env->bond_v2_asset_id_wire, zero, sizeof(zero));
-  const bool deployment = 0 != memcmp(env->bond_v2_deployment_commitment_wire, zero, sizeof(zero));
-  const bool cmr = 0 != memcmp(env->bond_v2_transition_cmr_wire, zero, sizeof(zero));
-  const bool insurance_script = 0 != memcmp(
-    env->bond_v2_insurance_reserve_script_sha256_wire, zero, sizeof(zero));
-  const bool insurance_cmr = 0 != memcmp(
-    env->bond_v2_insurance_reserve_cmr_wire, zero, sizeof(zero));
-  const bool collateral_script = 0 != memcmp(
-    env->bond_v2_collateral_vault_script_sha256_wire, zero, sizeof(zero));
-  const bool collateral_cmr = 0 != memcmp(
-    env->bond_v2_collateral_vault_cmr_wire, zero, sizeof(zero));
-  return env->bond_v2_identity_present
-    ? config && asset && deployment && cmr && insurance_script && insurance_cmr &&
-      collateral_script && collateral_cmr
-    : !config && !asset && !deployment && !cmr && !insurance_script && !insurance_cmr &&
-      !collateral_script && !collateral_cmr;
+  const unsigned char* roots[] = {
+    env->bond_v2_configuration_hash_wire, env->bond_v2_asset_id_wire,
+    env->bond_v2_deployment_commitment_wire, env->bond_v2_transition_cmr_wire,
+    env->bond_v2_insurance_reserve_script_sha256_wire, env->bond_v2_insurance_reserve_cmr_wire,
+    env->bond_v2_collateral_vault_script_sha256_wire, env->bond_v2_collateral_vault_cmr_wire};
+  uint32_t fields = 0;
+  for (size_t i = 0; i < sizeof(roots)/sizeof(*roots); ++i) fields |= (uint32_t)nonzero_root(roots[i]) << i;
+  return elements_haskell_optional_environment(2, env->bond_v2_identity_present, fields);
 }
 
 static bool valid_optional_bond_v2_projection(const ecx_prior_active_root_env* env) {
-  static const unsigned char zero[32] = {0};
-  if (env->bond_v2_projection_present > 1) return false;
-  const bool root = 0 != memcmp(
-    env->prior_active_bond_inbox_root_wire, zero, sizeof(zero));
-  return env->bond_v2_projection_present
-    ? root && 0 != env->current_sidechain_height
-    : !root && 0 == env->prior_active_bond_inbox_count &&
-      0 == env->current_sidechain_height;
+  return elements_haskell_optional_environment(3, env->bond_v2_projection_present,
+    nonzero_root(env->prior_active_bond_inbox_root_wire) |
+    ((env->prior_active_bond_inbox_count != 0) << 1) | ((env->current_sidechain_height != 0) << 2));
 }
 
 static bool valid_optional_bond_v2_incremental_activation_identity(
   const ecx_prior_active_root_env* env
 ) {
-  static const unsigned char zero[32] = {0};
-  if (env->bond_v2_incremental_activation_identity_present > 1) return false;
-  const bool activation_cmr = 0 != memcmp(
-    env->bond_v2_incremental_activation_cmr_wire, zero, sizeof(zero));
-  const bool successor_cmr = 0 != memcmp(
-    env->incremental_successor_transition_cmr_wire, zero, sizeof(zero));
-  return env->bond_v2_incremental_activation_identity_present
-    ? env->bond_v2_identity_present && activation_cmr && successor_cmr
-    : !activation_cmr && !successor_cmr;
+  return elements_haskell_optional_environment(4, env->bond_v2_incremental_activation_identity_present,
+    nonzero_root(env->bond_v2_incremental_activation_cmr_wire) |
+    (nonzero_root(env->incremental_successor_transition_cmr_wire) << 1) |
+    ((env->bond_v2_identity_present != 0) << 2));
 }
 
 /* Deserialize a Simplicity 'program' with its 'witness' data and execute it in the environment of the 'ix'th input of 'tx' with `taproot`.

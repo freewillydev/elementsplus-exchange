@@ -5,17 +5,78 @@
 #include <wallet/rpc/util.h>
 
 #include <common/url.h>
+#include <haskell/bridge.h>
 #include <rpc/util.h>
 #include <util/any.h>
 #include <util/translation.h>
+#include <util/strencodings.h>
 #include <wallet/context.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
 #include <string_view>
+#include <array>
+#include <utility>
+#include <stdexcept>
 #include <univalue.h>
 
 namespace wallet {
+void CheckDepositArgument(DepositArgument rule, int64_t amount, int64_t bound)
+{
+    static constexpr std::array<std::pair<int,const char*>,11> failures{{
+        {RPC_INVALID_PARAMETER,"value_sats must be positive and within the money range"},
+        {RPC_INVALID_PARAMETER,"fee_sats must be a non-negative monetary amount"},
+        {RPC_INVALID_PARAMETER,"value_sats must be greater than zero"},
+        {RPC_INVALID_PARAMETER,"fee_sats must be non-negative and less than value_sats"},
+        {RPC_INVALID_PARAMETER,"mainchain_vout must be a valid uint32 output index"},
+        {RPC_METHOD_NOT_FOUND,"Native BIP300 deposits are not enabled on this network"},
+        {RPC_MISC_ERROR,"importdrivechaindeposit is unavailable outside an Elements parent-chain configuration"},
+        {RPC_INVALID_PARAMETER,"mainchain_txid must be a 32-byte hex transaction id"},
+        {RPC_INVALID_PARAMETER,"mainchain_block_hash must be a 32-byte hex block hash"},
+        {RPC_INVALID_ADDRESS_OR_KEY,"Invalid Elements address"},
+        {RPC_METHOD_NOT_FOUND,"Legacy federated peg-ins are disabled on a Drivechain network; use importdrivechaindeposit"}}};
+    if (static_cast<size_t>(rule) >= failures.size()) throw std::runtime_error("Unknown deposit argument rule");
+    if (!drivechain::haskell::DepositPreflight(static_cast<uint32_t>(rule), amount, bound)) {
+        const auto [code,message] = failures.at(static_cast<size_t>(rule));
+        throw JSONRPCError(code, message);
+    }
+}
+
+int64_t ParseDrivechainSatoshis(const UniValue& value, const char* field, std::optional<int64_t> fallback)
+{
+    int64_t amount{fallback.value_or(0)};
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::DEPOSIT_SATOSHIS,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return value.isNum();
+        case 2: amount=value.getInt<int64_t>(); return 1;
+        case 3: return value.isStr();
+        case 4: return ParseInt64(value.get_str(),&amount);
+        case 5: throw JSONRPCError(RPC_INVALID_PARAMETER,strprintf("%s must be an integer number of satoshis",field));
+        case 6: return fallback.has_value();
+        case 7: return value.isNull();
+        default: throw std::logic_error("Invalid Haskell deposit satoshi action");
+        }
+    });
+    return amount;
+}
+
+DepositBroadcastResult BroadcastDrivechainDeposit(bool known, const std::function<bool(std::string&)>& broadcast)
+{
+    std::string error;
+    const auto result = drivechain::haskell::ParentReplayStore(
+        drivechain::haskell::ReplayStoreFlow::DEPOSIT_BROADCAST, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return known;
+        case 2: return broadcast(error);
+        case 3: case 4: return drivechain::haskell::DepositMessageMatches(step-3,error);
+        case 5: throw JSONRPCError(RPC_TRANSACTION_REJECTED,error);
+        default: throw std::logic_error("Invalid Haskell deposit broadcast action");
+        }
+    });
+    return {result==1,result==2};
+}
+
 static const std::string WALLET_ENDPOINT_BASE = "/wallet/";
 const std::string HELP_REQUIRING_PASSPHRASE{"\nRequires wallet passphrase to be set with walletpassphrase call if wallet is encrypted.\n"};
 
@@ -57,33 +118,33 @@ bool GetWalletNameFromJSONRPCRequest(const JSONRPCRequest& request, std::string&
 
 static std::shared_ptr<CWallet> LoadOrCreateDefaultWallet(WalletContext& context)
 {
-    constexpr const char* DEFAULT_BITWINDOW_WALLET = "default";
-
-    DatabaseOptions load_options;
-    load_options.require_existing = true;
-    load_options.verify = false;
-    DatabaseStatus load_status;
-    bilingual_str load_error;
-    std::vector<bilingual_str> load_warnings;
-    if (auto wallet = LoadWallet(context, DEFAULT_BITWINDOW_WALLET, /*load_on_start=*/true, load_options, load_status, load_error, load_warnings)) {
-        return wallet;
-    }
-    if (load_status != DatabaseStatus::FAILED_NOT_FOUND) {
-        throw JSONRPCError(RPC_WALLET_ERROR, load_error.original);
-    }
-
-    DatabaseOptions create_options;
-    create_options.require_create = true;
+    std::shared_ptr<CWallet> wallet;
+    DatabaseStatus status;
+    bilingual_str error;
+    const auto attempt = [&](auto open, bool create) {
+        DatabaseOptions options;
+        options.require_existing = !create;
+        options.require_create = create;
+        options.verify = create;
 #ifdef USE_SQLITE
-    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+        options.create_flags = create ? WALLET_FLAG_DESCRIPTORS : 0;
 #endif
-    DatabaseStatus create_status;
-    bilingual_str create_error;
-    std::vector<bilingual_str> create_warnings;
-    if (auto wallet = CreateWallet(context, DEFAULT_BITWINDOW_WALLET, /*load_on_start=*/true, create_options, create_status, create_error, create_warnings)) {
-        return wallet;
-    }
-    throw JSONRPCError(RPC_WALLET_ERROR, create_error.original);
+        error = {};
+        std::vector<bilingual_str> warnings;
+        wallet = open(context, "default", /*load_on_start=*/true, options, status, error, warnings);
+        return bool(wallet);
+    };
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::DEFAULT_WALLET,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return attempt(LoadWallet, false);
+        case 2: return status == DatabaseStatus::FAILED_NOT_FOUND;
+        case 4: return attempt(CreateWallet, true);
+        case 3: case 5: throw JSONRPCError(RPC_WALLET_ERROR, error.original);
+        default: throw std::logic_error("invalid default wallet action");
+        }
+    });
+    return wallet;
 }
 
 std::shared_ptr<CWallet> GetWalletForJSONRPCRequest(const JSONRPCRequest& request)

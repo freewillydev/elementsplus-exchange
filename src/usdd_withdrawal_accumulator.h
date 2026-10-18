@@ -6,6 +6,7 @@
 #define BITCOIN_USDD_WITHDRAWAL_ACCUMULATOR_H
 
 #include <elements_drivechain_identity.h>
+#include <haskell/bridge.h>
 #include <serialize.h>
 #include <uint256.h>
 
@@ -47,14 +48,7 @@ struct EthereumWithdrawalClaim {
     EthereumAddress recipient{};
     WithdrawalHash leaf{};
 
-    bool operator==(const EthereumWithdrawalClaim& other) const
-    {
-        return elements_genesis == other.elements_genesis && asset_id == other.asset_id &&
-            vault_id == other.vault_id && burn_txid_display == other.burn_txid_display &&
-            burn_vout == other.burn_vout && burn_id == other.burn_id &&
-            claim_index == other.claim_index && amount_usdt_micro == other.amount_usdt_micro &&
-            recipient == other.recipient && leaf == other.leaf;
-    }
+    bool operator==(const EthereumWithdrawalClaim&) const = default;
 };
 
 /** Reorg-safe append-only depth-64 sparse-Merkle state at one block. */
@@ -64,35 +58,33 @@ struct WithdrawalAccumulatorState {
     std::array<WithdrawalHash, WITHDRAWAL_ACCUMULATOR_DEPTH> frontier{};
 
     static WithdrawalAccumulatorState Empty();
+    static bool SupportsVersion(uint8_t version);
     bool IsSane() const;
     bool Append(const WithdrawalHash& leaf, std::string* error = nullptr);
 
-    bool operator==(const WithdrawalAccumulatorState& other) const
-    {
-        return count == other.count && root == other.root && frontier == other.frontier;
-    }
+    bool operator==(const WithdrawalAccumulatorState&) const = default;
 
     SERIALIZE_METHODS(WithdrawalAccumulatorState, obj)
     {
         uint8_t version{WITHDRAWAL_ACCUMULATOR_VERSION};
         READWRITE(version);
         SER_READ(obj, {
-            if (version != WITHDRAWAL_ACCUMULATOR_VERSION) {
+            if (!SupportsVersion(version)) {
                 throw std::ios_base::failure("unsupported USDD withdrawal accumulator version");
             }
         });
         READWRITE(obj.count);
         SER_WRITE(obj, s.write(MakeByteSpan(obj.root)));
         SER_READ(obj, s.read(MakeWritableByteSpan(obj.root)));
-        for (size_t level = 0; level < WITHDRAWAL_ACCUMULATOR_DEPTH; ++level) {
-            const bool occupied = ((obj.count >> level) & 1U) != 0;
-            if (occupied) {
-                SER_WRITE(obj, s.write(MakeByteSpan(obj.frontier[level])));
-                SER_READ(obj, s.read(MakeWritableByteSpan(obj.frontier[level])));
+        drivechain::haskell::UsddFrontierWire(obj.count, ser_action.ForRead(), [&](uint32_t step) {
+            if (step < WITHDRAWAL_ACCUMULATOR_DEPTH) {
+                SER_WRITE(obj, s.write(MakeByteSpan(obj.frontier.at(step))));
+                SER_READ(obj, s.read(MakeWritableByteSpan(obj.frontier.at(step))));
             } else {
-                SER_READ(obj, obj.frontier[level].fill(0));
+                SER_READ(obj, obj.frontier.at(step - WITHDRAWAL_ACCUMULATOR_DEPTH).fill(0));
             }
-        }
+            return true;
+        });
         SER_READ(obj, {
             if (!obj.IsSane()) {
                 throw std::ios_base::failure("malformed USDD withdrawal accumulator state");

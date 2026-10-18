@@ -14,16 +14,17 @@
 #include <string>
 #include <vector>
 
+class UniValue;
+
 namespace wallet {
 
-inline constexpr const char* DRIVECHAIN_WITHDRAWAL_DESTINATION_KEY{
-    "drivechain_withdrawal_destination"};
-inline constexpr const char* DRIVECHAIN_WITHDRAWAL_AMOUNT_KEY{
-    "drivechain_withdrawal_amount"};
-inline constexpr const char* DRIVECHAIN_WITHDRAWAL_MAIN_FEE_KEY{
-    "drivechain_withdrawal_main_fee"};
-inline constexpr const char* DRIVECHAIN_WITHDRAWAL_PAYOUT_SCRIPT_KEY{
-    "drivechain_withdrawal_payout_script"};
+CAmount LegacyWithdrawalAmount(CAmount payout);
+CAmount ValidateNativePayout(const CScript& destination, CAmount payout);
+/** Payout must already be admitted. Validate fee/total before constructing the burn. */
+CAmount PrepareNativeBurn(const uint256& parent, const CScript& destination,
+    CAmount payout, CAmount fee, CScript& burn);
+enum class WithdrawalCheck : unsigned char { NETWORK, ACTIVATION, SUBTRACT_FEE, RELAY, LEGACY_NETWORK };
+void CheckWithdrawal(WithdrawalCheck check, bool value);
 
 struct DrivechainWithdrawalBundle {
     std::vector<unsigned char> bytes;
@@ -33,6 +34,13 @@ struct DrivechainWithdrawalBundle {
 
 /** Decode a parent-network address or exact hex script and reject unspendable payouts. */
 CScript DecodeDrivechainWithdrawalDestination(const std::string& destination);
+
+/** Require exactly one parsed native burn matching all requested amounts. */
+uint32_t FindNativeWithdrawalOutput(const CTransaction& tx, const CScript& burn_script,
+    const CAsset& asset, const uint256& parent_genesis, CAmount burn, CAmount payout, CAmount fee);
+
+/** Read the first matching legacy enforcer event; this does not authenticate it. */
+std::string FindWithdrawalBundleEventStatus(const UniValue& peg_data, const std::string& m6id_hex);
 
 /** Legacy inputless M6 codec; does not authorize a burn or broadcast.
  * Native Betanet withdrawals use drivechain::BuildNativeWithdrawalM6 instead.

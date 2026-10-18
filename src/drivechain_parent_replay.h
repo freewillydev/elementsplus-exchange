@@ -6,6 +6,7 @@
 #define BITCOIN_DRIVECHAIN_PARENT_REPLAY_H
 
 #include <util/fs.h>
+#include <haskell/bmm_constants.h>
 #include <mainchainrpc.h>
 #include <uint256.h>
 
@@ -31,16 +32,16 @@ struct DrivechainParentReplayTip {
 };
 
 enum class DrivechainReplayStoreLoadStatus {
-    EMPTY,
-    LOADED,
-    CORRUPT,
-    IDENTITY_MISMATCH,
+    EMPTY = drivechain::REPLAY_LOAD_EMPTY,
+    LOADED = drivechain::REPLAY_LOAD_LOADED,
+    CORRUPT = drivechain::REPLAY_LOAD_CORRUPT,
+    IDENTITY_MISMATCH = drivechain::REPLAY_LOAD_IDENTITY_MISMATCH,
 };
 
 enum class DrivechainReplayStoreReadStatus {
-    FOUND,
-    NOT_FOUND,
-    CORRUPT,
+    FOUND = drivechain::REPLAY_READ_FOUND,
+    NOT_FOUND = drivechain::REPLAY_READ_NOT_FOUND,
+    CORRUPT = drivechain::REPLAY_READ_CORRUPT,
 };
 
 /**
@@ -51,11 +52,11 @@ enum class DrivechainReplayStoreReadStatus {
 class DrivechainParentReplayStore final
 {
 public:
-    static constexpr uint32_t SCHEMA_VERSION{4};
-    static constexpr uint32_t REPROPOSAL_SCHEMA_VERSION{5};
+    static constexpr uint32_t SCHEMA_VERSION{drivechain::REPLAY_UNIQUE_SCHEMA};
+    static constexpr uint32_t REPROPOSAL_SCHEMA_VERSION{drivechain::REPLAY_REPROPOSAL_SCHEMA};
 
     DrivechainParentReplayStore(fs::path path, size_t cache_bytes, bool wipe,
-        DrivechainWithdrawalHistoryRule history_rule = DrivechainWithdrawalHistoryRule::UNIQUE_M6ID);
+        DrivechainWithdrawalHistoryRule history_rule = static_cast<DrivechainWithdrawalHistoryRule>(drivechain::REPLAY_DEFAULT_HISTORY_RULE));
     ~DrivechainParentReplayStore();
 
     DrivechainParentReplayStore(const DrivechainParentReplayStore&) = delete;

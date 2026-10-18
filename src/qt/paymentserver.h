@@ -50,7 +50,7 @@ class QLocalServer;
 class QUrl;
 QT_END_NAMESPACE
 
-extern const QString ELEMENTS_IPC_PREFIX;
+const QString& ElementsIpcPrefix();
 
 class PaymentServer : public QObject
 {

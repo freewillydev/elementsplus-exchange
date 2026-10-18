@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "policy_constants.h"
 
 /* This section builds the 'rawElementsTransaction' structure which is the transaction data needed to build an Elements 'txEnv' environment
  * for evaluating Simplicity expressions within.
@@ -19,17 +20,6 @@ typedef struct rawElementsBuffer {
   const unsigned char* buf;
   uint32_t len;
 } rawElementsBuffer;
-
-#define ECX_SP1_GROTH16_PROOF_LEN ((size_t)356)
-/* Historical V2 pre-release statement.  It remains decodeable only for
- * regression tests and is never an accepted bond-V2 transition statement. */
-#define ECX_SP1_PUBLIC_VALUES_V4_LEN ((size_t)609)
-/* Frozen bond-V2 statement carried only by annex transport version 4. */
-#define ECX_SP1_PUBLIC_VALUES_V5_LEN ((size_t)850)
-/* One-shot pristine V18 -> incremental successor activation statement. */
-#define ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN ((size_t)364)
-/* Incremental successor outer proof statement. */
-#define ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN ((size_t)1627)
 
 typedef bool (*ecx_sp1_groth16_verify_fn)(
   void* context,
@@ -124,16 +114,6 @@ extern bool simplicity_elements_verify_sp1_groth16_v6_incremental_successor_anne
   const unsigned char expected_public_values_sha256[32],
   ecx_sp1_groth16_verify_fn verify,
   void* verify_context);
-
-/* Maximum exact Taproot annex size retained by an elementsTransaction.
- *
- * The existing `annex` field below is the annex body with the 0x50 Taproot
- * tag removed and is hashed for the released Simplicity annex jets.  A future
- * generated environmental jet may need the exact bytes, including that tag.
- * Keeping each copy bounded prevents a single annex from adding an unbounded
- * caller-controlled allocation to the opaque transaction environment.
- */
-#define SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE (1310720U)
 
 /* A structure representing data for one output from an Elements transaction.
  *

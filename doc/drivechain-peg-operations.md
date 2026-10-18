@@ -17,7 +17,7 @@ activation on the intended parent deployment before funding anything.
 Follow [RPC security](drivechain-rpc-security.md). Parent access requires
 authentication on numeric loopback, preferably a private rotating cookie;
 an explicit private credential file is supported for same-host bridges.
-Enforcer requests require a private, explicit grpcurl executable and mutual TLS. Keep
+Enforcer requests use the linked Haskell gRPC client with mutual TLS. Keep
 `drivechainl1blocksync=0` while preparing or auditing the deployment.
 No command below is authorization to spend real funds.
 

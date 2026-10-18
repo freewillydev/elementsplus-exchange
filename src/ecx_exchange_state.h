@@ -6,13 +6,16 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <ecx_bond_v2.h>
+#include <haskell/bmm_constants.h>
 #include <uint256.h>
 
 #include <cstdint>
 #include <array>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #if defined(ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE) && \
@@ -29,18 +32,21 @@
  * the outer recovery record contains only the exact custody descriptors. The
  * deliberately false legacy *monolithic* witness flag is not a release gate:
  * all simultaneous proof classes cannot and need not occupy one ciphertext. */
-#define ECX_BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN 1
-#if !ECX_BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN
-#error "ECX bond V2 requires the proven partitioned incremental recovery bound"
-#endif
+static_assert(drivechain::BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN,
+    "ECX bond V2 requires the proven partitioned incremental recovery bound");
+static_assert(drivechain::DISABLED_EXCHANGE_ACTIVATION_HEIGHT == std::numeric_limits<int>::max());
 
 class CBlockIndex;
 class CBlockUndo;
 class Coin;
 class CCoinsView;
 class CCoinsViewCache;
+class ArgsManager;
 
 namespace ecx {
+// Apply source-frozen arguments in order; conflicts preserve earlier assignments.
+void ApplyFrozenProfile(ArgsManager& args, bool matching_network, const char* release_hash,
+    std::span<const std::pair<const char*, const char*>> profile);
 // Cryptographically verify a confidential fixed-supply bond issuance opening.
 bool VerifyBondIssuance(const CTransaction& tx, uint32_t index, const uint256& vbf);
 // Public v3 relation only; input authorization and coin conservation remain
@@ -76,25 +82,24 @@ extern "C" bool ecx_witness_availability_verify_custody_receipts_v1(
     size_t receipt_count);
 #endif
 
-static constexpr uint8_t EXCHANGE_STATE_INTERFACE_VERSION{1};
-static constexpr uint16_t EXCHANGE_SCRIPT_CACHE_REVISION{12};
+using drivechain::EXCHANGE_STATE_INTERFACE_VERSION;
+using drivechain::EXCHANGE_SCRIPT_CACHE_REVISION;
 // Increment whenever fixed ECX/peg/Simplicity consensus semantics change.
 // This is committed to ecx_consensus.dat in addition to selectable settings.
-static constexpr uint32_t ECX_CONSENSUS_RULESET_REVISION{6};
+using drivechain::ECX_CONSENSUS_RULESET_REVISION;
 /** The production successor recovers twelve independently bounded recursive
  * children. This does not freeze their program identities or authorize a
  * network activation; those remain catalogue/profile build boundaries. */
-static constexpr bool BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN{
-    ECX_BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN != 0};
-static constexpr uint32_t FORCED_INCLUSION_BLOCKS{6};
-static constexpr uint64_t MAX_COMBINED_UNCONSUMED{64};
-static constexpr uint64_t MAX_COMBINED_SAME_PARENT_APPENDS{64};
-static constexpr uint64_t MAX_COMBINED_PENDING_WITNESS_ENTRIES{448};
-static constexpr uint32_t MAX_FORCED_TRANCHE_ORDER_WORK{64};
+using drivechain::BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN;
+static constexpr auto FORCED_INCLUSION_BLOCKS{drivechain::ECX_FORCED_INCLUSION_BLOCKS};
+static constexpr auto MAX_COMBINED_UNCONSUMED{drivechain::ECX_MAX_COMBINED_UNCONSUMED};
+static constexpr auto MAX_COMBINED_SAME_PARENT_APPENDS{drivechain::ECX_MAX_COMBINED_APPENDS};
+static constexpr auto MAX_COMBINED_PENDING_WITNESS_ENTRIES{drivechain::ECX_MAX_PENDING_WITNESS_ENTRIES};
+static constexpr auto MAX_FORCED_TRANCHE_ORDER_WORK{drivechain::ECX_MAX_TRANCHE_WORK};
 
 struct ExchangeConsensus
 {
-    int activation_height{std::numeric_limits<int>::max()};
+    int activation_height{drivechain::DISABLED_EXCHANGE_ACTIVATION_HEIGHT};
     COutPoint genesis_state_outpoint;
     uint256 genesis_state_root;
     std::array<unsigned char, 32> chain_id{};
@@ -106,7 +111,7 @@ struct ExchangeConsensus
     struct BondV2FrozenConsensus {
         bool activation_enabled{false};
         bool identities_frozen{false};
-        uint32_t deployment_version{2}; // 2: confidential; 3: explicit public issuance
+        uint32_t deployment_version{drivechain::DEFAULT_BOND_DEPLOYMENT_VERSION}; // 2: confidential; 3: explicit public issuance
         CTransactionRef deployment_transaction;
         CTransactionRef genesis_transaction;
         uint32_t issuance_input_index{0};
@@ -502,6 +507,9 @@ bool ComputeSourceAppendBudget(
     const ExchangeConsensusSnapshot& snapshot,
     uint64_t& budget,
     std::string& error);
+
+/** Explicit asset/value, null nonce and exact P2TR shape of a state authority. */
+bool IsStateAuthorityOutput(const CTxOut& output);
 
 /** BIP340-style tagged SHA256 over outpoint || SHA256(CTxOut bytes). */
 uint256 ComputeStateUtxoRoot(

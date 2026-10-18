@@ -10,11 +10,14 @@
 #include <vector>
 
 #include <addresstype.h>
+#include <drivechain_withdrawal.h>
 #include <interfaces/chain.h>
+#include <init.h>
 #include <key_io.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
 #include <rpc/server.h>
+#include <rpc/util.h>
 #include <script/solver.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
@@ -24,7 +27,9 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/drivechain_withdrawal.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
@@ -36,6 +41,7 @@
 using node::MAX_BLOCKFILE_SIZE;
 
 namespace wallet {
+RPCHelpMan sendtomainchain_drivechain();
 RPCHelpMan importmulti();
 RPCHelpMan dumpwallet();
 RPCHelpMan importwallet();
@@ -46,6 +52,256 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 static_assert(WALLET_INCREMENTAL_RELAY_FEE >= DEFAULT_INCREMENTAL_RELAY_FEE, "wallet incremental fee is smaller than default incremental relay fee");
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+BOOST_FIXTURE_TEST_CASE(sidechain_balance_rpc, TestChain100Setup)
+{
+    std::shared_ptr<CWallet> wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    WalletContext context;
+    context.args = &m_args;
+    AddWallet(context, wallet);
+    struct Restore {
+        WalletContext& context;
+        std::shared_ptr<CWallet> wallet;
+        CAsset asset{policyAsset};
+        ~Restore() { policyAsset=asset; RemoveWallet(context,wallet,std::nullopt); }
+    } restore{context,wallet};
+    policyAsset=CAsset{}; // This disposable Bitcoin fixture uses the null asset.
+    const auto bal=WITH_LOCK(wallet->cs_wallet, return GetBalance(*wallet));
+    const auto trusted=valueFor(bal.m_mine_trusted,policyAsset);
+    const auto total=trusted+valueFor(bal.m_mine_untrusted_pending,policyAsset)+valueFor(bal.m_mine_immature,policyAsset);
+    BOOST_REQUIRE(total>0);
+    JSONRPCRequest request;
+    request.strMethod="balance";
+    request.URI="/wallet/";
+    request.context=&context;
+    request.params=UniValue(UniValue::VARR);
+    for (const auto& command : GetWalletRPCCommands()) {
+        if (command.name!="balance") continue;
+        UniValue result;
+        BOOST_REQUIRE(command.actor(request,result,true));
+        BOOST_CHECK_EQUAL(result.size(),2U);
+        BOOST_CHECK_EQUAL(result["total_sats"].getInt<int64_t>(),total);
+        BOOST_CHECK_EQUAL(result["available_sats"].getInt<int64_t>(),trusted);
+        return;
+    }
+    BOOST_FAIL("balance RPC is not registered");
+}
+
+BOOST_FIXTURE_TEST_CASE(native_withdrawal_rpc_contract, TestChain100Setup)
+{
+    // Fund only this disposable chain, then exercise the native RPC without
+    // broadcasting or pretending this fixture validates BMM/parent consensus.
+    for (int i=0; i<2; ++i) CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    std::shared_ptr<CWallet> wallet = CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    wallet->SetBroadcastTransactions(false);
+    wallet->m_pay_tx_fee = CFeeRate{1000};
+    WalletContext context;
+    context.args = &m_args;
+    AddWallet(context,wallet);
+    auto& consensus = const_cast<Consensus::Params&>(Params().GetConsensus());
+    auto& parent = const_cast<uint256&>(Params().ParentGenesisBlockHash());
+    struct Restore {
+        WalletContext& context;
+        std::shared_ptr<CWallet> wallet;
+        Consensus::Params& consensus;
+        uint256& parent;
+        std::optional<uint8_t> slot;
+        bool enabled;
+        uint256 original_parent;
+        ~Restore() {
+            consensus.drivechain_slot=slot;
+            consensus.drivechain_m6_withdrawal_validation=enabled;
+            parent=original_parent;
+            RemoveWallet(context,wallet,std::nullopt);
+        }
+    } restore{context,wallet,consensus,parent,consensus.drivechain_slot,
+        consensus.drivechain_m6_withdrawal_validation,parent};
+
+    const std::string destination="hex:0014"+std::string(40,'1');
+    const auto params=[](const std::string& address,const std::string& amount,
+                         bool subtract=false,bool verbose=false,const std::string& fee="0.00001") {
+        UniValue values(UniValue::VARR);
+        values.push_back(address); values.push_back(amount); values.push_back(subtract);
+        values.push_back(verbose); values.push_back(fee);
+        return values;
+    };
+    JSONRPCRequest request;
+    request.strMethod="sendtomainchain";
+    request.URI="/wallet/missing";
+    const auto reject=[&](UniValue values,int code,const std::string& message) {
+        const size_t before=WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size());
+        request.params=std::move(values);
+        BOOST_CHECK_EXCEPTION(sendtomainchain_drivechain().HandleRequest(request),UniValue,
+            [&](const UniValue& error) {
+                BOOST_CHECK_EQUAL(error["code"].getInt<int>(),code);
+                BOOST_CHECK_MESSAGE(error["message"].get_str().find(message)!=std::string::npos,error.write());
+                return true;
+            });
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size()),before);
+    };
+    consensus.drivechain_slot.reset();
+    consensus.drivechain_m6_withdrawal_validation=true;
+    reject(params(destination,"0.1"),RPC_METHOD_NOT_FOUND,"not enabled on this network");
+    consensus.drivechain_slot=24;
+    consensus.drivechain_m6_withdrawal_validation=false;
+    reject(params(destination,"0.1"),RPC_METHOD_NOT_FOUND,"withdrawals are disabled");
+    consensus.drivechain_m6_withdrawal_validation=true;
+    reject(params(destination,"0.1"),RPC_INTERNAL_ERROR,"Wallet context not found");
+    request.context=&context;
+    reject(params(destination,"0.1"),RPC_WALLET_NOT_FOUND,"does not exist");
+    request.URI="/wallet/";
+    reject(params("hex:zz","bad-amount",true),RPC_INVALID_ADDRESS_OR_KEY,"hex: destination");
+    reject(params(destination,"0",true),RPC_TYPE_ERROR,"Invalid withdrawal payout");
+    reject(params(destination,"0.00000001",true),RPC_INVALID_PARAMETER,"payout is dust");
+    reject(params(destination,"0.1",true,false,"bad-fee"),RPC_INVALID_PARAMETER,"subtractfeefromamount");
+    parent.SetNull();
+    reject(params(destination,"21000000",false,false,"0.00000001"),RPC_TYPE_ERROR,"withdrawal total");
+    reject(params(destination,"0.1"),RPC_INVALID_PARAMETER,"parent genesis is null");
+    parent=uint256S("01");
+    // Bitcoin regtest has no native asset identity. The send commits before
+    // burn validation rejects it; neither response mode may retry that send.
+    BOOST_REQUIRE(consensus.pegged_asset.IsNull());
+    for (const bool verbose : {false,true}) {
+        request.params=params(destination,"0.1",false,verbose);
+        const size_t before=WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size());
+        BOOST_CHECK_EXCEPTION(sendtomainchain_drivechain().HandleRequest(request),UniValue,
+            [](const UniValue& error) {
+                return error["code"].getInt<int>() == RPC_WALLET_ERROR &&
+                    error["message"].get_str() == "Committed transaction is missing its exact native withdrawal burn";
+            });
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size()),before+1);
+    }
+}
+
+struct NativeWithdrawalSetup : TestingSetup {
+    NativeWithdrawalSetup() : TestingSetup{ChainType::CUSTOM,
+        TestOpts{.extra_args={"-initialfreecoins=100000000", "-anyonecanspendaremine=1"}}} {}
+    void CheckSend(bool verbose);
+};
+
+void NativeWithdrawalSetup::CheckSend(bool verbose)
+{
+    CKey key;
+    key.MakeNewKey(true);
+    std::shared_ptr<CWallet> wallet=CreateSyncedWallet(*m_node.chain,
+        WITH_LOCK(m_node.chainman->GetMutex(),return m_node.chainman->ActiveChain()),key);
+    BOOST_REQUIRE(WITH_LOCK(wallet->cs_wallet,return wallet->SetMasterBlindingKey(uint256S("02"))));
+    wallet->SetBroadcastTransactions(false);
+    wallet->m_pay_tx_fee=CFeeRate{1000};
+    WalletContext context;
+    context.args=&gArgs;
+    AddWallet(context,wallet);
+    auto& consensus=const_cast<Consensus::Params&>(Params().GetConsensus());
+    struct Restore {
+        WalletContext& context;
+        std::shared_ptr<CWallet> wallet;
+        Consensus::Params& consensus;
+        std::optional<uint8_t> slot;
+        bool enabled;
+        CAsset policy;
+        ~Restore() {
+            RemoveWallet(context,wallet,std::nullopt);
+            consensus.drivechain_slot=slot;
+            consensus.drivechain_m6_withdrawal_validation=enabled;
+            policyAsset=policy;
+        }
+    } restore{context,wallet,consensus,consensus.drivechain_slot,
+        consensus.drivechain_m6_withdrawal_validation,policyAsset};
+    consensus.drivechain_slot=24;
+    consensus.drivechain_m6_withdrawal_validation=true;
+    policyAsset=consensus.pegged_asset;
+    BOOST_REQUIRE(!policyAsset.IsNull());
+    const std::string destination="hex:0014"+std::string(40,'1');
+    const CScript payout=DecodeDrivechainWithdrawalDestination(destination);
+    CScript burn;
+    std::string error;
+    BOOST_REQUIRE(drivechain::BuildNativeWithdrawalScript(Params().ParentGenesisBlockHash(),payout,1000,burn,&error));
+    JSONRPCRequest request;
+    request.strMethod="sendtomainchain";
+    request.URI="/wallet/";
+    request.context=&context;
+    const auto reject=[&](int code,const std::string& message) {
+        const size_t before=WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size());
+        BOOST_CHECK_EXCEPTION(sendtomainchain_drivechain().HandleRequest(request),UniValue,
+            [&](const UniValue& error) {
+                return error["code"].getInt<int>() == code &&
+                    error["message"].get_str().find(message) != std::string::npos;
+            });
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size()),before);
+    };
+    SecureString passphrase;
+    passphrase.assign("test-only");
+    BOOST_REQUIRE(wallet->EncryptWallet(passphrase));
+    request.params=UniValue(UniValue::VARR);
+    request.params.push_back("hex:zz");
+    request.params.push_back("0.1");
+    reject(RPC_WALLET_UNLOCK_NEEDED,"walletpassphrase");
+    BOOST_REQUIRE(wallet->Unlock(passphrase));
+    request.params=UniValue(UniValue::VARR);
+    request.params.push_back(destination);
+    request.params.push_back("0.1");
+    const bool datacarrier=gArgs.GetBoolArg("-datacarrier",DEFAULT_ACCEPT_DATACARRIER);
+    gArgs.ForceSetArg("-datacarrier","0");
+    reject(RPC_INVALID_PARAMETER,"not relayable");
+    gArgs.ForceSetArg("-datacarrier",datacarrier ? "1" : "0");
+    {
+        request.params=UniValue(UniValue::VARR);
+        for (const auto& value : {UniValue(destination),UniValue("0.1"),UniValue(false),UniValue(verbose),UniValue("0.00001")})
+            request.params.push_back(value);
+        const size_t before=WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size());
+        UniValue result;
+        try { result=sendtomainchain_drivechain().HandleRequest(request); }
+        catch (const UniValue& failure) { BOOST_FAIL(failure.write()); }
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(wallet->mapWallet.size(),before+1);
+        const std::string txid=verbose ? result["txid"].get_str() : result.get_str();
+        const auto* committed=wallet->GetWalletTx(uint256S(txid));
+        BOOST_REQUIRE(committed && committed->tx);
+        BOOST_CHECK_EQUAL(committed->mapValue.at("drivechain_withdrawal"),"native-v1");
+        BOOST_CHECK_EQUAL(committed->mapValue.at("drivechain_parent_fee_sats"),"1000");
+        const uint32_t vout=FindNativeWithdrawalOutput(*committed->tx,burn,policyAsset,
+            Params().ParentGenesisBlockHash(),10'001'000,10'000'000,1000);
+        CMutableTransaction altered{*committed->tx};
+        const auto reject_output=[&](const std::string& message) {
+            BOOST_CHECK_EXCEPTION(FindNativeWithdrawalOutput(CTransaction{altered},burn,policyAsset,
+                Params().ParentGenesisBlockHash(),10'001'000,10'000'000,1000),UniValue,
+                [&](const UniValue& failure) {
+                    return failure["code"].getInt<int>() == RPC_WALLET_ERROR &&
+                        failure["message"].get_str().find(message) != std::string::npos;
+                });
+            BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet,return wallet->mapWallet.size()),before+1);
+        };
+        altered.vout.push_back(altered.vout[vout]);
+        altered.witness.vtxoutwit.resize(altered.vout.size());
+        reject_output("multiple native withdrawal burns");
+        altered.vout.pop_back();
+        altered.witness.vtxoutwit.resize(altered.vout.size());
+        altered.vout[vout].scriptPubKey.clear();
+        reject_output("missing its exact native withdrawal burn");
+        if (verbose) {
+            BOOST_CHECK_EQUAL(result["withdrawal_vout"].getInt<unsigned>(),vout);
+            BOOST_CHECK_EQUAL(AmountFromValue(result["burn_amount"]),10'001'000);
+            BOOST_CHECK_EQUAL(AmountFromValue(result["payout_amount"]),10'000'000);
+            BOOST_CHECK_EQUAL(AmountFromValue(result["mainchain_fee"]),1000);
+            BOOST_CHECK_EQUAL(result["bitcoin_script_pub_key"].get_str(),destination.substr(4));
+            BOOST_CHECK_EQUAL(result["status"].get_str(),"awaiting_confirmation");
+            BOOST_CHECK_EQUAL(result["next_step"].get_str(),strprintf("submitdrivechainwithdrawal %s %u <confirming_block_hash>",txid,vout));
+            BOOST_CHECK(result["fee_reason"].isStr());
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(native_withdrawal_rpc_success, NativeWithdrawalSetup)
+{
+    CheckSend(false);
+}
+
+BOOST_FIXTURE_TEST_CASE(native_withdrawal_rpc_verbose, NativeWithdrawalSetup)
+{
+    CheckSend(true);
+}
 
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
@@ -71,6 +327,55 @@ static void AddKey(CWallet& wallet, const CKey& key)
     auto& desc = descs.at(0);
     WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_reward_real_wallet_ownership)
+{
+    auto* loader = m_wallet_loader.get();
+    auto& context = *loader->context();
+    struct Cleanup {
+        WalletContext& context;
+        std::vector<std::shared_ptr<CWallet>> wallets;
+        ~Cleanup() { for (const auto& wallet : wallets) RemoveWallet(context,wallet,std::nullopt); }
+    } cleanup{context,{}};
+    const CKey key = GenerateRandomKey();
+    const CTxDestination destination = WitnessV0KeyHash(key.GetPubKey());
+    BOOST_CHECK(!IsDrivechainRewardSpendable(nullptr,destination));
+    BOOST_CHECK(!IsDrivechainRewardSpendable(loader,destination));
+
+    auto disabled = std::make_shared<CWallet>(m_node.chain.get(),"reward-disabled",CreateMockableWalletDatabase());
+    disabled->LoadWallet();
+    disabled->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    BOOST_REQUIRE(AddWallet(context,disabled));
+    cleanup.wallets.push_back(disabled);
+    BOOST_CHECK(!IsDrivechainRewardSpendable(loader,destination));
+
+    auto owner = std::make_shared<CWallet>(m_node.chain.get(),"reward-owner",CreateMockableWalletDatabase());
+    owner->LoadWallet();
+    owner->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    AddKey(*owner,key);
+    BOOST_REQUIRE(AddWallet(context,owner));
+    cleanup.wallets.push_back(owner);
+    for (const CTxDestination target : {CTxDestination{PKHash(key.GetPubKey())},destination}) {
+        BOOST_CHECK(IsDrivechainRewardSpendable(loader,target));
+        CScript script;
+        std::string error;
+        BOOST_CHECK(BuildDrivechainRewardScript(EncodeDestination(target),
+            [&](const CTxDestination& selected) { return IsDrivechainRewardSpendable(loader,selected); },script,&error));
+        BOOST_CHECK(script == GetScriptForDestination(target));
+        BOOST_CHECK(error.empty());
+    }
+    BOOST_CHECK(!IsDrivechainRewardSpendable(loader,PKHash(GenerateRandomKey().GetPubKey())));
+    // Deliberately retain ownership while toggling the policy flag in this
+    // disposable wallet, so the test distinguishes the two admission checks.
+    owner->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    BOOST_CHECK(interfaces::MakeWallet(context,owner)->isSpendable(destination));
+    BOOST_CHECK(!IsDrivechainRewardSpendable(loader,destination));
+    owner->UnsetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+    BOOST_CHECK(IsDrivechainRewardSpendable(loader,destination));
+    BOOST_REQUIRE(RemoveWallet(context,owner,std::nullopt));
+    cleanup.wallets.pop_back();
+    BOOST_CHECK(!IsDrivechainRewardSpendable(loader,destination));
 }
 
 BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)

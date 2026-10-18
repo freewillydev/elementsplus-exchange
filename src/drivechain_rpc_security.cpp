@@ -3,14 +3,18 @@
 #include <init.h>
 #include <chainparamsbase.h>
 #include <mainchainrpc.h>
+#include <drivechain_settings.h>
+#include <haskell/bridge.h>
+#include <haskell/rpc_security_constants.h>
 #include <netbase.h>
 #include <common/args.h>
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <limits>
-#include <set>
+#include <stdexcept>
 #ifndef WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -39,13 +43,13 @@ fs::path ResolveDrivechainGrpcCredentialPath(const ArgsManager& args,
 DrivechainGrpcTLSConfig GetDrivechainGrpcTLSConfig(const ArgsManager& args)
 {
     return {
-        args.GetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051"),
+        args.GetArg("-drivechainbmmgrpcaddr", DEFAULT_DRIVECHAIN_GRPC_ENDPOINT),
         ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpcca", "enforcer-tls/ca.pem"),
+            args, "-drivechainbmmgrpcca", drivechain::GRPC_CA_FILE),
         ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpccert", "enforcer-tls/elements-client.pem"),
+            args, "-drivechainbmmgrpccert", drivechain::GRPC_CLIENT_CERT_FILE),
         ResolveDrivechainGrpcCredentialPath(
-            args, "-drivechainbmmgrpckey", "enforcer-tls/elements-client-key.pem"),
+            args, "-drivechainbmmgrpckey", drivechain::GRPC_CLIENT_KEY_FILE),
         args.GetArg("-drivechainbmmgrpcauthority", ""),
     };
 }
@@ -54,165 +58,170 @@ bool ValidateReadableRegularFile(const fs::path& path,
                                  const bool private_key,
                                  std::string* error)
 {
-    std::error_code status_error;
-    const auto status = fs::symlink_status(path, status_error);
-    if (status_error || !fs::is_regular_file(status)) {
-        if (error) {
-            *error = strprintf("required %s must be a non-symlink regular file: %s",
-                               private_key ? "mTLS client key" : "mTLS certificate",
-                               fs::PathToString(path));
-        }
-        return false;
-    }
-
 #ifndef WIN32
-    struct stat metadata {};
-    const std::string native_path = fs::PathToString(path);
-    if (lstat(native_path.c_str(), &metadata) != 0 ||
-        !S_ISREG(metadata.st_mode)) {
-        if (error) {
-            *error = strprintf("mTLS credential must be a non-symlink regular file: %s",
-                               native_path);
-        }
-        return false;
-    }
-    if (metadata.st_uid != geteuid()) {
-        if (error) {
-            *error = strprintf("mTLS credential must be owned by the Elements process user: %s",
-                               native_path);
-        }
-        return false;
-    }
-    const fs::path parent_path = path.parent_path();
-    struct stat parent_metadata {};
-    const std::string native_parent = fs::PathToString(parent_path);
-    if (parent_path.empty() ||
-        lstat(native_parent.c_str(), &parent_metadata) != 0 ||
-        !S_ISDIR(parent_metadata.st_mode) ||
-        parent_metadata.st_uid != geteuid() ||
-        (parent_metadata.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
-        if (error) {
-            *error = strprintf(
-                "mTLS credential directory must be owned by the Elements process user and deny group/other write access: %s",
-                native_parent);
-        }
-        return false;
-    }
-    const mode_t forbidden = private_key
-        ? (S_IRWXG | S_IRWXO)
-        : (S_IWGRP | S_IWOTH);
-    if ((metadata.st_mode & forbidden) != 0) {
-        if (error) {
-            *error = private_key
-                ? strprintf("mTLS client key must deny all group and other access: %s", native_path)
-                : strprintf("mTLS certificate must deny group and other write access: %s", native_path);
-        }
-        return false;
-    }
-    // Opening after path-only checks must not follow a replacement symlink or
-    // block on a replacement FIFO. Validate the opened file as well, before
-    // letting grpcurl use a credential in this protected directory.
-    const int descriptor = open(
-        native_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    struct stat opened_metadata {};
-    const bool valid_open = descriptor >= 0 &&
-        fstat(descriptor, &opened_metadata) == 0 &&
-        S_ISREG(opened_metadata.st_mode) &&
-        opened_metadata.st_uid == geteuid() &&
-        (opened_metadata.st_mode & forbidden) == 0 &&
-        opened_metadata.st_dev == metadata.st_dev &&
-        opened_metadata.st_ino == metadata.st_ino;
-    if (descriptor >= 0) close(descriptor);
-    if (!valid_open) {
-        if (error) *error = "mTLS credential could not be securely opened: " + native_path;
-        return false;
-    }
-#else
-    std::ifstream input(path);
-    if (!input.good()) {
-        if (error) *error = "required mTLS credential is not readable: " + fs::PathToString(path);
-        return false;
-    }
+    struct stat metadata {}, parent_metadata {}, opened_metadata {};
+    std::string native_path, native_parent;
+    int descriptor=-1;
 #endif
-    return true;
+    try {
+      return drivechain::haskell::AdmitTlsCredentialFile(private_key,[&](uint32_t action) -> uint64_t {
+        switch (action) {
+        case 1: {
+            std::error_code status_error;
+            const auto status = fs::symlink_status(path,status_error);
+            if (status_error || !fs::is_regular_file(status)) return 0;
+#ifdef WIN32
+            return 2;
+#else
+            return 1;
+#endif
+        }
+        case 2:
+            if (error) *error = strprintf("required %s must be a non-symlink regular file: %s",
+                private_key ? "mTLS client key" : "mTLS certificate",fs::PathToString(path));
+            return 1;
+#ifndef WIN32
+        case 3:
+            native_path = fs::PathToString(path);
+            return lstat(native_path.c_str(),&metadata)==0 && S_ISREG(metadata.st_mode);
+        case 4:
+            if (error) *error = strprintf("mTLS credential must be a non-symlink regular file: %s",native_path);
+            return 1;
+        case 5: return metadata.st_uid;
+        case 15: return geteuid();
+        case 6:
+            if (error) *error = strprintf("mTLS credential must be owned by the Elements process user: %s",native_path);
+            return 1;
+        case 7: {
+            const auto parent_path = path.parent_path();
+            native_parent = fs::PathToString(parent_path);
+            return !parent_path.empty();
+        }
+        case 16: return lstat(native_parent.c_str(),&parent_metadata)==0 && S_ISDIR(parent_metadata.st_mode);
+        case 17: return parent_metadata.st_uid;
+        case 18: return geteuid();
+        case 19: return parent_metadata.st_mode & (S_IWGRP | S_IWOTH);
+        case 8:
+            if (error) *error = strprintf(
+                "mTLS credential directory must be owned by the Elements process user and deny group/other write access: %s",native_parent);
+            return 1;
+        case 9: return metadata.st_mode & (S_IRWXG | S_IRWXO);
+        case 20: return metadata.st_mode & (S_IWGRP | S_IWOTH);
+        case 10:
+            if (error) *error = private_key
+                ? strprintf("mTLS client key must deny all group and other access: %s",native_path)
+                : strprintf("mTLS certificate must deny group and other write access: %s",native_path);
+            return 1;
+        case 11:
+            descriptor=open(native_path.c_str(),O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            return descriptor>=0;
+        case 21: return fstat(descriptor,&opened_metadata)==0 && S_ISREG(opened_metadata.st_mode);
+        case 22: return opened_metadata.st_uid;
+        case 23: return geteuid();
+        case 24: return opened_metadata.st_mode & (S_IRWXG | S_IRWXO);
+        case 25: return opened_metadata.st_mode & (S_IWGRP | S_IWOTH);
+        case 26: return opened_metadata.st_dev;
+        case 27: return metadata.st_dev;
+        case 28: return opened_metadata.st_ino;
+        case 29: return metadata.st_ino;
+        case 30:
+            if (descriptor>=0) close(descriptor);
+            descriptor=-1; return 1;
+        case 12:
+            if (error) *error = "mTLS credential could not be securely opened: " + native_path;
+            return 1;
+#else
+        case 13: {
+            std::ifstream input(path);
+            return input.good();
+        }
+        case 14:
+            if (error) *error = "required mTLS credential is not readable: " + fs::PathToString(path);
+            return 1;
+#endif
+        default: throw std::logic_error("invalid credential validation action");
+        }
+      });
+    } catch (...) {
+#ifndef WIN32
+        if (descriptor>=0) close(descriptor);
+#endif
+        throw;
+    }
 }
 
 } // namespace
+
+DrivechainGrpcStatus ClassifyDrivechainGrpcResult(const BoundedCommandResult& child,
+    bool accept_duplicate, std::string& error)
+{
+    std::vector<unsigned char> input{2,static_cast<unsigned char>(
+        child.cancelled | (child.started << 1) | (child.timed_out << 2) |
+        (child.output_truncated << 3) | (!child.error.empty() << 4) |
+        (child.exited << 5) | ((child.exit_code == 0) << 6)),static_cast<unsigned char>(accept_duplicate && child.exit_code == 6)};
+    input.insert(input.end(),child.output.begin(),child.output.end());
+    std::vector<unsigned char> output;
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::SUBMISSION_POLICY,input,output,nullptr))
+        throw std::runtime_error("Invalid Haskell gRPC result policy input");
+    error.clear();
+    switch (output.at(0)) {
+    case 0: return DrivechainGrpcStatus::SUCCESS;
+    case 4: error = "enforcer gRPC cancelled during shutdown"; break;
+    case 5: error = strprintf("enforcer gRPC request rejected: %s",child.error); break;
+    case 6: error = "enforcer gRPC exceeded its deadline"; break;
+    case 7: error = "enforcer gRPC exceeded its output limit"; break;
+    case 8: error = strprintf("enforcer gRPC transport failed: %s",child.error); break;
+    case 9: error = "enforcer gRPC did not complete"; break;
+    case 10:
+        error = strprintf("enforcer gRPC status %d: %s",child.exit_code,child.output);
+        return DrivechainGrpcStatus::NONZERO_EXIT;
+    default: throw std::runtime_error("Invalid Haskell gRPC result policy response");
+    }
+    return DrivechainGrpcStatus::PROCESS_FAILURE;
+}
 
 bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error)
 {
     if (error) error->clear();
     const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
-    if (config.address.empty() || config.address.find("://") != std::string::npos) {
-        if (error) *error = "-drivechainbmmgrpcaddr must be a host:port endpoint without a URL scheme";
-        return false;
-    }
-    if (config.address.size() > 512 ||
-        std::any_of(config.address.begin(), config.address.end(),
-                    [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
-        if (error) *error = "-drivechainbmmgrpcaddr contains whitespace, control characters, or excessive data";
-        return false;
-    }
+    static constexpr const char* errors[]{
+        "-drivechainbmmgrpcaddr must be a host:port endpoint without a URL scheme",
+        "-drivechainbmmgrpcaddr contains whitespace, control characters, or excessive data",
+        "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port",
+        "-drivechainbmmgrpcaddr requires numeric loopback (IPv4 127/8 or IPv6 ::1)",
+        "-drivechainpegoutenforcer and -drivechainbmmgrpcaddr must select the same authenticated endpoint",
+        "-drivechainbmmwalletaddr and -drivechainbmmgrpcaddr must select the same authenticated endpoint",
+        "Connect bearer authentication is no longer supported; configure enforcer mTLS",
+        "-drivechainbmmgrpcauthority contains whitespace or control characters"};
+    const auto text=drivechain::haskell::AdmitGrpcText(config.address,config.authority);
     uint16_t port{0};
     std::string host;
-    SplitHostPort(config.address, port, host);
-    if (host.empty() || host.front() == '-' || port == 0) {
-        if (error) *error = "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port";
-        return false;
-    }
-    if (!IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true)) {
-        if (error) *error = "-drivechainbmmgrpcaddr requires numeric loopback (IPv4 127/8 or IPv6 ::1)";
-        return false;
-    }
-    // The former peg-out endpoint is a compatibility assertion, not a second
-    // transport. BMM bids and withdrawals must use the same authenticated
-    // enforcer; silently ignoring a conflicting endpoint would misroute funds.
-    if (args.IsArgSet("-drivechainpegoutenforcer") &&
-        args.GetArg("-drivechainpegoutenforcer", "") != config.address) {
-        if (error) *error = "-drivechainpegoutenforcer and -drivechainbmmgrpcaddr must select the same authenticated endpoint";
-        return false;
-    }
-    if (args.IsArgSet("-drivechainbmmwalletaddr") &&
-        args.GetArg("-drivechainbmmwalletaddr", "") != config.address) {
-        if (error) *error = "-drivechainbmmwalletaddr and -drivechainbmmgrpcaddr must select the same authenticated endpoint";
-        return false;
-    }
-    if (args.IsArgSet("-drivechainbmmconnectauthcookie")) {
-        if (error) *error = "Connect bearer authentication is no longer supported; configure enforcer mTLS";
-        return false;
-    }
-    if (!config.authority.empty() &&
-        std::any_of(config.authority.begin(), config.authority.end(),
-                    [](const unsigned char c) { return c <= 0x20 || c == 0x7f; })) {
-        if (error) *error = "-drivechainbmmgrpcauthority contains whitespace or control characters";
-        return false;
-    }
-    return ValidateReadableRegularFile(config.ca_certificate, false, error) &&
-           ValidateReadableRegularFile(config.client_certificate, false, error) &&
-           ValidateReadableRegularFile(config.client_key, true, error);
-}
-
-bool ValidateDrivechainGrpcExecutable(const ArgsManager& args, std::string* error)
-{
-    if (error) error->clear();
-    const fs::path path = fs::PathFromString(args.GetArg("-drivechainbmmgrpcurl", ""));
-    if (path.empty() || !path.is_absolute()) {
-        if (error) *error = "-drivechainbmmgrpcurl must explicitly name an absolute executable path; PATH search is disabled";
-        return false;
-    }
-#ifndef WIN32
-    // grpcurl can read the client key and custody requests. Apply the same
-    // owner/directory/no-follow checks as the private key before each exec.
-    if (!ValidateReadableRegularFile(path, true, error)) return false;
-    if (access(fs::PathToString(path).c_str(), X_OK) != 0) {
-        if (error) *error = "configured grpcurl is not executable";
-        return false;
-    }
-    return true;
-#else
-    if (error) *error = "secure grpcurl execution is not implemented on Windows";
-    return false;
-#endif
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::GRPC_CONFIG,
+        [&](uint32_t action) -> uint32_t {
+        if (action>=2 && action<=16 && action%2==0) {
+            if (error) *error=errors[action/2-1];
+            return 1;
+        }
+        switch (action) {
+        case 1: return text.address_shape;
+        case 3: return text.address_characters;
+        case 5:
+            SplitHostPort(config.address,port,host);
+            return !host.empty() | (!host.starts_with('-') << 1) | ((port!=0) << 2);
+        case 7: return IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true);
+        // Compatibility endpoints must identify the same authenticated enforcer.
+        case 9: return args.IsArgSet("-drivechainpegoutenforcer");
+        case 20: return args.GetArg("-drivechainpegoutenforcer","")==config.address;
+        case 11: return args.IsArgSet("-drivechainbmmwalletaddr");
+        case 21: return args.GetArg("-drivechainbmmwalletaddr","")==config.address;
+        case 13: return !args.IsArgSet("-drivechainbmmconnectauthcookie");
+        case 15: return text.authority_characters;
+        case 17: return ValidateReadableRegularFile(config.ca_certificate,false,error);
+        case 18: return ValidateReadableRegularFile(config.client_certificate,false,error);
+        case 19: return ValidateReadableRegularFile(config.client_key,true,error);
+        default: throw std::logic_error("invalid enforcer TLS configuration action");
+        }
+    }) != 0;
 }
 
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
@@ -224,50 +233,47 @@ BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     const std::function<bool()>& should_cancel)
 {
     BoundedCommandResult failure;
-    static const std::set<std::string> ALLOWED_METHODS{
-        "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
-        "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
-        "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
-        "cusf.mainchain.v1.ValidatorService/GetChainInfo",
-        "cusf.mainchain.v1.ValidatorService/GetChainTip",
-        "cusf.mainchain.v1.ValidatorService/GetSidechains",
-        "cusf.mainchain.v1.ValidatorService/GetCtip",
-    };
-    if (ALLOWED_METHODS.count(method) == 0) {
-        failure.error = "refusing an unrecognized enforcer gRPC method";
-        return failure;
-    }
-    if (json_payload.empty() || json_payload.size() > (1U << 20)) {
-        failure.error = "enforcer gRPC payload must contain 1..1048576 bytes";
-        return failure;
-    }
-
     std::string config_error;
     UniValue parsed_payload;
-    if (!parsed_payload.read(json_payload) || !parsed_payload.isObject()) {
-        failure.error = "enforcer gRPC payload must be one JSON object";
-        return failure;
-    }
-    if (!ValidateDrivechainGrpcTLSConfig(args, &config_error) ||
-        !ValidateDrivechainGrpcExecutable(args, &config_error)) {
-        failure.error = config_error;
-        return failure;
-    }
-    const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
-    std::vector<std::string> argv{
-        args.GetArg("-drivechainbmmgrpcurl", ""),
-        "-cacert", fs::PathToString(config.ca_certificate),
-        "-cert", fs::PathToString(config.client_certificate),
-        "-key", fs::PathToString(config.client_key),
-    };
-    if (!config.authority.empty()) {
-        argv.push_back("-authority");
-        argv.push_back(config.authority);
-    }
-    argv.insert(argv.end(), {
-        "-d", json_payload, config.address, method,
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::GRPC_REQUEST_ADMISSION,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1:
+            try {
+                // Keep method rejection ahead of payload size/JSON validation.
+                drivechain::haskell::GrpcPlan(std::array<std::string,1>{method});
+                return 1;
+            } catch (const std::invalid_argument&) { return 0; }
+        case 2: failure.error = "refusing an unrecognized enforcer gRPC method"; return 1;
+        case 11: return std::min<size_t>(method.size(),UINT32_MAX);
+        case 12: return std::min<size_t>(json_payload.size(),UINT32_MAX);
+        case 4: failure.error = "enforcer gRPC payload must contain 1..1048576 bytes"; return 1;
+        case 5: return parsed_payload.read(json_payload) && parsed_payload.isObject();
+        case 6: failure.error = "enforcer gRPC payload must be one JSON object"; return 1;
+        case 7: return ValidateDrivechainGrpcTLSConfig(args, &config_error);
+        case 8:
+            config_error = "invalid enforcer gRPC deadline or output bound";
+            return timeout.count() > 0 && timeout.count() <= 600000 && max_output > 0 && max_output <= 16777216;
+        case 9: failure.error = config_error; return 1;
+        case 10: break;
+        default: throw std::logic_error("invalid enforcer gRPC request action");
+        }
+        const DrivechainGrpcTLSConfig config = GetDrivechainGrpcTLSConfig(args);
+        const auto reply=drivechain::haskell::GrpcRequest(std::array<std::string,7>{
+            method,json_payload,config.address,
+            fs::PathToString(config.ca_certificate),fs::PathToString(config.client_certificate),
+            fs::PathToString(config.client_key),config.authority}, timeout.count(), max_output, should_cancel);
+        failure.started = true;
+        failure.exited = true;
+        failure.exit_code = reply.status;
+        failure.cancelled = reply.status == -2;
+        failure.timed_out = reply.status == -3;
+        failure.output_truncated = reply.status == -4;
+        if (reply.status < 0) failure.error = reply.output;
+        else failure.output = reply.output;
+        return 1;
     });
-    return RunBoundedCommand(argv, timeout, max_output, should_cancel);
+    return failure;
 }
 
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
@@ -291,31 +297,36 @@ bool ValidateNativeDrivechainRpcServerConfig(const ArgsManager& args,
                                              std::string* error)
 {
     if (error) error->clear();
-    if (args.GetBoolArg("-rest", false)) {
-        if (error) *error = "unauthenticated REST is not permitted on a native drivechain node";
-        return false;
-    }
-    const int64_t configured_port = args.GetIntArg(
-        "-rpcport", BaseParams().RPCPort());
-    if (configured_port <= 0 ||
-        configured_port > std::numeric_limits<uint16_t>::max()) {
-        if (error) *error = "-rpcport must be between 1 and 65535";
-        return false;
-    }
-
-    for (const std::string& binding : args.GetArgs("-rpcbind")) {
-        uint16_t port = static_cast<uint16_t>(configured_port);
-        std::string host;
-        SplitHostPort(binding, port, host);
-        if (port == 0 || host.empty() ||
-            !IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true)) {
-            if (error) {
-                *error = strprintf(
-                    "native drivechain JSON-RPC requires a numeric IPv4 127/8 or IPv6 ::1 binding, not %s",
-                    binding);
-            }
-            return false;
+    int64_t configured_port{0};
+    std::vector<std::string> bindings;
+    std::string host;
+    size_t index{0};
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::RPC_SERVER,
+        [&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return args.GetBoolArg("-rest", false);
+        case 2:
+            if (error) *error = "unauthenticated REST is not permitted on a native drivechain node";
+            return 1;
+        case 3:
+            configured_port = args.GetIntArg("-rpcport", BaseParams().RPCPort());
+            return drivechain::haskell::DepositPreflight(0,configured_port,65535);
+        case 4:
+            if (error) *error = "-rpcport must be between 1 and 65535";
+            return 1;
+        case 5: bindings = args.GetArgs("-rpcbind"); return 1;
+        case 6: return index<bindings.size();
+        case 7: {
+            uint16_t port = static_cast<uint16_t>(configured_port);
+            SplitHostPort(bindings.at(index),port,host);
+            return (port!=0) | (!host.empty() << 1);
         }
-    }
-    return true;
+        case 10: return IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true);
+        case 8:
+            if (error) *error = strprintf("native drivechain JSON-RPC requires a numeric IPv4 127/8 or IPv6 ::1 binding, not %s",bindings.at(index));
+            return 1;
+        case 9: ++index; return 1;
+        default: throw std::logic_error("invalid RPC server configuration action");
+        }
+    }) != 0;
 }

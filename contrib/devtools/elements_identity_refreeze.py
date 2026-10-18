@@ -146,9 +146,18 @@ def _safe_integer_expression(expression: str) -> int:
 
 
 class Header:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, generated_include_dir: Path | None = None) -> None:
         self.path = path
+        self.generated_include_dir = generated_include_dir
         self.text = path.read_text(encoding="utf-8")
+        # Only current identities include the Haskell-generated resource table.
+        # Resolve beside the supplied header, never from a different checkout.
+        if re.search(r"^#include <haskell/resource_constants.h>$", self.text, re.MULTILINE):
+            self.text += "\n" + (path.parent / "haskell/resource_constants.h").read_text(encoding="utf-8")
+        if re.search(r"^#include <haskell/bootstrap_constants.h>$", self.text, re.MULTILINE):
+            if generated_include_dir is None:
+                raise ValueError("bootstrap constants require an explicit generated include directory")
+            self.text += "\n" + (generated_include_dir / "haskell/bootstrap_constants.h").read_text(encoding="utf-8")
 
     def string(self, name: str) -> str:
         match = re.search(
@@ -855,7 +864,7 @@ def calculate_v11(header: Header) -> IdentityResult:
 def calculate_alphanet_v11(header: Header, bootstrap: Header | None = None) -> IdentityResult:
     """Live Alpha, including its exact non-genesis parent bootstrap."""
     if bootstrap is None:
-        bootstrap = Header(header.path.parent / "elements_drivechain_bootstrap.h")
+        bootstrap = Header(header.path.parent / "elements_drivechain_bootstrap.h", header.generated_include_dir)
     for name, value in ALPHA_CHECKPOINT.items():
         if header.string(name) != value:
             raise ValueError(f"refusing Alpha: wrong {name}")
@@ -1085,12 +1094,14 @@ def main() -> int:
         "--indexer-bindings", action="store_true",
         help="export audited Betanet consumer bindings (requires --mode v11-betanet; no --candidate)",
     )
+    parser.add_argument("--generated-include-dir", type=Path,
+                        help="build src directory containing haskell/bootstrap_constants.h (required for Alpha)")
     args = parser.parse_args()
     if args.indexer_bindings and (args.candidate or args.mode != "v11-betanet"):
         parser.error("--indexer-bindings requires --mode v11-betanet and forbids --candidate")
 
     try:
-        header = Header(args.header)
+        header = Header(args.header, args.generated_include_dir)
         calculate = {"v7": calculate_v7, "v11": calculate_v11,
                      "v11-alphanet": calculate_alphanet_v11,
                      "v11-betanet": calculate_betanet_v11}[args.mode]

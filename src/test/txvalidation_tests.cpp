@@ -116,6 +116,76 @@ BOOST_AUTO_TEST_CASE(explicit_asset_total_boundaries)
     TxValidationState hidden;
     BOOST_CHECK(!CheckTransaction(CTransaction(tx), hidden, true));
     BOOST_CHECK_EQUAL(hidden.GetRejectReason(), "bad-txns-asset-not-explicit");
+    TxValidationState aggregate_hidden, deferred_hidden;
+    BOOST_CHECK(CheckTransaction(CTransaction(tx), aggregate_hidden));
+    BOOST_CHECK(CheckTransactionWithoutAggregateTotals(CTransaction(tx), deferred_hidden));
+}
+
+BOOST_AUTO_TEST_CASE(explicit_total_modes_match_subtraction_reference)
+{
+    BasicTestingSetup setup(ChainType::ELEMENTS);
+    const CAmount amounts[]{std::numeric_limits<CAmount>::min(), -1, 0, 1,
+        MAX_MONEY - 1, MAX_MONEY, MAX_MONEY + 1, std::numeric_limits<CAmount>::max()};
+    for (bool same_asset : {false, true}) for (unsigned mode = 0; mode < 3; ++mode)
+        for (CAmount first : amounts) for (CAmount second : amounts) {
+            CMutableTransaction tx;
+            tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), 0));
+            tx.vout.resize(2);
+            tx.vout[0].nAsset = CAsset(uint256S("01"));
+            tx.vout[1].nAsset = CAsset(uint256S(same_asset ? "01" : "02"));
+            tx.vout[0].nValue = first;
+            tx.vout[1].nValue = second;
+            CAmount totals[2]{};
+            std::string expected;
+            for (unsigned index = 0; index < 2; ++index) {
+                const CAmount value = index == 0 ? first : second;
+                if (value < 0) { expected = "bad-txns-vout-negative"; break; }
+                if (value > MAX_MONEY) { expected = "bad-txns-vout-toolarge"; break; }
+                if (mode == 2) continue;
+                auto& total = totals[mode == 1 && !same_asset ? index : 0];
+                if (value > MAX_MONEY - total) { expected = "bad-txns-txouttotal-toolarge"; break; }
+                total += value;
+            }
+            TxValidationState state;
+            const bool accepted = mode == 2 ? CheckTransactionWithoutAggregateTotals(CTransaction(tx), state) :
+                CheckTransaction(CTransaction(tx), state, mode == 1);
+            BOOST_CHECK_EQUAL(accepted, expected.empty());
+            BOOST_CHECK_EQUAL(state.GetRejectReason(), expected);
+        }
+}
+
+BOOST_AUTO_TEST_CASE(explicit_creation_scan_matches_previous_policy)
+{
+    BasicTestingSetup setup(ChainType::ELEMENTS);
+    const auto original=[](const CTransaction& tx) {
+        for (const auto& output : tx.vout) if (!output.nAsset.IsExplicit() || !output.nValue.IsExplicit() || !output.nNonce.IsNull()) return false;
+        for (const auto& input : tx.vin) {
+            const auto& issuance=input.assetIssuance;
+            if ((!issuance.nAmount.IsNull() && !issuance.nAmount.IsExplicit()) ||
+                (!issuance.nInflationKeys.IsNull() && !issuance.nInflationKeys.IsExplicit())) return false;
+        }
+        for (const auto& witness : tx.witness.vtxoutwit) if (!witness.vchRangeproof.empty() || !witness.vchSurjectionproof.empty()) return false;
+        for (const auto& witness : tx.witness.vtxinwit) if (!witness.vchIssuanceAmountRangeproof.empty() || !witness.vchInflationKeysRangeproof.empty()) return false;
+        return true;
+    };
+    BOOST_CHECK(Consensus::HasOnlyExplicitCreations(CTransaction(CMutableTransaction{})));
+    for (unsigned index=0;index<2;++index) for (unsigned mask=0;mask<2048;++mask) {
+        CMutableTransaction tx;
+        tx.vin.resize(2); tx.vout.resize(2); tx.witness.vtxinwit.resize(2); tx.witness.vtxoutwit.resize(2);
+        for (auto& output : tx.vout) { output.nAsset=CAsset(uint256S("01")); output.nValue=1; }
+        if (mask & 1) tx.vout[index].nAsset.vchCommitment.assign(33,0x0a);
+        if (mask & 2) tx.vout[index].nValue.vchCommitment.assign(33,0x08);
+        if (mask & 4) tx.vout[index].nNonce.vchCommitment.assign(33,0x02);
+        const auto set=[](auto& value,unsigned kind) { if (kind==1) value=1; if (kind==2) value.vchCommitment.assign(33,0x08); };
+        set(tx.vin[index].assetIssuance.nAmount,(mask>>3)%3);
+        set(tx.vin[index].assetIssuance.nInflationKeys,(mask>>5)%3);
+        if (mask & 128) tx.witness.vtxoutwit[index].vchRangeproof={1};
+        if (mask & 256) tx.witness.vtxoutwit[index].vchSurjectionproof={1};
+        if (mask & 512) tx.witness.vtxinwit[index].vchIssuanceAmountRangeproof={1};
+        if (mask & 1024) tx.witness.vtxinwit[index].vchInflationKeysRangeproof={1};
+        const CTransaction immutable(tx);
+        BOOST_CHECK_EQUAL(Consensus::HasOnlyExplicitCreations(immutable),original(immutable));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(explicit_only_activation_and_creations)
@@ -175,6 +245,26 @@ BOOST_AUTO_TEST_CASE(explicit_only_activation_and_creations)
     tx.vin[0].assetIssuance.nInflationKeys.vchCommitment.assign(33, 0);
     tx.vin[0].assetIssuance.nInflationKeys.vchCommitment[0] = 8;
     BOOST_CHECK(!Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+}
+
+BOOST_AUTO_TEST_CASE(parameter_gates_preserve_signed_boundaries_and_slot_presence)
+{
+    Consensus::Params params;
+    for (int activation : {std::numeric_limits<int>::min(),-1,0,1,100,std::numeric_limits<int>::max()}) {
+        params.explicit_only_height=activation;
+        BOOST_CHECK_EQUAL(params.ExplicitOnlyConfigured(),activation>=0);
+        for (int height : {std::numeric_limits<int>::min(),-1,0,1,99,100,101,std::numeric_limits<int>::max()})
+            BOOST_CHECK_EQUAL(params.ExplicitOnlyActive(height),activation>=0 && height>=activation);
+    }
+    for (bool enabled : {false,true}) {
+        params.drivechain_m6_withdrawal_validation=enabled;
+        params.drivechain_slot.reset();
+        BOOST_CHECK(!params.DrivechainWithdrawalValidationEnabled());
+        for (unsigned slot : {0U,24U,130U,255U}) {
+            params.drivechain_slot=slot;
+            BOOST_CHECK_EQUAL(params.DrivechainWithdrawalValidationEnabled(),enabled);
+        }
+    }
 }
 
 /**

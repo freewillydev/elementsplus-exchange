@@ -7,6 +7,8 @@
 
 #include <init.h>
 #include <core_io.h>
+#include <exception>
+#include <memory>
 
 #include <kernel/checks.h>
 #include <kernel/validation_cache_sizes.h>
@@ -22,10 +24,13 @@
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <crypto/common.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
-#include <core_io.h>
+#include <drivechain_settings.h>
 #include <hash.h>
+#include <haskell/bridge.h>
+#include <haskell/rpc_security_constants.h>
 #include <httprpc.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
@@ -178,25 +183,21 @@ static constexpr bool DEFAULT_STOPAFTERBLOCKIMPORT{false};
 static CThreadInterrupt g_drivechain_l1_block_sync_interrupt;
 static std::thread g_drivechain_l1_block_sync_thread;
 
-static UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params)
+static UniValue CallMainChainRPCAllowNull(const std::string& method, const UniValue& params)
 {
-    const UniValue reply = CallMainChainRPC(method, params);
-    if (!reply["error"].isNull()) {
-        throw std::runtime_error(strprintf("%s returned error: %s", method, reply["error"].write()));
-    }
-    return reply["result"];
+    return CheckDrivechainRPCReply(method, CallMainChainRPC(method, params), /*require_result=*/false);
 }
 
 static int64_t GetMainchainBlockHeight()
 {
-    return CallMainChainRPCChecked("getblockcount", UniValue(UniValue::VARR)).getInt<int64_t>();
+    return CallMainChainRPCAllowNull("getblockcount", UniValue(UniValue::VARR)).getInt<int64_t>();
 }
 
 static uint256 GetMainchainBlockHash(const int64_t height)
 {
     UniValue params(UniValue::VARR);
     params.push_back(height);
-    return uint256S(CallMainChainRPCChecked("getblockhash", params).get_str());
+    return uint256S(CallMainChainRPCAllowNull("getblockhash", params).get_str());
 }
 
 bool BuildDrivechainRewardScript(
@@ -207,34 +208,33 @@ bool BuildDrivechainRewardScript(
 {
     script.clear();
     if (error) error->clear();
-    if (address.empty()) {
-        if (error) *error = "set -drivechainrewardaddress to an address owned by the bidder's loaded Elements wallet";
-        return false;
-    }
-    const CTxDestination destination = DecodeDestination(address);
-    if (!IsValidDestination(destination)) {
-        if (error) *error = "-drivechainrewardaddress is not a valid address on the selected network";
-        return false;
-    }
-
-    // Restrict the automatic bidder to key-hash destinations. A script-hash
-    // address (or a future witness program) could still hide OP_TRUE, and the
-    // coinbase is explicit, so do not silently discard a blinding key.
+    CTxDestination destination;
     const CPubKey* blinding_key{nullptr};
-    if (const auto* pkh = std::get_if<PKHash>(&destination)) {
-        blinding_key = &pkh->blinding_pubkey;
-    } else if (const auto* wpkh = std::get_if<WitnessV0KeyHash>(&destination)) {
-        blinding_key = &wpkh->blinding_pubkey;
-    } else {
-        if (error) *error = "-drivechainrewardaddress must be an unconfidential P2PKH or P2WPKH address";
-        return false;
-    }
-    if (blinding_key->IsValid()) {
-        if (error) *error = "-drivechainrewardaddress must be unconfidential because coinbase rewards are explicit";
-        return false;
-    }
-    if (!is_spendable || !is_spendable(destination)) {
-        if (error) *error = "-drivechainrewardaddress is not spendable by a loaded private-key-enabled wallet";
+    const int code = drivechain::haskell::BmmRewardAddress([&](uint32_t step) {
+        switch (step) {
+        case 1: return !address.empty();
+        case 2: destination = DecodeDestination(address); return IsValidDestination(destination);
+        // Only key-hash destinations are safe for explicit automatic rewards.
+        case 3:
+            if (const auto* pkh = std::get_if<PKHash>(&destination)) blinding_key = &pkh->blinding_pubkey;
+            else if (const auto* wpkh = std::get_if<WitnessV0KeyHash>(&destination)) blinding_key = &wpkh->blinding_pubkey;
+            return blinding_key != nullptr;
+        case 4:
+            if (!blinding_key) throw std::logic_error("Missing reward address key");
+            return !blinding_key->IsValid();
+        case 5: return drivechain::haskell::ParentReplayAll<2>({[&] { return bool(is_spendable); },
+            [&] { return is_spendable(destination); }});
+        default: throw std::logic_error("Invalid Haskell reward address action");
+        }
+    });
+    if (code) {
+        static constexpr std::array<const char*,5> errors{
+            "set -drivechainrewardaddress to an address owned by the bidder's loaded Elements wallet",
+            "-drivechainrewardaddress is not a valid address on the selected network",
+            "-drivechainrewardaddress must be an unconfidential P2PKH or P2WPKH address",
+            "-drivechainrewardaddress must be unconfidential because coinbase rewards are explicit",
+            "-drivechainrewardaddress is not spendable by a loaded private-key-enabled wallet"};
+        if (error) *error = errors.at(code-1);
         return false;
     }
     script = GetScriptForDestination(destination);
@@ -247,66 +247,44 @@ bool ComputeDrivechainBmmBid(const CAmount configured_bid,
                              std::string* error)
 {
     if (error) error->clear();
-    if (configured_bid <= 0 || !MoneyRange(configured_bid)) {
+    const auto result = drivechain::haskell::BmmSelectedBid(configured_bid,sidechain_fees);
+    if (result == -1) {
         if (error) *error = "configured BMM bid must be positive and within the money range";
         return false;
     }
-    if (sidechain_fees < 0 || !MoneyRange(sidechain_fees)) {
+    if (result == -2) {
         if (error) *error = "sidechain candidate fees are outside the money range";
         return false;
     }
-    selected_bid = std::max(configured_bid, sidechain_fees);
-    if (selected_bid <= 0 || !MoneyRange(selected_bid)) {
-        if (error) *error = "selected BMM bid is outside the money range";
-        return false;
-    }
+    if (result <= 0) throw std::runtime_error("Haskell BMM bid selection failed");
+    selected_bid = result;
     return true;
 }
 
 bool ComputeDrivechainBmmReplacementBid(const std::string& error, const CAmount current,
                                        const CAmount maximum, CAmount& replacement)
 {
-    if (current <= 0 || !MoneyRange(current) || !MoneyRange(maximum) || current >= maximum) return false;
-    if (error.find("insufficient fee, rejecting replacement ") == std::string::npos) return false;
-    std::string marker{"not enough additional fees to relay; "};
-    auto start = error.find(marker);
-    if (start == std::string::npos) {
-        marker = "less fees than conflicting txs; ";
-        start = error.find(marker);
-    }
-    if (start == std::string::npos) return false;
-    const auto value_start = start + marker.size();
-    const auto separator = error.find(" < ", value_start);
-    if (separator == std::string::npos) return false;
-    std::string paid = error.substr(value_start, separator - value_start);
-    const bool negative = !paid.empty() && paid.front() == '-';
-    if (negative) paid.erase(0, 1);
-    const auto paid_amount = ParseMoney(paid);
-    const auto needed_start = separator + 3;
-    const auto end = error.find_first_not_of("0123456789.", needed_start);
-    if (end == needed_start || (end != std::string::npos && error[end] != '"' && error[end] != '\n')) return false;
-    const auto needed = ParseMoney(error.substr(needed_start, end - needed_start));
-    if (!paid_amount || !needed) return false;
-    const CAmount delta = *needed - (negative ? -*paid_amount : *paid_amount);
-    if (delta <= 0 || delta > maximum - current) return false;
-    replacement = current + delta;
-    return true;
+    return drivechain::haskell::BmmReplacementBid(error,current,maximum,replacement);
 }
 
 bool ParseDrivechainBmmBid(const std::string& value,
                            CAmount& bid,
                            std::string* error)
 {
-    if (error) error->clear();
+    namespace hs = drivechain::haskell;
     int64_t parsed{0};
-    if (!ParseInt64(value, &parsed)) {
-        if (error) *error = "BMM bid must be a canonical base-10 integer";
-        return false;
-    }
     CAmount selected{0};
-    if (!ComputeDrivechainBmmBid(parsed, 0, selected, error)) return false;
-    bid = selected;
-    return true;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::PARSED_BID, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: case 4: return error != nullptr;
+        case 2: error->clear(); return 1;
+        case 3: return ParseInt64(value, &parsed);
+        case 5: *error = "BMM bid must be a canonical base-10 integer"; return 1;
+        case 6: return ComputeDrivechainBmmBid(parsed, 0, selected, error);
+        case 7: bid = selected; return 1;
+        default: throw std::logic_error("invalid parsed bid action");
+        }
+    });
 }
 
 bool ResolveElementsFeeAsset(const std::optional<std::string>& configured,
@@ -315,37 +293,26 @@ bool ResolveElementsFeeAsset(const std::optional<std::string>& configured,
                              CAsset& resolved,
                              std::string* error)
 {
-    if (error) error->clear();
-    if (!configured) {
-        resolved = pegged_asset;
-        return true;
-    }
-
-    const auto parsed = uint256::FromHex(*configured);
-    if (!parsed) {
-        if (error) *error = "-feeasset must be exactly 64 hexadecimal characters";
-        return false;
-    }
-    const CAsset requested{*parsed};
-    if (enforce_canonical && requested != pegged_asset) {
-        if (error) *error = "-feeasset must equal the immutable Elements pegged asset";
-        return false;
-    }
-    resolved = enforce_canonical ? pegged_asset : requested;
-    return true;
+    return drivechain::haskell::FeeAsset(configured,enforce_canonical,
+        std::span<const unsigned char,32>{pegged_asset.begin(),32},
+        std::span<unsigned char,32>{resolved.begin(),32},error);
 }
 
 static bool GetConfiguredDrivechainBmmBid(const ArgsManager& args,
                                           CAmount& bid,
                                           std::string* error)
 {
-    if (!args.IsArgSet("-drivechainbmmbid")) {
-        bid = DEFAULT_DRIVECHAIN_BMM_BID;
-        if (error) error->clear();
-        return true;
-    }
-    return ParseDrivechainBmmBid(
-        args.GetArg("-drivechainbmmbid", ""), bid, error);
+    namespace hs = drivechain::haskell;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::CONFIGURED_BID, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return args.IsArgSet("-drivechainbmmbid");
+        case 2: return ParseDrivechainBmmBid(args.GetArg("-drivechainbmmbid", ""), bid, error);
+        case 3: bid = DEFAULT_DRIVECHAIN_BMM_BID; return 1;
+        case 4: return error != nullptr;
+        case 5: error->clear(); return 1;
+        default: throw std::logic_error("invalid configured bid action");
+        }
+    });
 }
 
 BoundedCommandResult RunBoundedCommand(
@@ -355,18 +322,19 @@ BoundedCommandResult RunBoundedCommand(
     const std::function<bool()>& should_cancel)
 {
     BoundedCommandResult result;
-    if (argv.empty() || argv.front().empty()) {
-        result.error = "bounded command has no executable";
-        return result;
-    }
-    if (timeout <= std::chrono::milliseconds::zero() || max_output == 0) {
-        result.error = "bounded command requires positive timeout and output limit";
-        return result;
-    }
-    if (should_cancel && should_cancel()) {
-        result.cancelled = true;
-        return result;
-    }
+    namespace hs = drivechain::haskell;
+    if (!hs::ParentReplayStore(hs::ReplayStoreFlow::CHILD_PREFLIGHT, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return hs::ParentReplayAll<2>({[&] { return !argv.empty(); }, [&] { return !argv.front().empty(); }});
+        case 2: result.error = "bounded command has no executable"; return 1;
+        case 3: return hs::ParentReplayAll<2>({[&] { return timeout > std::chrono::milliseconds::zero(); },
+            [&] { return max_output != 0; }});
+        case 4: result.error = "bounded command requires positive timeout and output limit"; return 1;
+        case 5: return hs::ParentReplayAll<2>({[&] { return bool(should_cancel); }, [&] { return should_cancel(); }});
+        case 6: result.cancelled = true; return 1;
+        default: throw std::logic_error("invalid child preflight action");
+        }
+    })) return result;
 
 #ifdef WIN32
     result.error = "direct bounded child processes are not supported on Windows";
@@ -377,15 +345,16 @@ BoundedCommandResult RunBoundedCommand(
         result.error = strprintf("failed to create child output pipe (%d)", errno);
         return result;
     }
-    const auto close_pipe = [&] {
-        if (output_pipe[0] >= 0) close(output_pipe[0]);
-        if (output_pipe[1] >= 0) close(output_pipe[1]);
-        output_pipe[0] = output_pipe[1] = -1;
+    const auto close_pipe = [](int* descriptors) noexcept {
+        for (int index = 0; index < 2; ++index) {
+            if (descriptors[index] >= 0) close(descriptors[index]);
+            descriptors[index] = -1;
+        }
     };
+    std::unique_ptr<int,decltype(close_pipe)> pipe_guard(output_pipe,close_pipe);
     if (fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC) == -1 ||
         fcntl(output_pipe[1], F_SETFD, FD_CLOEXEC) == -1) {
         result.error = strprintf("failed to secure child output pipe (%d)", errno);
-        close_pipe();
         return result;
     }
 
@@ -399,7 +368,6 @@ BoundedCommandResult RunBoundedCommand(
     const pid_t child = fork();
     if (child < 0) {
         result.error = strprintf("failed to fork child process (%d)", errno);
-        close_pipe();
         return result;
     }
     if (child == 0) {
@@ -418,6 +386,18 @@ BoundedCommandResult RunBoundedCommand(
         _exit(127);
     }
 
+    int child_status{0};
+    bool child_reaped{false};
+    // Emergency cleanup for unwinding before or during the normal Haskell-driven lifecycle.
+    const auto reap_child = [&](const pid_t* pid) noexcept {
+        if (child_reaped) return;
+        (void)kill(-*pid,SIGKILL);
+        (void)kill(*pid,SIGKILL);
+        pid_t waited;
+        do { waited = waitpid(*pid,&child_status,0); } while (waited < 0 && errno == EINTR);
+        child_reaped = waited == *pid || (waited < 0 && errno == ECHILD);
+    };
+    std::unique_ptr<const pid_t,decltype(reap_child)> child_guard(&child,reap_child);
     result.started = true;
     close(output_pipe[1]);
     output_pipe[1] = -1;
@@ -431,58 +411,60 @@ BoundedCommandResult RunBoundedCommand(
         result.error = strprintf("failed to make child output nonblocking (%d)", errno);
     }
 
-    int child_status{0};
-    bool child_reaped{false};
     bool output_eof{false};
-    const auto reap_nonblocking = [&] {
-        if (child_reaped) return;
-        for (;;) {
-            const pid_t waited = waitpid(child, &child_status, WNOHANG);
-            if (waited == child) {
-                child_reaped = true;
-                return;
+    const auto reap = [&](bool blocking) {
+        int wait_error{0};
+        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CHILD_REAP,
+            [&](uint32_t action) -> uint32_t {
+            switch (action) {
+            case 1: return child_reaped;
+            case 2: {
+                const pid_t waited = waitpid(child,&child_status,blocking ? 0 : WNOHANG);
+                wait_error = errno;
+                // Record released ownership before another fallible FFI transition.
+                if (waited == child) { child_reaped = true; return 0; }
+                if (waited == 0) return 1;
+                if (waited > 0) return 5;
+                if (wait_error == ECHILD) { child_reaped = true; return 3; }
+                return wait_error == EINTR ? 2 : 4;
             }
-            if (waited == 0) return;
-            if (waited < 0 && errno == EINTR) continue;
-            if (waited < 0 && errno == ECHILD) {
-                child_reaped = true;
-                return;
+            case 4:
+                if (result.error.empty()) result.error = blocking ?
+                    strprintf("failed to reap terminated child (%d)",wait_error) :
+                    strprintf("failed to reap child process (%d)",wait_error);
+                return 1;
+            default: throw std::logic_error("Invalid Haskell child reap action");
             }
-            if (waited < 0 && result.error.empty()) {
-                result.error = strprintf("failed to reap child process (%d)", errno);
-            }
-            return;
-        }
+        });
     };
     const auto drain_output = [&] {
         std::array<char, 4096> buffer;
-        for (;;) {
-            const ssize_t count = read(output_pipe[0], buffer.data(), buffer.size());
-            if (count > 0) {
-                const size_t available =
-                    max_output > result.output.size()
-                        ? max_output - result.output.size()
-                        : 0;
-                const size_t append = std::min<size_t>(
-                    available, static_cast<size_t>(count));
+        ssize_t count{0};
+        int read_error{0};
+        return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CHILD_DRAIN,
+            [&](uint32_t action) -> uint32_t {
+            switch (action) {
+            case 1:
+                count = read(output_pipe[0],buffer.data(),buffer.size());
+                read_error = errno;
+                if (count > 0) return 0;
+                if (count == 0) return 1;
+                if (read_error == EINTR) return 2;
+                return read_error == EAGAIN || read_error == EWOULDBLOCK ? 3 : 4;
+            case 2: {
+                const size_t append = hs::BoundedAppend(max_output,result.output.size(),count);
                 result.output.append(buffer.data(), append);
-                if (append != static_cast<size_t>(count)) {
-                    result.output_truncated = true;
-                    return true;
-                }
-                continue;
+                const bool truncated = append != static_cast<size_t>(count);
+                if (truncated) result.output_truncated = true;
+                return truncated;
             }
-            if (count == 0) {
-                output_eof = true;
-                return true;
+            case 3: output_eof = true; return 1;
+            case 4:
+                if (result.error.empty()) result.error = strprintf("failed reading child output (%d)",read_error);
+                return 1;
+            default: throw std::logic_error("Invalid Haskell child drain action");
             }
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
-            if (result.error.empty()) {
-                result.error = strprintf("failed reading child output (%d)", errno);
-            }
-            return false;
-        }
+        }) != 0;
     };
     const auto signal_group = [&](const int signal_number) {
         // Negative pid addresses the dedicated child process group. Signal the
@@ -491,78 +473,76 @@ BoundedCommandResult RunBoundedCommand(
         if (!child_reaped) (void)kill(child, signal_number);
     };
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    bool terminate_child{!result.error.empty()};
-    while (!terminate_child) {
-        if (!drain_output()) {
-            terminate_child = true;
-            break;
-        }
-        reap_nonblocking();
-        if (result.output_truncated) {
-            terminate_child = true;
-            break;
-        }
-        if (should_cancel && should_cancel()) {
-            result.cancelled = true;
-            terminate_child = true;
-            break;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            result.timed_out = true;
-            terminate_child = true;
-            break;
-        }
-        if (child_reaped && output_eof) break;
-
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - now);
-        const int poll_timeout = static_cast<int>(
-            std::max<int64_t>(1, std::min<int64_t>(25, remaining.count())));
-        pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
-        const int poll_result = poll(&descriptor, 1, poll_timeout);
-        if (poll_result < 0 && errno != EINTR) {
-            result.error = strprintf("failed polling child output (%d)", errno);
-            terminate_child = true;
-        }
+    bool terminate_child{true};
+    std::exception_ptr monitor_failure;
+    std::chrono::steady_clock::time_point now;
+    try {
+        terminate_child = drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CHILD_MONITOR,
+            [&](uint32_t action) -> uint32_t {
+            switch (action) {
+            case 1: return !result.error.empty();
+            case 2: return drain_output();
+            case 3: reap(false); return 1;
+            case 4: return result.output_truncated;
+            case 5: return hs::ParentReplayAll<2>({[&] { return bool(should_cancel); }, [&] { return should_cancel(); }});
+            case 6: result.cancelled = true; return 1;
+            case 7: now = std::chrono::steady_clock::now(); return now >= deadline;
+            case 8: result.timed_out = true; return 1;
+            case 9: return hs::ParentReplayAll<2>({[&] { return child_reaped; }, [&] { return output_eof; }});
+            case 10: {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now);
+                const int poll_timeout = static_cast<int>(hs::BoundedWait(remaining.count(),25));
+                pollfd descriptor{output_pipe[0],POLLIN | POLLHUP | POLLERR,0};
+                const int polled = poll(&descriptor,1,poll_timeout);
+                if (polled >= 0 || errno == EINTR) return 1;
+                result.error = strprintf("failed polling child output (%d)",errno);
+                return 0;
+            }
+            default: throw std::logic_error("Invalid Haskell child monitor action");
+            }
+        }) != 0;
+    } catch (...) {
+        // A monitor/cancellation exception must not bypass termination and reaping.
+        monitor_failure = std::current_exception();
     }
 
     if (terminate_child) {
         signal_group(SIGTERM);
         const auto grace_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
-        while (!child_reaped &&
-               std::chrono::steady_clock::now() < grace_deadline) {
-            reap_nonblocking();
-            if (child_reaped) break;
-            pollfd descriptor{output_pipe[0], POLLIN | POLLHUP | POLLERR, 0};
-            (void)poll(&descriptor, 1, 10);
-            if (output_nonblocking) (void)drain_output();
+        try {
+            drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CHILD_GRACE,
+                [&](uint32_t action) -> uint32_t {
+                switch (action) {
+                case 1: return hs::ParentReplayAll<2>({[&] { return !child_reaped; },
+                    [&] { return std::chrono::steady_clock::now() < grace_deadline; }});
+                case 2: reap(false); return 1;
+                case 3: return child_reaped;
+                case 4: {
+                    pollfd descriptor{output_pipe[0],POLLIN | POLLHUP | POLLERR,0};
+                    (void)poll(&descriptor,1,10);
+                    return 1;
+                }
+                case 5: return output_nonblocking;
+                case 6: (void)drain_output(); return 1;
+                default: throw std::logic_error("Invalid Haskell child grace action");
+                }
+            });
+        } catch (...) {
+            if (!monitor_failure) monitor_failure = std::current_exception();
         }
         // Also kill descendants that inherited the output descriptor.
         signal_group(SIGKILL);
     }
 
-    if (!child_reaped) {
-        for (;;) {
-            const pid_t waited = waitpid(child, &child_status, 0);
-            if (waited == child) {
-                child_reaped = true;
-                break;
-            }
-            if (waited < 0 && errno == EINTR) continue;
-            if (waited < 0 && errno == ECHILD) {
-                child_reaped = true;
-                break;
-            }
-            if (waited < 0 && result.error.empty()) {
-                result.error = strprintf("failed to reap terminated child (%d)", errno);
-            }
-            break;
-        }
+    try {
+        reap(true);
+    } catch (...) {
+        if (!monitor_failure) monitor_failure = std::current_exception();
+        child_guard.reset();
     }
     if (output_nonblocking) (void)drain_output();
-    close_pipe();
+    pipe_guard.reset();
 
     result.exited = child_reaped;
     if (child_reaped) {
@@ -572,6 +552,7 @@ BoundedCommandResult RunBoundedCommand(
             result.exit_code = 128 + WTERMSIG(child_status);
         }
     }
+    if (monitor_failure) std::rethrow_exception(monitor_failure);
     return result;
 #endif
 }
@@ -585,68 +566,48 @@ bool SubmitDrivechainWithdrawalBundle(
 {
     if (response) response->clear();
     if (error) error->clear();
-    if (sidechain_slot < 0 || sidechain_slot > 255) {
-        if (error) *error = "drivechain withdrawal slot is outside the BIP300 range";
+    const auto reject = [&](std::string message) {
+        if (error) *error = std::move(message);
         return false;
-    }
-    if (bundle.empty() || bundle.size() > 1024 * 1024) {
-        if (error) *error = "blinded withdrawal bundle must be between 1 byte and 1 MiB";
-        return false;
-    }
-
+    };
+    const auto classify = [](std::span<const unsigned char> input) {
+        std::vector<unsigned char> output;
+        if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::SUBMISSION_POLICY,input,output,nullptr))
+            throw std::runtime_error("Invalid Haskell withdrawal submission policy input");
+        return output.at(0);
+    };
+    std::array<unsigned char,14> input{};
+    WriteLE32(input.data()+1,static_cast<uint32_t>(sidechain_slot));
+    WriteLE64(input.data()+5,bundle.size());
 #ifdef WIN32
-    if (error) *error = "BIP300 withdrawal gRPC submission is not supported on Windows builds";
-    return false;
-#else
+    input.back() = 1;
+#endif
+    switch (classify(input)) {
+    case 0: break;
+    case 1: return reject("drivechain withdrawal slot is outside the BIP300 range");
+    case 2: return reject("blinded withdrawal bundle must be between 1 byte and 1 MiB");
+    case 3: return reject("BIP300 withdrawal gRPC submission is not supported on Windows builds");
+    default: throw std::runtime_error("Invalid Haskell withdrawal submission admission");
+    }
+#ifndef WIN32
     const std::string request = strprintf(
         "{\"sidechainId\":%d,\"transaction\":\"%s\"}",
         sidechain_slot, EncodeBase64(MakeUCharSpan(bundle)));
 
-    static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
-    static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
+    static constexpr size_t MAX_GRPC_OUTPUT{64 * 1024};
+    static constexpr auto GRPC_TIMEOUT{std::chrono::seconds{10}};
     const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
         gArgs, "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle", request,
-        std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
-        MAX_GRPCURL_OUTPUT,
+        std::chrono::duration_cast<std::chrono::milliseconds>(GRPC_TIMEOUT),
+        MAX_GRPC_OUTPUT,
         [&node] { return ShutdownRequested(node); });
-    if (child.cancelled) {
-        if (error) *error = "grpcurl cancelled during shutdown";
-        return false;
-    }
-    if (!child.started) {
-        if (error) *error = strprintf("failed to launch grpcurl: %s", child.error);
-        return false;
-    }
-    if (child.timed_out) {
-        if (error) *error = "grpcurl exceeded its 10-second deadline";
-        return false;
-    }
-    if (child.output_truncated) {
-        if (error) *error = "grpcurl exceeded its 64 KiB output limit";
-        return false;
-    }
-    if (!child.error.empty()) {
-        if (error) *error = strprintf(
-            "grpcurl process management failed: %s", child.error);
-        return false;
-    }
-    if (!child.exited) {
-        if (error) *error = "grpcurl was not reaped";
-        return false;
-    }
-    if (child.exit_code != 0) {
-        // BroadcastWithdrawalBundle is idempotent. Treat an exact duplicate as
-        // success so a caller may safely retry after losing the first reply.
-        if (child.output.find("AlreadyExists") == std::string::npos) {
-            if (error) {
-                *error = strprintf("grpcurl exited with status %d: %s",
-                                   child.exit_code, child.output);
-            }
-            return false;
-        }
-    }
+    std::string child_error;
+    if (ClassifyDrivechainGrpcResult(child,true,child_error) != DrivechainGrpcStatus::SUCCESS)
+        return reject(std::move(child_error));
     if (response) *response = child.output;
     return true;
+#else
+    throw std::runtime_error("Haskell withdrawal submission unexpectedly admitted Windows");
 #endif
 }
 
@@ -658,170 +619,170 @@ static void SubmitDrivechainBmmGrpcRequest(NodeContext& node, const int sidechai
     CAmount selected_bid{0};
     std::string bid_error;
     CAmount configured_bid{0};
-    if (!GetConfiguredDrivechainBmmBid(
-            gArgs, configured_bid, &bid_error) ||
-        !ComputeDrivechainBmmBid(
-            configured_bid, sidechain_fees, selected_bid, &bid_error)) {
-        throw std::runtime_error(bid_error);
-    }
+    namespace hs = drivechain::haskell;
+    hs::ParentReplayStore(hs::ReplayStoreFlow::REQUIRED_PAIR, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return GetConfiguredDrivechainBmmBid(gArgs, configured_bid, &bid_error);
+        case 2: return ComputeDrivechainBmmBid(configured_bid, sidechain_fees, selected_bid, &bid_error);
+        case 3: throw std::runtime_error(bid_error);
+        default: throw std::logic_error("invalid bid preparation action");
+        }
+    });
 
     const CAmount extra = gArgs.GetIntArg("-drivechainbmmreplacementextra", 0);
-    if (!MoneyRange(extra)) throw std::runtime_error("Invalid BMM replacement allowance");
-    const CAmount maximum_bid = selected_bid + std::min(extra, MAX_MONEY - selected_bid);
-    // Core may report the conflicting absolute fee before its relay increment.
-    // Allow those two recovery steps for this exact candidate, within one cap.
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        if (ShutdownRequested(node) || GetMainchainBlockHash(GetMainchainBlockHeight()) != mainchain_tip_hash) {
-            throw std::runtime_error("BMM parent changed before submission");
-        }
-        const std::string request = strprintf(
-            "{\"sidechainId\":%d,\"valueSats\":\"%d\",\"height\":%d,\"criticalHash\":{\"hex\":\"%s\"},\"prevBytes\":{\"hex\":\"%s\"}}",
-            sidechain_slot,
-            selected_bid,
-            mainchain_tip_height,
-            critical_hash.GetHex(),
-            mainchain_tip_hash.GetHex());
+    const CAmount maximum_bid = drivechain::haskell::BmmReplacementLimit(selected_bid, extra);
+    if (maximum_bid == -1) throw std::runtime_error("Invalid BMM replacement allowance");
+    BoundedCommandResult child;
+    std::string child_error;
+    const int result = drivechain::haskell::BmmSubmit(selected_bid,maximum_bid,
+        [&](uint32_t action, uint64_t value) -> int64_t {
+        switch (action) {
+        case 1: return drivechain::haskell::ParentReplayAll<2>({[&] { return !ShutdownRequested(node); },
+            [&] { return GetMainchainBlockHash(GetMainchainBlockHeight()) == mainchain_tip_hash; }});
+        case 2: {
+        const std::string request = BuildDrivechainBmmRequest(
+            sidechain_slot,value,mainchain_tip_height,critical_hash,mainchain_tip_hash).write();
 
-        static constexpr size_t MAX_GRPCURL_OUTPUT{64 * 1024};
-        static constexpr auto GRPCURL_TIMEOUT{std::chrono::seconds{10}};
-        const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
+        static constexpr size_t MAX_GRPC_OUTPUT{64 * 1024};
+        static constexpr auto GRPC_TIMEOUT{std::chrono::seconds{10}};
+        child = RunAuthenticatedDrivechainGrpc(
             gArgs, "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction", request,
-            std::chrono::duration_cast<std::chrono::milliseconds>(GRPCURL_TIMEOUT),
-            MAX_GRPCURL_OUTPUT,
+            std::chrono::duration_cast<std::chrono::milliseconds>(GRPC_TIMEOUT),
+            MAX_GRPC_OUTPUT,
             [&node] { return ShutdownRequested(node); });
-        if (child.cancelled) {
-            throw std::runtime_error("grpcurl cancelled during shutdown");
+        switch (ClassifyDrivechainGrpcResult(child,false,child_error)) {
+        case DrivechainGrpcStatus::PROCESS_FAILURE: return 0;
+        case DrivechainGrpcStatus::NONZERO_EXIT: return 1;
+        case DrivechainGrpcStatus::SUCCESS: return 2;
         }
-        if (!child.started) {
-            throw std::runtime_error(strprintf(
-                "failed to launch grpcurl: %s", child.error));
+        throw std::logic_error("Invalid BMM child status");
         }
-        if (child.timed_out) {
-            throw std::runtime_error("grpcurl exceeded its 10-second deadline");
-        }
-        if (child.output_truncated) {
-            throw std::runtime_error("grpcurl exceeded its 64 KiB output limit");
-        }
-        if (!child.error.empty()) {
-            throw std::runtime_error(strprintf(
-                "grpcurl process management failed: %s", child.error));
-        }
-        if (!child.exited) {
-            throw std::runtime_error("grpcurl was not reaped");
-        }
-        if (child.exit_code != 0) {
+        case 3: {
             CAmount replacement{0};
-            if (attempt < 2 && ComputeDrivechainBmmReplacementBid(child.output, selected_bid, maximum_bid, replacement)) {
-                LogPrintf("drivechain L1 block sync: replacing stale BMM input conflict, bid %d -> %d sats (cap %d)\n",
-                          selected_bid, replacement, maximum_bid);
-                selected_bid = replacement;
-                continue;
-            }
-            if (child.output.find("AlreadyExists") != std::string::npos ||
-                child.output.find("same `sidechain_number` and `prev_bytes` already exists") != std::string::npos) {
-                LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
-                    sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height);
-                return;
-            }
-            throw std::runtime_error(strprintf(
-                "grpcurl exited with status %d: %s",
-                child.exit_code, child.output));
+            return ComputeDrivechainBmmReplacementBid(child.output,value,maximum_bid,replacement) ? replacement : 0;
         }
-        LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, critical hash %s, candidate fees %s, bid %s, response %s\n",
-            sidechain_slot, mainchain_tip_hash.GetHex(), mainchain_tip_height,
-            critical_hash.GetHex(), FormatMoney(sidechain_fees),
-            FormatMoney(selected_bid), child.output);
-        return;
-    }
+        case 4:
+            LogPrintf("drivechain L1 block sync: replacing stale BMM input conflict, bid %d -> %d sats (cap %d)\n",
+                selected_bid,value,maximum_bid);
+            selected_bid = value;
+            break;
+        case 5: return drivechain::haskell::BmmMessageMatches(
+            drivechain::haskell::BmmMessageKind::DUPLICATE_REQUEST, child.output);
+        case 6:
+            if (value == 0) {
+                LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
+                    sidechain_slot,mainchain_tip_hash.GetHex(),mainchain_tip_height);
+            } else {
+                LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, critical hash %s, candidate fees %s, bid %s, response %s\n",
+                    sidechain_slot,mainchain_tip_hash.GetHex(),mainchain_tip_height,
+                    critical_hash.GetHex(),FormatMoney(sidechain_fees),FormatMoney(selected_bid),child.output);
+            }
+            break;
+        default: throw std::logic_error("Invalid Haskell BMM submission action");
+        }
+        return 1;
+    });
+    if (result) throw std::runtime_error(result == 1 ? "BMM parent changed before submission" : child_error);
 #endif
+}
+
+static bool IsCurrentDrivechainBidParent(const int64_t parent_height, const uint256& parent_hash)
+{
+    int64_t mainchain_tip_height{0};
+    uint256 mainchain_tip_hash;
+    namespace hs = drivechain::haskell;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::BID_PARENT, [&](uint32_t stage) -> uint32_t {
+        switch (stage) {
+        case 1: mainchain_tip_height = GetMainchainBlockHeight(); return 1;
+        case 2: mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height); return 1;
+        case 3: return parent_height == mainchain_tip_height;
+        case 4: return parent_hash == mainchain_tip_hash;
+        case 5:
+            LogPrintf("drivechain L1 block sync: refusing BIP301 BMM for non-tip parent block %s height %d; current mainchain tip is %s height %d\n",
+                parent_hash.GetHex(), parent_height, mainchain_tip_hash.GetHex(), mainchain_tip_height);
+            return 1;
+        default: throw std::logic_error("invalid bid parent action");
+        }
+    });
 }
 
 static bool SubmitNativeDrivechainBmm(NodeContext& node, const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& critical_hash, const CAmount sidechain_fees)
 {
-    const int64_t mainchain_tip_height = GetMainchainBlockHeight();
-    const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
-    if (parent_height != mainchain_tip_height || parent_hash != mainchain_tip_hash) {
-        LogPrintf("drivechain L1 block sync: refusing BIP301 BMM for non-tip parent block %s height %d; current mainchain tip is %s height %d\n",
-            parent_hash.GetHex(), parent_height, mainchain_tip_hash.GetHex(), mainchain_tip_height);
-        return false;
-    }
-
-    try {
-        SubmitDrivechainBmmGrpcRequest(node, sidechain_slot, mainchain_tip_height, mainchain_tip_hash, critical_hash, sidechain_fees);
-        return true;
-    } catch (const std::exception& e) {
-        LogPrintf("drivechain L1 block sync: BIP301 gRPC request failed: %s\n", e.what());
-        return false;
-    }
+    return drivechain::haskell::ParentReplayAll<2>({
+        [&] { return IsCurrentDrivechainBidParent(parent_height, parent_hash); },
+        [&] {
+            try {
+                SubmitDrivechainBmmGrpcRequest(node, sidechain_slot, parent_height, parent_hash, critical_hash, sidechain_fees);
+                return true;
+            } catch (const std::exception& e) {
+                LogPrintf("drivechain L1 block sync: BIP301 gRPC request failed: %s\n", e.what());
+                return false;
+            }
+        },
+    });
 }
 
 static bool SubmitEcxDrivechainBmm(const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount bid)
 {
-    const int64_t mainchain_tip_height = GetMainchainBlockHeight();
-    const uint256 mainchain_tip_hash = GetMainchainBlockHash(mainchain_tip_height);
-    if (parent_height != mainchain_tip_height || parent_hash != mainchain_tip_hash) {
-        LogPrintf("drivechain L1 block sync: refusing BIP301 BMM for non-tip parent block %s height %d; current mainchain tip is %s height %d\n",
-            parent_hash.GetHex(), parent_height, mainchain_tip_hash.GetHex(), mainchain_tip_height);
-        return false;
-    }
-
     uint256 request_txid;
     std::string error;
-    if (!SubmitDrivechainBmmBid(
-            sidechain_slot,
-            static_cast<uint64_t>(bid),
-            static_cast<uint32_t>(mainchain_tip_height),
-            sidechain_block_hash,
-            mainchain_tip_hash,
-            request_txid,
-            &error)) {
-        LogPrintf("drivechain L1 block sync: BIP301 work bid failed: %s\n", error);
-        return false;
-    }
-    LogPrintf("drivechain L1 block sync: submitted funded BIP301 work bid %s for critical hash %s; parent request txid %s\n",
-        FormatMoney(bid), sidechain_block_hash.GetHex(), request_txid.GetHex());
-    return true;
+    namespace hs = drivechain::haskell;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::FUNDED_SUBMISSION, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return IsCurrentDrivechainBidParent(parent_height,parent_hash);
+        case 2: return SubmitDrivechainBmmBid(sidechain_slot,static_cast<uint64_t>(bid),
+            static_cast<uint32_t>(parent_height),sidechain_block_hash,parent_hash,request_txid,&error);
+        case 3: LogPrintf("drivechain L1 block sync: BIP301 work bid failed: %s\n",error); break;
+        case 4:
+            LogPrintf("drivechain L1 block sync: submitted funded BIP301 work bid %s for critical hash %s; parent request txid %s\n",
+                FormatMoney(bid),sidechain_block_hash.GetHex(),request_txid.GetHex());
+            break;
+        default: throw std::logic_error("invalid funded submission action");
+        }
+        return 1;
+    });
+}
+
+static bool WaitForDrivechainBmm(NodeContext& node, const std::function<int32_t(uint32_t)>& action)
+{
+    return drivechain::haskell::BmmWait([&](uint32_t step) -> int32_t {
+        if (step == 1) return !ShutdownRequested(node);
+        if (step == 6) return g_drivechain_l1_block_sync_interrupt.sleep_for(std::chrono::seconds{30});
+        return action(step);
+    });
 }
 
 static bool WaitForDrivechainBmmCommitment(NodeContext& node, const uint256& critical_hash, const uint256& parent_hash, const int sidechain_slot)
 {
-    int attempts = 0;
-    int definitive_failures = 0;
-    while (!ShutdownRequested(node)) {
-        std::string bmm_error;
-        if (IsDrivechainBmmCommitmentMined(critical_hash, parent_hash, sidechain_slot, &bmm_error)) {
+    std::string bmm_error;
+    return WaitForDrivechainBmm(node,[&](uint32_t step) -> int32_t {
+        switch (step) {
+        case 2:
+            bmm_error.clear();
+            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::COMMITMENT_PROBE,
+                [&](uint32_t action) -> uint32_t {
+                    switch (action) {
+                    case 1: return IsDrivechainBmmCommitmentMined(critical_hash,parent_hash,sidechain_slot,&bmm_error);
+                    case 2: return IsDefinitiveDrivechainBmmWaitError(bmm_error);
+                    default: throw std::logic_error("invalid commitment probe action");
+                    }
+                });
+        case 4:
             LogPrintf("drivechain L1 block sync: confirmed mined BIP301 critical hash %s and parent %s\n",
                 critical_hash.GetHex(), parent_hash.GetHex());
-            return true;
-        }
-
-        // Once the exact active successor exists but carries no matching M7,
-        // this candidate cannot be committed on that P->Q edge.  Stop waiting
-        // after repeated observations and build a fresh candidate on the new
-        // parent tip.  Transport/RPC failures remain retryable indefinitely.
-        const bool definitive_mismatch =
-            IsDefinitiveDrivechainBmmWaitError(bmm_error);
-        if (definitive_mismatch) {
-            ++definitive_failures;
-            if (definitive_failures >= 3) {
-                LogPrintf("drivechain L1 block sync: abandoning BIP301 critical hash %s for parent %s because the mined L1 successor does not contain its BMM commitment: %s\n",
-                    critical_hash.GetHex(), parent_hash.GetHex(), bmm_error);
-                return false;
-            }
-        } else {
-            definitive_failures = 0;
-        }
-
-        if (attempts % 4 == 0) {
+            break;
+        case 5:
+            LogPrintf("drivechain L1 block sync: abandoning BIP301 critical hash %s for parent %s because the mined L1 successor does not contain its BMM commitment: %s\n",
+                critical_hash.GetHex(), parent_hash.GetHex(), bmm_error);
+            break;
+        case 3:
             LogPrintf("drivechain L1 block sync: waiting for mined BIP301 critical hash %s and parent %s: %s\n",
                 critical_hash.GetHex(), parent_hash.GetHex(), bmm_error);
-        }
-        ++attempts;
-        if (!g_drivechain_l1_block_sync_interrupt.sleep_for(std::chrono::seconds{30})) {
             break;
+        default: throw std::logic_error("Invalid Haskell BMM commitment wait action");
         }
-    }
-    return false;
+        return 1;
+    });
 }
 
 static bool WaitForDrivechainBmmProof(
@@ -832,52 +793,51 @@ static bool WaitForDrivechainBmmProof(
     const uint256& critical_hash,
     drivechain::BmmProof& proof)
 {
-    int attempts = 0;
-    int definitive_failures = 0;
-    while (!ShutdownRequested(node)) {
+    std::string proof_error;
+    bool transport_failure{false};
+    return WaitForDrivechainBmm(node,[&](uint32_t step) -> int32_t {
         try {
-            if (GetMainchainBlockHeight() > parent_height) {
-                std::string proof_error;
-                if (BuildDrivechainBmmProof(
-                        previous_state,
-                        parent_height,
-                        parent_hash,
-                        critical_hash,
-                        proof,
-                        &proof_error)) {
-                    LogPrintf("drivechain L1 block sync: constructed and verified BIP301 successor proof for critical hash %s and parent %s\n",
-                        critical_hash.GetHex(), parent_hash.GetHex());
-                    return true;
-                }
-                ++definitive_failures;
-                if (definitive_failures >= 3) {
-                    LogPrintf("drivechain L1 block sync: abandoning critical hash %s for parent %s because its fixed successor proof is invalid: %s\n",
-                        critical_hash.GetHex(), parent_hash.GetHex(), proof_error);
-                    return false;
-                }
-            } else {
-                definitive_failures = 0;
-            }
-
-            if (attempts % 4 == 0) {
+        switch (step) {
+        case 2:
+            proof_error.clear();
+            transport_failure = false;
+            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::SUCCESSOR_PROBE,
+                [&](uint32_t action) -> uint32_t {
+                    switch (action) {
+                    case 1: return GetMainchainBlockHeight() > parent_height;
+                    case 2: return BuildDrivechainBmmProof(previous_state,parent_height,parent_hash,critical_hash,proof,&proof_error);
+                    default: throw std::logic_error("invalid successor probe action");
+                    }
+                });
+        case 4:
+            LogPrintf("drivechain L1 block sync: constructed and verified BIP301 successor proof for critical hash %s and parent %s\n",
+                critical_hash.GetHex(), parent_hash.GetHex());
+            break;
+        case 5:
+            LogPrintf("drivechain L1 block sync: abandoning critical hash %s for parent %s because its fixed successor proof is invalid: %s\n",
+                critical_hash.GetHex(), parent_hash.GetHex(), proof_error);
+            break;
+        case 3:
+            if (transport_failure) LogPrintf("drivechain L1 block sync: waiting for L1 proof data: %s\n",proof_error);
+            else
                 LogPrintf("drivechain L1 block sync: waiting for L1 successor proof for critical hash %s and parent %s\n",
                     critical_hash.GetHex(), parent_hash.GetHex());
-            }
-        } catch (const std::exception& exception) {
-            if (attempts % 4 == 0) {
-                LogPrintf("drivechain L1 block sync: waiting for L1 proof data: %s\n", exception.what());
-            }
-        }
-        ++attempts;
-        if (!g_drivechain_l1_block_sync_interrupt.sleep_for(std::chrono::seconds{30})) {
             break;
+        default: throw std::logic_error("Invalid Haskell BMM proof wait action");
         }
-    }
-    return false;
+        return 1;
+        } catch (const std::exception& exception) {
+            if (step == 3 && transport_failure) throw;
+            transport_failure = true;
+            proof_error = exception.what();
+            return 3;
+        }
+    });
 }
 
-static bool PrepareDrivechainBlock(ChainstateManager& chainman, CBlock& block)
+bool PrepareDrivechainBlock(ChainstateManager& chainman, CBlock& block)
 {
+    namespace hs = drivechain::haskell;
     static unsigned int extra_nonce = 0;
     uint64_t max_tries = 1000000;
 
@@ -887,342 +847,316 @@ static bool PrepareDrivechainBlock(ChainstateManager& chainman, CBlock& block)
     }
 
     const CChainParams chainparams(Params());
-    if (!g_signed_blocks) {
-        while (max_tries > 0 && block.nNonce < std::numeric_limits<uint32_t>::max() &&
-               !CheckProofOfWork(block.GetHash(), block.nBits, chainparams.GetConsensus()) &&
-               !bool{chainman.m_interrupt}) {
-            ++block.nNonce;
-            --max_tries;
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::BLOCK_PREPARATION,[&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return g_signed_blocks;
+        case 2: return node::SearchBlockNonce(block, max_tries, chainparams.GetConsensus(), chainman.m_interrupt);
+        case 3: return node::AppendOpTrueBlockWitness(block);
+        case 4: return !block.m_dynafed_params.IsNull();
+        case 5:
+            LogPrintf("drivechain L1 block sync: cannot sign dynamic federation block because signblockscript is not WSH(OP_TRUE)\n");
+            return 1;
+        default: throw std::logic_error("Invalid Haskell block preparation action");
         }
-        if (max_tries == 0 || bool{chainman.m_interrupt}) {
-            return false;
-        }
-    }
-
-    CScript op_true(OP_TRUE);
-    if (block.m_dynafed_params.m_current.m_signblockscript == GetScriptForDestination(WitnessV0ScriptHash(op_true))) {
-        block.m_signblock_witness.stack.push_back(std::vector<unsigned char>(op_true.begin(), op_true.end()));
-    } else if (!block.m_dynafed_params.IsNull()) {
-        LogPrintf("drivechain L1 block sync: cannot sign dynamic federation block because signblockscript is not WSH(OP_TRUE)\n");
-        return false;
-    }
-
-    return true;
+    });
 }
 
-static bool AcceptPreparedDrivechainBlock(ChainstateManager& chainman, const CBlock& block)
+bool AcceptPreparedDrivechainBlock(ChainstateManager& chainman, const CBlock& block)
 {
+    namespace hs = drivechain::haskell;
     std::shared_ptr<const CBlock> shared_pblock = std::make_shared<const CBlock>(block);
-    if (!chainman.ProcessNewBlock(shared_pblock, /*force_processing=*/true,
-                                  /*min_pow_checked=*/true, nullptr)) {
-        LogPrintf("drivechain L1 block sync: generated sidechain block %s was not accepted\n", block.GetHash().ToString());
-        return false;
-    }
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::BLOCK_ACCEPTANCE,[&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return chainman.ProcessNewBlock(shared_pblock, /*force_processing=*/true, /*min_pow_checked=*/true, nullptr);
+        case 2:
+            LogPrintf("drivechain L1 block sync: generated sidechain block %s was not accepted\n", block.GetHash().ToString());
+            return 1;
+        default: throw std::logic_error("Invalid Haskell block acceptance action");
+        }
+    });
+}
 
-    return true;
+bool IsDrivechainRewardSpendable(interfaces::WalletLoader* loader, const CTxDestination& destination)
+{
+    namespace hs = drivechain::haskell;
+    std::vector<std::unique_ptr<interfaces::Wallet>> wallets;
+    size_t index{0};
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::REWARD_WALLET,[&](uint32_t action) -> uint32_t {
+        switch (action) {
+        case 1: return loader != nullptr;
+        case 2: wallets = loader->getWallets(); return 1;
+        case 3: return index < wallets.size();
+        case 4: return wallets.at(index)->privateKeysDisabled();
+        case 5: return wallets.at(index)->isSpendable(destination);
+        case 6: ++index; return 1;
+        default: throw std::logic_error("invalid reward wallet action");
+        }
+    });
+}
+
+static std::unique_ptr<CBlockTemplate> CreateDrivechainBlockTemplate(NodeContext& node,
+    int64_t parent_height, const std::vector<CScript>& commitments,
+    std::optional<uint64_t> authenticated_parent_height = std::nullopt)
+{
+    // Admit the wallet-owned payout before hashing a candidate or paying a bid.
+    CScript coinbase_script;
+    std::string reward_error;
+    std::unique_ptr<CBlockTemplate> result;
+    namespace hs = drivechain::haskell;
+    hs::ParentReplayStore(hs::ReplayStoreFlow::TEMPLATE_CREATION,[&](uint32_t step) -> uint32_t {
+    switch (step) {
+    case 1: return BuildDrivechainRewardScript(gArgs.GetArg("-drivechainrewardaddress", ""),
+            [&node](const CTxDestination& destination) {
+                return IsDrivechainRewardSpendable(node.wallet_loader,destination);
+            },coinbase_script,&reward_error);
+    case 2: LogPrintf("drivechain L1 block sync: automatic BMM bidding paused: %s\n",reward_error); break;
+    case 3: {
+        BlockAssembler::Options options;
+        ApplyArgsManOptions(gArgs,options);
+        options.coinbase_output_script = coinbase_script;
+        options.commit_scripts = commitments;
+        options.authenticated_parent_height = authenticated_parent_height;
+        result = BlockAssembler(node.chainman->ActiveChainstate(),node.mempool.get(),options).CreateNewBlock();
+        return bool(result);
+    }
+    case 4: LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n",parent_height); break;
+    default: throw std::logic_error("invalid template creation action");
+    }
+    return 1;
+    });
+    return result;
 }
 
 static bool MineNativeBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
     const auto& configured_slot = Params().GetConsensus().drivechain_slot;
-    if (!configured_slot.has_value()) {
-        LogPrintf("drivechain L1 block sync: refusing to mine on a network without an assigned drivechain slot\n");
-        return false;
-    }
-    if (!node.chainman || !node.mempool) {
-        LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n");
-        return false;
-    }
-
-    int side_height = 0;
-    {
+    int side_height{0};
+    CAmount sidechain_fees{0};
+    std::unique_ptr<CBlockTemplate> block_template;
+    uint256 sidechain_block_hash,critical_hash;
+    std::optional<usdd::WithdrawalAccumulatorState> previous_withdrawal_accumulator;
+    std::string checkpoint_error;
+    return drivechain::haskell::BmmProduction(/*ecx=*/false,[&](uint32_t stage) {
+    switch (stage) {
+    case 1: return configured_slot.has_value();
+    case 2: return bool(node.chainman);
+    case 13: return bool(node.mempool);
+    case 3: {
         LOCK(cs_main);
         const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
-        if (!tip) {
-            LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n");
-            return false;
-        }
-        side_height = tip->nHeight + 1;
+        if (tip) side_height = drivechain::haskell::NextBlockHeight(true, tip->nHeight);
+        return tip != nullptr;
     }
-
+    case 4: {
     const CScript parent_commitment = CreateDrivechainParentCommitmentScript(parent_hash);
     const std::vector<CScript> commitments{parent_commitment};
 
-    // Commit the bidder's wallet-controlled payout before hashing the
-    // candidate and paying for its BMM request. A missing/unowned destination
-    // pauses only automatic bidding, not normal node validation or peering.
-    CScript coinbase_script;
-    std::string reward_error;
-    if (!BuildDrivechainRewardScript(
-            gArgs.GetArg("-drivechainrewardaddress", ""),
-            [&node](const CTxDestination& destination) {
-                if (!node.wallet_loader) return false;
-                for (const auto& wallet : node.wallet_loader->getWallets()) {
-                    if (!wallet->privateKeysDisabled() && wallet->isSpendable(destination)) {
-                        return true;
-                    }
-                }
-                return false;
-            },
-            coinbase_script, &reward_error)) {
-        LogPrintf("drivechain L1 block sync: automatic BMM bidding paused: %s\n", reward_error);
-        return false;
+    block_template = CreateDrivechainBlockTemplate(node,parent_height,commitments);
+    return bool(block_template);
     }
-    BlockAssembler::Options options;
-    ApplyArgsManOptions(gArgs, options);
-    options.coinbase_output_script = coinbase_script;
-    options.commit_scripts = commitments;
-    std::unique_ptr<CBlockTemplate> block_template(
-        BlockAssembler(node.chainman->ActiveChainstate(), node.mempool.get(), options).CreateNewBlock());
-    if (!block_template) {
-        LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n", parent_height);
-        return false;
+    case 5:
+    sidechain_fees = -block_template->vTxFees[0];
+    return PrepareDrivechainBlock(*node.chainman,block_template->block);
+    case 6: {
+    sidechain_block_hash = block_template->block.GetHash();
+    LOCK(cs_main);
+    const CBlockIndex* predecessor = node.chainman->m_blockman.LookupBlockIndex(block_template->block.hashPrevBlock);
+    const bool current = predecessor && node.chainman->ActiveChain().Tip() == predecessor;
+    if (current) previous_withdrawal_accumulator = predecessor->m_usdd_withdrawal_accumulator;
+    return current;
     }
-
-    const CAmount sidechain_fees = -block_template->vTxFees[0];
-    const int sidechain_slot = *configured_slot;
-
-    if (!PrepareDrivechainBlock(*node.chainman, block_template->block)) {
-        return false;
-    }
-
-    const uint256 sidechain_block_hash = block_template->block.GetHash();
-    usdd::WithdrawalAccumulatorState previous_withdrawal_accumulator;
-    {
-        LOCK(cs_main);
-        const CBlockIndex* predecessor =
-            node.chainman->m_blockman.LookupBlockIndex(
-                block_template->block.hashPrevBlock);
-        if (!predecessor ||
-            node.chainman->ActiveChain().Tip() != predecessor) {
-            LogPrintf("drivechain L1 block sync: sidechain tip changed while deriving BIP301 USDD checkpoint; rebuilding candidate\n");
-            return false;
-        }
-        if (!predecessor->m_usdd_withdrawal_accumulator.has_value()) {
-            LogPrintf("drivechain L1 block sync: predecessor USDD withdrawal accumulator unavailable; reindex required\n");
-            return false;
-        }
-        previous_withdrawal_accumulator =
-            *predecessor->m_usdd_withdrawal_accumulator;
-    }
+    case 11: return previous_withdrawal_accumulator.has_value();
+    case 12: {
     usdd::WithdrawalAccumulatorState next_withdrawal_accumulator;
-    uint256 critical_hash;
-    std::string checkpoint_error;
-    if (!usdd::DeriveWithdrawalBip301CriticalHash(
+    return usdd::DeriveWithdrawalBip301CriticalHash(
             block_template->block, Params().GetConsensus().hashGenesisBlock,
-            static_cast<uint8_t>(sidechain_slot),
-            previous_withdrawal_accumulator, next_withdrawal_accumulator,
-            critical_hash, &checkpoint_error)) {
-        LogPrintf("drivechain L1 block sync: cannot derive BIP301 USDD checkpoint for sidechain block %s: %s\n",
-                  sidechain_block_hash.GetHex(), checkpoint_error);
-        return false;
+            static_cast<uint8_t>(*configured_slot),
+            *previous_withdrawal_accumulator, next_withdrawal_accumulator,
+            critical_hash, &checkpoint_error);
     }
-    if (!SubmitNativeDrivechainBmm(node, sidechain_slot, parent_height, parent_hash, critical_hash, sidechain_fees)) {
-        LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
-            side_height, parent_height);
-        return false;
-    }
-
-    if (!WaitForDrivechainBmmCommitment(node, critical_hash, parent_hash, sidechain_slot)) {
-        return false;
-    }
-
-    if (!AcceptPreparedDrivechainBlock(*node.chainman, block_template->block)) {
-        return false;
-    }
-
+    case 7: return SubmitNativeDrivechainBmm(node, *configured_slot, parent_height, parent_hash, critical_hash, sidechain_fees);
+    case 8: return WaitForDrivechainBmmCommitment(node,critical_hash,parent_hash,*configured_slot);
+    case 9: return AcceptPreparedDrivechainBlock(*node.chainman,block_template->block);
+    case 10:
     LogPrintf("drivechain L1 block sync: mined sidechain block %s at height %d with BIP301 USDD checkpoint %s for L1 block %s at height %d, fees %s\n",
         sidechain_block_hash.ToString(), side_height, critical_hash.GetHex(),
         parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
+    break;
+    case 101: LogPrintf("drivechain L1 block sync: refusing to mine on a network without an assigned drivechain slot\n"); break;
+    case 102: LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n"); break;
+    case 103: LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n"); break;
+    case 106: LogPrintf("drivechain L1 block sync: sidechain tip changed while deriving BIP301 USDD checkpoint; rebuilding candidate\n"); break;
+    case 111: LogPrintf("drivechain L1 block sync: predecessor USDD withdrawal accumulator unavailable; reindex required\n"); break;
+    case 112:
+        LogPrintf("drivechain L1 block sync: cannot derive BIP301 USDD checkpoint for sidechain block %s: %s\n",
+                  sidechain_block_hash.GetHex(), checkpoint_error);
+        break;
+    case 107:
+        LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
+            side_height, parent_height);
+        break;
+    default: throw std::logic_error("Invalid Haskell native production stage");
+    }
     return true;
+    });
 }
 
 static bool MineEcxBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
-    if (!Params().GetConsensus().elements_mode ||
-        !Params().GetConsensus().has_parent_chain) {
-        LogPrintf("drivechain L1 block sync: disabled outside an Elements parent-chain configuration\n");
-        return false;
-    }
-    if (!node.chainman || !node.mempool) {
-        LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n");
-        return false;
-    }
-
-    int side_height = 0;
+    int side_height{0},sidechain_slot{0};
     drivechain::BmmL1State bmm_state;
-    {
+    drivechain::BmmProof bmm_proof;
+    std::vector<CScript> commitments;
+    std::unique_ptr<CBlockTemplate> block_template;
+    uint64_t approving_parent_height{0},simplicity_milliweight{0};
+    CAmount sidechain_fees{0};
+    std::array<int64_t,3> fee_quote{};
+    const auto& [verification_fee,producer_reserve,bid] = fee_quote;
+    uint256 critical_hash,sidechain_block_hash;
+    bool state_available{false};
+    std::string state_error,proof_error;
+    return drivechain::haskell::BmmProduction(/*ecx=*/true,[&](uint32_t stage) {
+    switch (stage) {
+    case 1: return Params().GetConsensus().elements_mode;
+    case 19: return Params().GetConsensus().has_parent_chain;
+    case 2: return bool(node.chainman);
+    case 20: return bool(node.mempool);
+    case 3: {
         LOCK(cs_main);
         const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
-        if (!tip) {
-            LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n");
-            return false;
-        }
-        side_height = tip->nHeight + 1;
-        std::string state_error;
-        if (!drivechain::GetEffectiveBmmState(
+        if (tip) {
+            side_height = drivechain::haskell::NextBlockHeight(true, tip->nHeight);
+            state_available = drivechain::GetEffectiveBmmState(
                 node.chainman->ActiveChainstate().CoinsTip(),
                 tip,
                 bmm_state,
-                state_error)) {
-            LogPrintf("drivechain L1 block sync: cannot obtain deterministic BMM state: %s\n", state_error);
-            return false;
+                state_error);
         }
+        return tip != nullptr;
     }
-
+    case 15: return state_available;
+    case 4: {
     const std::vector<unsigned char> parent_hash_bytes(parent_hash.begin(), parent_hash.end());
     const CScript parent_commitment = CScript() << OP_RETURN << parent_hash_bytes;
-    const std::vector<CScript> commitments{parent_commitment};
+    commitments = {parent_commitment};
 
-    if (parent_height < 0 ||
-        static_cast<uint64_t>(parent_height) >=
-            std::numeric_limits<uint32_t>::max()) {
-        LogPrintf("drivechain L1 block sync: parent successor height is outside the ECX committed range\n");
-        return false;
+    return drivechain::haskell::ApprovingParentHeight(parent_height, approving_parent_height);
     }
-    const uint64_t approving_parent_height{
-        static_cast<uint64_t>(parent_height) + 1};
-
-    // Commit the bidder's wallet-controlled payout before hashing the
-    // candidate and paying for its BMM request. A missing/unowned destination
-    // pauses only automatic bidding, not normal node validation or peering.
-    CScript coinbase_script;
-    std::string reward_error;
-    if (!BuildDrivechainRewardScript(
-            gArgs.GetArg("-drivechainrewardaddress", ""),
-            [&node](const CTxDestination& destination) {
-                if (!node.wallet_loader) return false;
-                for (const auto& wallet : node.wallet_loader->getWallets()) {
-                    if (!wallet->privateKeysDisabled() && wallet->isSpendable(destination)) {
-                        return true;
-                    }
-                }
-                return false;
-            },
-            coinbase_script, &reward_error)) {
-        LogPrintf("drivechain L1 block sync: automatic BMM bidding paused: %s\n", reward_error);
-        return false;
-    }
-    BlockAssembler::Options options;
-    ApplyArgsManOptions(gArgs, options);
-    options.coinbase_output_script = coinbase_script;
-    options.commit_scripts = commitments;
-    options.authenticated_parent_height = approving_parent_height;
-    std::unique_ptr<CBlockTemplate> block_template(
-        BlockAssembler(node.chainman->ActiveChainstate(), node.mempool.get(), options).CreateNewBlock());
-    if (!block_template) {
-        LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n", parent_height);
-        return false;
-    }
-
-    const CAmount sidechain_fees = -block_template->vTxFees[0];
-    uint64_t simplicity_milliweight{0};
-    for (const CTransactionRef& tx : block_template->block.vtx) {
-        const uint64_t tx_work{GetSimplicityValidationMilliweight(*tx)};
-        if (simplicity_milliweight > std::numeric_limits<uint64_t>::max() - tx_work) {
-            LogPrintf("drivechain L1 block sync: candidate Simplicity work accounting overflow\n");
-            return false;
-        }
-        simplicity_milliweight += tx_work;
-    }
-    BmmWorkFeeQuote fee_quote;
-    if (!CalculateBmmWorkFeeQuote(
+    case 5:
+    block_template = CreateDrivechainBlockTemplate(node,parent_height,commitments,approving_parent_height);
+    return bool(block_template);
+    case 6:
+    sidechain_fees = -block_template->vTxFees[0];
+    return drivechain::haskell::BmmWorkTotal(false,block_template->block.vtx.size(),
+        [&](uint64_t index) { return GetSimplicityValidationMilliweight(*block_template->block.vtx.at(index)); },
+        simplicity_milliweight);
+    case 16:
+    return drivechain::haskell::BmmWorkQuoteDisplay(
             sidechain_fees,
             simplicity_milliweight,
-            gArgs.GetIntArg("-drivechainbmmworksatsperkwu", 1000),
-            gArgs.GetIntArg("-drivechainbmmproducerreserve", 0),
-            fee_quote) || fee_quote.bid <= 0) {
-        LogPrintf("drivechain L1 block sync: candidate fees cannot fund verification, reserve, and a positive BIP301 bid\n");
-        return false;
-    }
-    const int sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", 24);
-    if (sidechain_slot != drivechain::BMM_SIDECHAIN_SLOT) {
-        LogPrintf("drivechain L1 block sync: deterministic BMM consensus is fixed to sidechain slot 24\n");
-        return false;
-    }
-
-    if (!PrepareDrivechainBlock(*node.chainman, block_template->block)) {
-        return false;
-    }
-
-    if (!block_template->block.HasBmmProof()) {
-        LogPrintf("drivechain L1 block sync: refusing to produce a block outside the strict public-signet BMM branch\n");
-        return false;
-    }
-    const uint256 critical_hash = block_template->block.GetBmmCriticalHash();
-    if (!SubmitEcxDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, fee_quote.bid)) {
-        LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
-            side_height, parent_height);
-        return false;
-    }
+            gArgs.GetIntArg("-drivechainbmmworksatsperkwu", drivechain::DEFAULT_BMM_WORK_SATS_PER_KWU),
+            gArgs.GetIntArg("-drivechainbmmproducerreserve", drivechain::DEFAULT_BMM_PRODUCER_RESERVE),
+            fee_quote);
+    case 7:
+    sidechain_slot = gArgs.GetIntArg("-drivechainbmmslot", drivechain::BMM_SIDECHAIN_SLOT);
+    return drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::CONFIGURED_SLOT,
+        1, sidechain_slot, drivechain::BMM_SIDECHAIN_SLOT);
+    case 8: return PrepareDrivechainBlock(*node.chainman,block_template->block);
+    case 9: return block_template->block.HasBmmProof();
+    case 17:
+    critical_hash = block_template->block.GetBmmCriticalHash();
+    return true;
+    case 10: return SubmitEcxDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, bid);
+    case 18:
     LogPrintf("drivechain L1 block sync: work-priced candidate fees=%s verification=%s reserve=%s bid=%s simplicity_milliweight=%u\n",
-        FormatMoney(sidechain_fees), FormatMoney(fee_quote.verification_fee),
-        FormatMoney(fee_quote.producer_reserve), FormatMoney(fee_quote.bid),
+        FormatMoney(sidechain_fees), FormatMoney(verification_fee),
+        FormatMoney(producer_reserve), FormatMoney(bid),
         simplicity_milliweight);
-
-    drivechain::BmmProof bmm_proof;
-    if (!WaitForDrivechainBmmProof(
-            node,
-            bmm_state,
-            parent_height,
-            parent_hash,
-            critical_hash,
-            bmm_proof)) {
-        return false;
-    }
-    std::string proof_error;
-    if (!drivechain::AttachBmmProof(block_template->block, bmm_proof, proof_error)) {
-        LogPrintf("drivechain L1 block sync: failed to attach deterministic BMM proof: %s\n", proof_error);
-        return false;
-    }
-
-    const uint256 sidechain_block_hash = block_template->block.GetHash();
-    if (!AcceptPreparedDrivechainBlock(*node.chainman, block_template->block)) {
-        return false;
-    }
-
+    break;
+    case 11: return WaitForDrivechainBmmProof(node,bmm_state,parent_height,parent_hash,critical_hash,bmm_proof);
+    case 12: return drivechain::AttachBmmProof(block_template->block, bmm_proof, proof_error);
+    case 13:
+    sidechain_block_hash = block_template->block.GetHash();
+    return AcceptPreparedDrivechainBlock(*node.chainman,block_template->block);
+    case 14:
     LogPrintf("drivechain L1 block sync: accepted sidechain block %s (BMM critical hash %s) at height %d for L1 block %s at height %d, fees %s\n",
         sidechain_block_hash.ToString(), critical_hash.GetHex(), side_height, parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
+    break;
+    case 101: LogPrintf("drivechain L1 block sync: disabled outside an Elements parent-chain configuration\n"); break;
+    case 102: LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n"); break;
+    case 103: LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n"); break;
+    case 115: LogPrintf("drivechain L1 block sync: cannot obtain deterministic BMM state: %s\n", state_error); break;
+    case 104: LogPrintf("drivechain L1 block sync: parent successor height is outside the ECX committed range\n"); break;
+    case 106: LogPrintf("drivechain L1 block sync: candidate Simplicity work accounting overflow\n"); break;
+    case 116: LogPrintf("drivechain L1 block sync: candidate fees cannot fund verification, reserve, and a positive BIP301 bid\n"); break;
+    case 107: LogPrintf("drivechain L1 block sync: deterministic BMM consensus is fixed to sidechain slot 24\n"); break;
+    case 109: LogPrintf("drivechain L1 block sync: refusing to produce a block outside the strict public-signet BMM branch\n"); break;
+    case 110:
+        LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
+            side_height, parent_height);
+        break;
+    case 112: LogPrintf("drivechain L1 block sync: failed to attach deterministic BMM proof: %s\n", proof_error); break;
+    default: throw std::logic_error("Invalid Haskell ECX production stage");
+    }
     return true;
+    });
 }
 
 static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
-    // The existing Alpha chain uses its native withdrawal-checkpoint critical
-    // hash. Never substitute the private ECX header-proof encoding for it.
-    if (Params().GetConsensus().drivechain_slot.has_value()) {
-        return MineNativeBlockForParentBlock(node, parent_height, parent_hash);
-    }
-    return MineEcxBlockForParentBlock(node, parent_height, parent_hash);
+    namespace hs = drivechain::haskell;
+    // Configured slots use the native withdrawal-checkpoint critical hash,
+    // never the private ECX header-proof encoding.
+    return hs::ParentReplayStore(hs::ReplayStoreFlow::PRODUCTION_ROUTING,[&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return Params().GetConsensus().drivechain_slot.has_value();
+        case 2: return MineNativeBlockForParentBlock(node, parent_height, parent_hash);
+        case 3: return MineEcxBlockForParentBlock(node, parent_height, parent_hash);
+        default: throw std::logic_error("Invalid Haskell production routing action");
+        }
+    });
 }
 
 static void DrivechainL1BlockSyncTick(NodeContext& node)
 {
-    if (ShutdownRequested(node) ||
-        !Params().GetConsensus().elements_mode ||
-        !Params().GetConsensus().has_parent_chain ||
-        !gArgs.GetBoolArg("-drivechainl1blocksync", true)) {
-        return;
-    }
-    if (!Params().GetConsensus().drivechain_slot.has_value()) {
-        return;
-    }
+    namespace hs = drivechain::haskell;
+    if (!hs::ParentReplayStore(hs::ReplayStoreFlow::SYNC_PREFLIGHT, [&](uint32_t stage) -> uint32_t {
+        switch (stage) {
+        case 1: return !ShutdownRequested(node);
+        case 2: return Params().GetConsensus().elements_mode;
+        case 3: return Params().GetConsensus().has_parent_chain;
+        case 4: return gArgs.GetBoolArg("-drivechainl1blocksync", true);
+        case 5: return Params().GetConsensus().drivechain_slot.has_value();
+        default: throw std::logic_error("invalid sync preflight action");
+        }
+    })) return;
 
     try {
-        const int64_t parent_height = GetMainchainBlockHeight();
+        int64_t parent_height = 0;
         int side_height = 0;
-        {
+        drivechain::haskell::BmmSyncTick([&](uint32_t stage) {
+        switch (stage) {
+        case 1:
+            parent_height = GetMainchainBlockHeight();
+            return true;
+        case 2: {
             LOCK(cs_main);
             side_height = node.chainman ? node.chainman->ActiveChain().Height() : 0;
+            return true;
         }
-
-        if (side_height < parent_height) {
+        case 3:
+            return drivechain::haskell::ChildBehind(side_height, parent_height);
+        case 4: {
             const uint256 parent_hash = GetMainchainBlockHash(parent_height);
-            if (MineOneBlockForParentBlock(node, parent_height, parent_hash)) {
-                LogPrintf("drivechain L1 block sync: accepted BMM-confirmed sidechain block for current parent height %d; previous sidechain height %d\n",
-                    parent_height, side_height);
-            }
+            return MineOneBlockForParentBlock(node, parent_height, parent_hash);
         }
+        case 5:
+            LogPrintf("drivechain L1 block sync: accepted BMM-confirmed sidechain block for current parent height %d; previous sidechain height %d\n",
+                parent_height, side_height);
+            return true;
+        default: throw std::logic_error("Invalid Haskell BMM sync stage");
+        }
+        });
     } catch (const std::exception& e) {
         LogPrintf("drivechain L1 block sync: tick failed: %s\n", e.what());
     }
@@ -1230,10 +1164,15 @@ static void DrivechainL1BlockSyncTick(NodeContext& node)
 
 static void ThreadDrivechainL1BlockSync(NodeContext& node, const std::chrono::seconds interval)
 {
-    while (!ShutdownRequested(node)) {
-        DrivechainL1BlockSyncTick(node);
-        if (!g_drivechain_l1_block_sync_interrupt.sleep_for(interval)) break;
-    }
+    namespace hs = drivechain::haskell;
+    hs::ParentReplayStore(hs::ReplayStoreFlow::SYNC_LOOP, [&](uint32_t stage) -> uint32_t {
+        switch (stage) {
+        case 1: return !ShutdownRequested(node);
+        case 2: DrivechainL1BlockSyncTick(node); return 1;
+        case 3: return g_drivechain_l1_block_sync_interrupt.sleep_for(interval);
+        default: throw std::logic_error("invalid sync loop action");
+        }
+    });
 }
 
 static void StartDrivechainL1BlockSyncThread(NodeContext& node, const int64_t interval_seconds)
@@ -1273,36 +1212,31 @@ static void StopDrivechainL1BlockSyncThread()
 static void PeriodicChainstateReverification(ChainstateManager& chainman,
                                              const bool native_drivechain)
 {
-    if (native_drivechain) {
-        // Replay/authenticate new parent blocks before taking cs_main in
-        // ActivateBestChain. Locked consensus paths only consume a tiny fixed
-        // catch-up allowance and never wait for this warmer's cache mutex.
-        std::string warm_error;
-        if (!WarmDrivechainParentState(&warm_error)) {
+    std::string warm_error, mempool_error;
+    uint64_t replay_epoch{0};
+    BlockValidationState state;
+    namespace hs = drivechain::haskell;
+    hs::ParentReplayStore(hs::ReplayStoreFlow::PERIODIC_REVERIFICATION, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return native_drivechain;
+        // Warm parent data outside cs_main before locked anchor reconciliation.
+        case 2: return WarmDrivechainParentState(&warm_error);
+        case 3:
             LogPrintf("Failed to warm authenticated drivechain parent state; locked validation remains fail-closed (%s)\n",
                       warm_error);
-        } else {
-            const uint64_t replay_epoch =
-                GetDrivechainParentReplayEpoch();
-            if (!chainman.ActiveChainstate()
-                     .IsDrivechainMempoolCurrentForMining()) {
-                std::string mempool_error;
-                if (!chainman.ActiveChainstate()
-                         .RevalidateDrivechainMempoolForParentEpoch(
-                             replay_epoch, &mempool_error)) {
-                    LogPrintf(
-                        "Native drivechain peg-ins remain fenced from mining while mempool revalidation waits: %s\n",
-                        mempool_error);
-                }
-            }
+            return 1;
+        case 4: replay_epoch = GetDrivechainParentReplayEpoch(); return 1;
+        case 5: return chainman.ActiveChainstate().IsDrivechainMempoolCurrentForMining();
+        case 6: return chainman.ActiveChainstate().RevalidateDrivechainMempoolForParentEpoch(replay_epoch, &mempool_error);
+        case 7:
+            LogPrintf("Native drivechain peg-ins remain fenced from mining while mempool revalidation waits: %s\n", mempool_error);
+            return 1;
+        default: throw std::logic_error("invalid periodic reverification action");
         }
-    }
-
-    BlockValidationState state;
+    });
     if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
         LogPrintf("Failed to periodically %s (%s)\n",
-                  native_drivechain ? "reconcile drivechain anchors" : "activate best chain",
-                  state.ToString());
+                  native_drivechain ? "reconcile drivechain anchors" : "activate best chain", state.ToString());
     }
 }
 
@@ -1939,15 +1873,14 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the funded local enforcer wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmreplacementextra=<sats>", "Maximum additional satoshis above the selected BMM bid for up to two replacement retries after Core fee-deficit rejections (default: 0, disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", "Authenticated TLS enforcer endpoint for native BIP301 submission (default: 127.0.0.1:55051). Enforcer responses are not consensus evidence.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", strprintf("Authenticated TLS enforcer endpoint for native BIP301 submission (default: %s). Enforcer responses are not consensus evidence.", DEFAULT_DRIVECHAIN_GRPC_ENDPOINT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Deprecated compatibility assertion; if supplied, must exactly match -drivechainbmmgrpcaddr. Withdrawals and BMM bids use the same authenticated enforcer endpoint.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcurl=<path>", "Required absolute path to an owner-only executable grpcurl for authenticated enforcer reads and submissions. No PATH search. Install in an owner-controlled directory.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainpegoutmainfeesats=<sats>", "Positive L1 fee for historical ECX withdrawals only (default: 10000). Must be less than the withdrawal amount; native withdrawals use their RPC fee parameter.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainpegoutmainfeesats=<sats>", strprintf("Positive L1 fee for historical ECX withdrawals only (default: %d). Must be less than the withdrawal amount; native withdrawals use their RPC fee parameter.", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainrewardaddress=<address>", "Unconfidential P2PKH/P2WPKH address owned by a loaded private-key-enabled Elements wallet, paid the automatic BMM candidate's fees and subsidy. Required for automatic bidding; absent, invalid, or unowned addresses pause bidding without stopping the node. No anyone-can-spend fallback. This does not refund the mainchain bid.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmwalletaddr=<host:port>", "Deprecated compatibility assertion; must exactly match -drivechainbmmgrpcaddr. All enforcer calls require mTLS.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmconnectauthcookie=<file>", "Unsupported legacy transport option. Remove and configure enforcer mTLS credentials instead.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmworksatsperkwu=<amount>", "Verification price in policy-asset satoshis per 1,000 units of deterministic Simplicity validation weight. (default: 1000)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmproducerreserve=<amount>", "Policy-asset satoshis retained by the candidate producer after verification cost and before funding its BIP301 bid. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmworksatsperkwu=<amount>", strprintf("Verification price in policy-asset satoshis per 1,000 units of deterministic Simplicity validation weight. (default: %d)", drivechain::DEFAULT_BMM_WORK_SATS_PER_KWU), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmproducerreserve=<amount>", strprintf("Policy-asset satoshis retained by the candidate producer after verification cost and before funding its BIP301 bid. (default: %d)", drivechain::DEFAULT_BMM_PRODUCER_RESERVE), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainsidechainnetwork=<name>", "Sidechain network required for authenticated drivechain deposits. (default: liquid-signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainnetwork=<name>", "Mainchain network required for authenticated drivechain deposits. (default: signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainmainchainsignetchallenge=<hex>", "Signet challenge required for authenticated drivechain deposits. (default: LayerTwoLabs public signet)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -1955,9 +1888,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-drivechainsidechaintitle=<title>", "Activated sidechain title required for authenticated drivechain deposits. (default: Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainsidechainhashid1=<hex>", "Activated sidechain hashId1 required for authenticated drivechain deposits. (default: LayerTwoLabs slot-24 Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainsidechainhashid2=<hex>", "Activated sidechain hashId2 required for authenticated drivechain deposits. (default: LayerTwoLabs slot-24 Elements)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcca=<file>", "Enforcer TLS CA certificate; relative to the network data directory (default: enforcer-tls/ca.pem).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpccert=<file>", "Enforcer mTLS client certificate (default: enforcer-tls/elements-client.pem).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpckey=<file>", "Owner-only enforcer mTLS client private key (default: enforcer-tls/elements-client-key.pem).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcca=<file>", strprintf("Enforcer TLS CA certificate; relative to the network data directory (default: %s).", drivechain::GRPC_CA_FILE), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpccert=<file>", strprintf("Enforcer mTLS client certificate (default: %s).", drivechain::GRPC_CLIENT_CERT_FILE), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpckey=<file>", strprintf("Owner-only enforcer mTLS client private key (default: %s).", drivechain::GRPC_CLIENT_KEY_FILE), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmgrpcauthority=<name>", "Optional expected TLS server name; certificate verification is never disabled.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-peginconfirmationdepth=<n>", strprintf("Peg-in claims must be this deep to be considered valid. (default: %d)", DEFAULT_PEGIN_CONFIRMATION_DEPTH), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-parentpubkeyprefix", strprintf("The byte prefix, in decimal, of the parent chain's base58 pubkey address. (default: %d)", 111), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
@@ -2160,19 +2093,21 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
     // parameter sets remain available to unit tests, but are never production
     // startup identities for this binary.
 #ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
-    if (args.GetChainName() != CBaseChainParams::ELEMENTS) {
-        return InitError(Untranslated(
-            "This binary only supports the canonical -chain=elements production network"));
-    }
     std::string identity_error;
-    if (!IsCanonicalElementsProductionIdentity(
-            Params(), BaseParams(), &identity_error)) {
-        return InitError(Untranslated(strprintf(
-            "Refusing to start with a noncanonical Elements production identity: %s", identity_error)));
-    }
-    if (!CheckCanonicalUsddSp1VerifierStartupIdentity(&identity_error)) {
-        return InitError(Untranslated(strprintf(
-            "Refusing to start with an incompatible USDD SP1 verifier: %s", identity_error)));
+    const char* reason = "This binary only supports the canonical -chain=elements production network";
+    if (!drivechain::haskell::ParentReplayAll<3>({
+        [&] { return drivechain::haskell::NetworkSelectionStatus(
+            drivechain::haskell::NetworkSelection::PRODUCTION, args.GetChainName()) == 0; },
+        [&] {
+            reason = "Refusing to start with a noncanonical Elements production identity: ";
+            return IsCanonicalElementsProductionIdentity(Params(), BaseParams(), &identity_error);
+        },
+        [&] {
+            reason = "Refusing to start with an incompatible USDD SP1 verifier: ";
+            return CheckCanonicalUsddSp1VerifierStartupIdentity(&identity_error);
+        },
+    })) {
+        return InitError(Untranslated(strprintf("%s%s", reason, identity_error)));
     }
 #endif
 #ifdef _MSC_VER
@@ -2212,27 +2147,24 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
 bool IsMainchainRPCHostAllowed(const std::string& host,
                                const bool native_drivechain)
 {
-    if (!native_drivechain) return true;
-    const auto numeric_address = LookupHost(host, /*fAllowLookup=*/false);
-    if (!numeric_address) return false;
-
     // Consensus authentication uses HTTP Basic credentials. Until the parent
     // connection supports an authenticated local transport (for example a
     // Unix-domain socket), do not permit even numeric LAN addresses: a network
     // attacker could substitute a fork view while learning the credentials.
-    if (numeric_address->IsIPv4()) {
-        // GetAddrBytes() uses the 16-byte addr-v1 serialization for IPv4, so
-        // inspect the canonical 32-bit IPv4 value instead of its wire form.
-        return (numeric_address->GetLinkedIPv4() >> 24) == 127;
-    }
-    if (numeric_address->IsIPv6()) {
-        const std::vector<unsigned char> bytes = numeric_address->GetAddrBytes();
-        static constexpr std::array<unsigned char, ADDR_IPV6_SIZE> IPV6_LOOPBACK{
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-        return bytes.size() == IPV6_LOOPBACK.size() &&
-               std::equal(bytes.begin(), bytes.end(), IPV6_LOOPBACK.begin());
-    }
-    return false;
+    std::optional<CNetAddr> numeric_address;
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_RPC_HOST,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return native_drivechain;
+        case 2: numeric_address = LookupHost(host, /*fAllowLookup=*/false); return numeric_address.has_value();
+        case 3: return numeric_address->IsIPv4();
+        // IPv4 GetAddrBytes() is the 16-byte addr-v1 serialization, not its canonical value.
+        case 4: return drivechain::haskell::ParentRpcAddress(4, numeric_address->GetLinkedIPv4());
+        case 5: return numeric_address->IsIPv6();
+        case 6: return drivechain::haskell::ParentRpcAddress(6, 0, numeric_address->GetAddrBytes());
+        default: throw std::logic_error("invalid parent RPC host action");
+        }
+    });
 }
 
 bool AppInitParameterInteraction(ArgsManager& args)
@@ -2242,104 +2174,73 @@ bool AppInitParameterInteraction(ArgsManager& args)
 
     // also see: InitParameterInteraction()
 
-    if (args.IsArgSet("-drivechainrewardaddress") &&
-        (!chainparams.GetConsensus().elements_mode ||
-         !chainparams.GetConsensus().has_parent_chain)) {
-        return InitError(Untranslated("-drivechainrewardaddress may only be used in an Elements parent-chain configuration"));
-    }
-
-    // Error if network-specific options (-addnode, -connect, etc) are
-    // specified in default section of config file, but not overridden
-    // on the command line or in this chain's section of the config file.
-    ChainTypeMeta chain = args.GetChainTypeMeta(); // ELEMENTS
-    if (chain.chain_type == ChainType::SIGNET) {
-        LogPrintf("Signet derived magic (message start): %s\n", HexStr(chainparams.MessageStart()));
-    }
     const auto& drivechain_slot = chainparams.GetConsensus().drivechain_slot;
-    if (drivechain_slot.has_value()) {
-        std::string rpc_security_error;
-        if (!ValidateNativeDrivechainRpcServerConfig(args, &rpc_security_error)) {
-            return InitError(Untranslated(rpc_security_error));
+    std::optional<ChainTypeMeta> selected_chain;
+    CAmount configured_bid{0}, selected_bid{0};
+    int64_t replacement_extra{0};
+    int parent_rpc_timeout{0};
+    std::string startup_error, credential;
+    // Synchronous parent checks may hold cs_main. Bound requests tightly and
+    // forbid DNS/LAN endpoints, whose lookup/authentication escapes that bound.
+    static constexpr int MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT{2};
+    if (!drivechain::haskell::StartupArgs(drivechain_slot ? uint32_t{*drivechain_slot} : 256U,
+        MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT, [&](uint32_t step) -> uint64_t {
+        switch (step) {
+        case 1: return args.IsArgSet("-drivechainrewardaddress");
+        case 2: return chainparams.GetConsensus().elements_mode;
+        case 3: return chainparams.GetConsensus().has_parent_chain;
+        case 4:
+            selected_chain = args.GetChainTypeMeta();
+            if (selected_chain->chain_type == ChainType::SIGNET) {
+                LogPrintf("Signet derived magic (message start): %s\n", HexStr(chainparams.MessageStart()));
+            }
+            return 1;
+        case 5: return selected_chain.value().chain_type == ChainType::SIGNET;
+        case 7: return ValidateNativeDrivechainRpcServerConfig(args, &startup_error);
+        case 8: return args.IsArgSet("-mainchainrpcuser");
+        case 9: return args.IsArgSet("-mainchainrpcpassword");
+        case 10: return args.GetIntArg("-drivechainbmmslot", drivechain_slot.value());
+        case 11: return GetConfiguredDrivechainBmmBid(args, configured_bid, &startup_error);
+        case 12: return ComputeDrivechainBmmBid(configured_bid, 0, selected_bid, &startup_error);
+        case 13: return ParseInt64(args.GetArg("-drivechainbmmreplacementextra", "0"), &replacement_extra);
+        case 14: return replacement_extra;
+        case 15:
+            // Retain the existing native-int conversion before range admission.
+            parent_rpc_timeout = args.GetIntArg("-mainchainrpctimeout", MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT);
+            return parent_rpc_timeout;
+        case 16:
+            // Publish the short default before later checks, as the native path did.
+            args.ForceSetArg("-mainchainrpctimeout", ToString(parent_rpc_timeout)); return 1;
+        case 17: return IsMainchainRPCHostAllowed(args.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT), true);
+        case 18: return args.IsArgSet("-drivechainbmmslot");
+        case 19: return args.IsArgSet("-drivechainbmmbid");
+        case 20: return args.IsArgSet("-parentgenesisblockhash");
+        case 21: return args.GetArg("-parentgenesisblockhash", "") == chainparams.ParentGenesisBlockHash().GetHex();
+        case 22: return args.IsArgSet("-mainchainrpccredentialfile");
+        case 23: return args.IsArgSet("-mainchainrpccookiefile");
+        case 24: return ReadMainchainRpcCredentialFile(fs::PathFromString(args.GetArg("-mainchainrpccredentialfile", "")), credential, &startup_error);
+        case 101: startup_error = "-drivechainrewardaddress may only be used in an Elements parent-chain configuration"; break;
+        case 102: break;
+        case 103: startup_error = "Native parent RPC credentials must be supplied through a private cookie or explicit credential file, not command-line/config credentials"; break;
+        case 104: startup_error = strprintf("-drivechainbmmslot is immutable for this chain and must be %d", drivechain_slot.value()); break;
+        case 105: startup_error = strprintf("Invalid -drivechainbmmbid: %s", startup_error); break;
+        case 106: startup_error = "Invalid -drivechainbmmreplacementextra: expected nonnegative satoshis within money range"; break;
+        case 107: startup_error = strprintf("-mainchainrpctimeout must be between 1 and %d seconds on a native drivechain network", MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT); break;
+        case 108: startup_error = "-mainchainrpchost must be an IPv4 127/8 or IPv6 ::1 loopback address on a native drivechain network"; break;
+        case 109: startup_error = "-drivechainbmmslot may only be used on a native drivechain network"; break;
+        case 110: startup_error = "-drivechainbmmbid may only be used on a native drivechain network"; break;
+        case 111: startup_error = "-parentgenesisblockhash cannot override the Signet chainparams identity"; break;
+        case 112: startup_error = "-mainchainrpccredentialfile is mutually exclusive with cookie and inline credential options"; break;
+        case 113: startup_error = "Static parent RPC credential files require a numeric-loopback endpoint"; break;
+        case 114: break;
+        default: throw std::runtime_error("Unknown Haskell startup action");
         }
-        if (args.IsArgSet("-mainchainrpcuser") || args.IsArgSet("-mainchainrpcpassword")) {
-            return InitError(Untranslated("Native parent RPC credentials must be supplied through a private cookie or explicit credential file, not command-line/config credentials"));
-        }
-        if (args.GetIntArg("-drivechainbmmslot", *drivechain_slot) != *drivechain_slot) {
-            return InitError(Untranslated(strprintf("-drivechainbmmslot is immutable for this chain and must be %d",
-                                       *drivechain_slot)));
-        }
-        CAmount configured_bid{0};
-        CAmount selected_bid{0};
-        std::string bid_error;
-        if (!GetConfiguredDrivechainBmmBid(
-                args, configured_bid, &bid_error) ||
-            !ComputeDrivechainBmmBid(
-                configured_bid,
-                /*sidechain_fees=*/0, selected_bid, &bid_error)) {
-            return InitError(Untranslated(strprintf(
-                "Invalid -drivechainbmmbid: %s", bid_error)));
-        }
+        InitError(Untranslated(startup_error));
+        return 1;
+    })) return false;
+    const auto& chain = selected_chain.value();
 
-        int64_t replacement_extra{0};
-        if (!ParseInt64(args.GetArg("-drivechainbmmreplacementextra", "0"), &replacement_extra) || !MoneyRange(replacement_extra)) {
-            return InitError(Untranslated("Invalid -drivechainbmmreplacementextra: expected nonnegative satoshis within money range"));
-        }
-
-        // Parent-chain validity checks are synchronous and some callers hold
-        // cs_main (and, during activation/mempool work, the mempool lock).
-        // A stalled local RPC must fail closed quickly instead of freezing all
-        // sidechain consensus and networking work for the ordinary 15-minute
-        // client default. Multiple authenticated reads can occur per proof, so
-        // keep the per-request bound deliberately small.
-        static constexpr int MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT{2};
-        const int parent_rpc_timeout = args.GetIntArg(
-            "-mainchainrpctimeout", MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT);
-        if (parent_rpc_timeout < 1 || parent_rpc_timeout > MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT) {
-            return InitError(Untranslated(strprintf(
-                "-mainchainrpctimeout must be between 1 and %d seconds on a native drivechain network",
-                MAX_DRIVECHAIN_PARENT_RPC_TIMEOUT)));
-        }
-        // Materialize the drivechain-specific default because the low-level
-        // RPC client otherwise falls back to its ordinary-network default.
-        args.ForceSetArg("-mainchainrpctimeout", ToString(parent_rpc_timeout));
-
-        // libevent's connection timeout starts after its synchronous hostname
-        // lookup. Consensus paths may hold cs_main while contacting the
-        // operator's parent node, so accepting a DNS name would leave that
-        // lookup outside the hard validation deadline. Require a numeric
-        // loopback address. HTTP Basic authentication over a LAN is not an
-        // authenticated consensus transport and is therefore forbidden.
-        const std::string parent_rpc_host =
-            args.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT);
-        if (!IsMainchainRPCHostAllowed(parent_rpc_host,
-                                       /*native_drivechain=*/true)) {
-            return InitError(Untranslated(
-                "-mainchainrpchost must be an IPv4 127/8 or IPv6 ::1 loopback address on a native drivechain network"));
-        }
-    } else {
-        if (args.IsArgSet("-drivechainbmmslot")) {
-            return InitError(Untranslated("-drivechainbmmslot may only be used on a native drivechain network"));
-        }
-        if (args.IsArgSet("-drivechainbmmbid")) {
-            return InitError(Untranslated("-drivechainbmmbid may only be used on a native drivechain network"));
-        }
-    }
-    if (chain.chain_type == ChainType::SIGNET && args.IsArgSet("-parentgenesisblockhash") &&
-        args.GetArg("-parentgenesisblockhash", "") != chainparams.ParentGenesisBlockHash().GetHex()) {
-        return InitError(Untranslated("-parentgenesisblockhash cannot override the Signet chainparams identity"));
-    }
-    if (args.IsArgSet("-mainchainrpccredentialfile")) {
-        if (args.IsArgSet("-mainchainrpccookiefile") || args.IsArgSet("-mainchainrpcuser") || args.IsArgSet("-mainchainrpcpassword")) {
-            return InitError(Untranslated("-mainchainrpccredentialfile is mutually exclusive with cookie and inline credential options"));
-        }
-        if (!IsMainchainRPCHostAllowed(args.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT), true)) {
-            return InitError(Untranslated("Static parent RPC credential files require a numeric-loopback endpoint"));
-        }
-        std::string credential, credential_error;
-        if (!ReadMainchainRpcCredentialFile(fs::PathFromString(args.GetArg("-mainchainrpccredentialfile", "")), credential, &credential_error)) {
-            return InitError(Untranslated(credential_error));
-        }
-    }
+    // Reject network-specific options in the default config section unless overridden.
     bilingual_str errors;
     for (const auto& arg : args.GetUnsuitableSectionOnlyArgs()) {
         errors += strprintf(_("Config setting for %s only applied on %s network when in [%s] section."), arg, chain.chain_name, chain.chain_name) + Untranslated("\n");
@@ -2738,6 +2639,52 @@ bool CheckHostPortOptions(const ArgsManager& args) {
     return true;
 }
 
+static std::optional<bilingual_str> AuthenticateStartupParent(
+    drivechain::haskell::ReplayStoreFlow stage, bool enabled, ChainstateManager* chainman = nullptr)
+{
+    namespace hs = drivechain::haskell;
+    std::string warm_error, mempool_error;
+    uint64_t replay_epoch{0};
+    BlockValidationState state;
+    const char* chain_error = "ERROR: cannot reconcile the child chain with the authenticated parent state: ";
+    const auto chainstate = [&]() -> Chainstate& {
+        if (!chainman) throw std::logic_error("startup parent action requires chainstate");
+        return chainman->ActiveChainstate();
+    };
+    const auto failure = hs::ParentReplayStore(stage, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return WarmDrivechainParentState(&warm_error);
+        case 2: replay_epoch = GetDrivechainParentReplayEpoch(); return replay_epoch != 0;
+        case 3: return chainstate().RevalidateDrivechainMempoolForParentEpoch(replay_epoch, &mempool_error);
+        case 4:
+            LogPrintf("Native drivechain peg-ins remain fenced from mining after startup mempool revalidation: %s\n", mempool_error);
+            return 1;
+        case 5: return chainstate().ReconcileDrivechainAnchorsForStartup(state);
+        case 6:
+            chain_error = "ERROR: cannot activate the child chain after parent-state reconciliation: ";
+            return chainstate().ActivateBestChain(state);
+        case 7: return enabled;
+        case 8: uiInterface.InitMessage(_("Authenticating drivechain parent state")); return 1;
+        default: throw std::logic_error("invalid startup parent action");
+        }
+    });
+    if (!failure) return std::nullopt;
+    if (stage == hs::ReplayStoreFlow::STARTUP_PARENT_LOAD) {
+        return Untranslated(strprintf("Cannot authenticate drivechain parent state before loading the child chain: %s",
+            warm_error.empty() ? "no authenticated replay generation" : warm_error));
+    }
+    if (stage == hs::ReplayStoreFlow::STARTUP_PARENT_VERIFY) {
+        return Untranslated(strprintf("%s%s", failure == 1 ?
+            "Cannot authenticate drivechain parent state before verification: " :
+            "Cannot reconcile drivechain anchors before verification: ",
+            failure == 1 ? warm_error : state.ToString()));
+    }
+    if (failure == 1) return Untranslated(strprintf(
+        "ERROR: cannot authenticate the configured drivechain parent state: %s", warm_error));
+    if (failure == 2) return Untranslated("ERROR: authenticated drivechain parent replay did not publish a generation");
+    return Untranslated(strprintf("%s%s", chain_error, state.ToString()));
+}
+
 // A GUI user may opt to retry once with do_reindex set if there is a failure during chainstate initialization.
 // The function therefore has to support re-entry.
 static ChainstateLoadResult InitAndLoadChainstate(
@@ -2751,15 +2698,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
 
     // Parent outages must not be mistaken for child database corruption. Do
     // this before opening the databases, including on every reindex retry.
-    if (chainparams.GetConsensus().drivechain_slot.has_value()) {
-        uiInterface.InitMessage(_("Authenticating drivechain parent state"));
-        std::string error;
-        if (!WarmDrivechainParentState(&error) ||
-            GetDrivechainParentReplayEpoch() == 0) {
-            return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated(strprintf(
-                "Cannot authenticate drivechain parent state before loading the child chain: %s",
-                error.empty() ? "no authenticated replay generation" : error))};
-        }
+    if (const auto error = AuthenticateStartupParent(drivechain::haskell::ReplayStoreFlow::STARTUP_PARENT_LOAD,
+            chainparams.GetConsensus().drivechain_slot.has_value())) {
+        return {ChainstateLoadStatus::FAILURE_FATAL, *error};
     }
 
     CTxMemPool::Options mempool_opts{
@@ -2855,19 +2796,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
     if (status == node::ChainstateLoadStatus::SUCCESS) {
         // Parent reorgs can occur while loading. Reconcile anchors before
         // VerifyDB reconnects blocks under consensus locks.
-        if (chainparams.GetConsensus().drivechain_slot.has_value()) {
-            std::string parent_error;
-            if (!WarmDrivechainParentState(&parent_error)) {
-                return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated(strprintf(
-                    "Cannot authenticate drivechain parent state before verification: %s",
-                    parent_error))};
-            }
-            BlockValidationState anchor_state;
-            if (!chainman.ActiveChainstate().ReconcileDrivechainAnchorsForStartup(anchor_state)) {
-                return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated(strprintf(
-                    "Cannot reconcile drivechain anchors before verification: %s",
-                    anchor_state.ToString()))};
-            }
+        if (const auto parent_error = AuthenticateStartupParent(drivechain::haskell::ReplayStoreFlow::STARTUP_PARENT_VERIFY,
+                chainparams.GetConsensus().drivechain_slot.has_value(), &chainman)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL, *parent_error};
         }
         uiInterface.InitMessage(_("Verifying blocks…"));
         if (chainman.m_blockman.m_have_pruned && options.check_blocks > MIN_BLOCKS_TO_KEEP) {
@@ -3659,49 +3590,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     connOptions.m_i2p_accept_incoming = args.GetBoolArg("-i2pacceptincoming", DEFAULT_I2P_ACCEPT_INCOMING);
 
-    if (native_drivechain) {
-        // Native BIP300/BIP301 validity is mandatory even when legacy
-        // -validatepegin is disabled. Authenticate the parent replay cache and
-        // reconcile persisted anchors before P2P can deliver work and before
-        // RPC warmup exposes a child-chain tip to callers.
-        uiInterface.InitMessage(
-            _("Authenticating drivechain parent state"));
-        std::string warm_error;
-        if (!WarmDrivechainParentState(&warm_error)) {
-            return InitError(Untranslated(strprintf(
-                "ERROR: cannot authenticate the configured drivechain parent state: %s",
-                warm_error)));
-        }
-
-        const uint64_t replay_epoch = GetDrivechainParentReplayEpoch();
-        if (replay_epoch == 0) {
-            return InitError(Untranslated(
-                "ERROR: authenticated drivechain parent replay did not publish a generation"));
-        }
-        std::string mempool_error;
-        if (!chainman.ActiveChainstate()
-                 .RevalidateDrivechainMempoolForParentEpoch(
-                     replay_epoch, &mempool_error)) {
-            // Preserve potentially valid entries on temporary parent
-            // unavailability. Their mismatched epoch prevents every block
-            // template from selecting them until a later successful sweep.
-            LogPrintf(
-                "Native drivechain peg-ins remain fenced from mining after startup mempool revalidation: %s\n",
-                mempool_error);
-        }
-
-        BlockValidationState activation_state;
-        if (!chainman.ActiveChainstate().ReconcileDrivechainAnchorsForStartup(
-                activation_state)) {
-            return InitError(Untranslated(strprintf(
-                "ERROR: cannot reconcile the child chain with the authenticated parent state: %s",
-                activation_state.ToString())));
-        }
-        if (!chainman.ActiveChainstate().ActivateBestChain(activation_state)) {
-            return InitError(Untranslated(strprintf(
-                "ERROR: cannot activate the child chain after parent-state reconciliation: %s",
-                activation_state.ToString())));
-        }
+    // Native parent authentication remains mandatory before P2P/RPC exposure,
+    // independently of the legacy -validatepegin setting.
+    if (const auto error = AuthenticateStartupParent(drivechain::haskell::ReplayStoreFlow::STARTUP_PARENT,
+            native_drivechain, &chainman)) {
+        return InitError(*error);
     }
 
     if (!node.connman->Start(scheduler, connOptions)) {
@@ -3728,7 +3621,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     // has a parent. A stray -validatepegin on a Bitcoin-mode chain must not
     // turn an external RPC response into a startup dependency.
     const Consensus::Params& consensus = Params().GetConsensus();
-    if (consensus.elements_mode && consensus.has_parent_chain &&
+    const bool elements_parent = drivechain::haskell::ParentReplayAll<2>({[&] { return consensus.elements_mode; },
+        [&] { return consensus.has_parent_chain; }});
+    if (elements_parent &&
         gArgs.GetBoolArg("-validatepegin", consensus.has_parent_chain)) {
         uiInterface.InitMessage(_("Awaiting mainchain RPC warmup"));
         if (!MainchainRPCCheck()) {
@@ -3784,18 +3679,22 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         client->start(scheduler);
     }
 
-    if (chainparams.GetConsensus().elements_mode &&
-        chainparams.GetConsensus().has_parent_chain) {
-        LOCK(cs_main);
-        const CBlockIndex* tip = node.chainman->ActiveChain().Tip();
-        const uint256 bundle_hash =
-            tip == nullptr ? uint256::ZERO : tip->hashWithdrawalBundle;
-        node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash);
-        LogPrintf(
-            "Restored drivechain withdrawal bundle state from sidechain tip: %s\n",
-            bundle_hash.GetHex());
-    } else {
-        node::RestoreCurrentDrivechainWithdrawalBundleHash(uint256::ZERO);
+    {
+        std::optional<UniqueLock<RecursiveMutex>> lock;
+        const CBlockIndex* tip{nullptr};
+        uint256 bundle_hash;
+        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::STARTUP_BUNDLE,
+            [&](uint32_t step) -> uint32_t {
+                switch (step) {
+                case 1: return elements_parent;
+                case 2: lock.emplace(cs_main,"cs_main",__FILE__,__LINE__); tip = node.chainman->ActiveChain().Tip(); return tip != nullptr;
+                case 3: bundle_hash = Assert(tip)->hashWithdrawalBundle; break;
+                case 4: case 6: node::RestoreCurrentDrivechainWithdrawalBundleHash(bundle_hash); break;
+                case 5: LogPrintf("Restored drivechain withdrawal bundle state from sidechain tip: %s\n", bundle_hash.GetHex()); break;
+                default: throw std::logic_error("invalid startup bundle action");
+                }
+                return 1;
+            });
     }
 
     BanMan* banman = node.banman.get();
@@ -3803,9 +3702,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         banman->DumpBanlist();
     }, DUMP_BANS_INTERVAL);
 
-    if (Params().GetConsensus().drivechain_slot.has_value() &&
-        args.GetBoolArg("-drivechainl1blocksync", true)) {
-        const int64_t interval_seconds = std::max<int64_t>(1, args.GetIntArg("-drivechainl1blocksyncinterval", 10));
+    if (drivechain::haskell::ParentReplayAll<2>({[&] { return Params().GetConsensus().drivechain_slot.has_value(); },
+        [&] { return args.GetBoolArg("-drivechainl1blocksync", true); }})) {
+        const int64_t interval_seconds = drivechain::haskell::BoundedWait(args.GetIntArg("-drivechainl1blocksyncinterval", 10),INT64_MAX);
         LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, mined BIP301 BMM enforcement, sidechain slot %d\n",
             interval_seconds,
             *Params().GetConsensus().drivechain_slot);

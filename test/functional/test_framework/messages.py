@@ -1154,7 +1154,7 @@ HEADER_DYNAFED_HF_MASK = 0x7fffffff
 class CBlockHeader:
     __slots__ = ("hash", "hashMerkleRoot", "hashPrevBlock", "nBits", "nNonce",
                  "nTime", "nVersion", "sha256", "block_height", "proof", "m_dynafed_params",
-                 "m_signblock_witness")
+                 "m_signblock_witness", "utreexo_leaves", "utreexo_roots")
 
     def __init__(self, header=None):
         if header is None:
@@ -1170,6 +1170,8 @@ class CBlockHeader:
             self.hash = header.hash
             self.m_dynafed_params = header.m_dynafed_params
             self.m_signblock_witness = header.m_signblock_witness
+            self.utreexo_leaves = header.utreexo_leaves
+            self.utreexo_roots = list(header.utreexo_roots)
             self.calc_sha256()
 
     def set_null(self):
@@ -1181,6 +1183,8 @@ class CBlockHeader:
         self.proof = CProof()
         self.m_dynafed_params = DynaFedParams()
         self.m_signblock_witness = CScriptWitness()
+        self.utreexo_leaves = 0
+        self.utreexo_roots = []
         self.sha256 = None
         self.hash = None
 
@@ -1198,9 +1202,13 @@ class CBlockHeader:
         self.block_height = struct.unpack("<I", f.read(4))[0]
         if is_dyna:
             self.m_dynafed_params.deserialize(f)
-            self.m_signblock_witness.stack = deser_string_vector(f)
         else:
             self.proof.deserialize(f)
+        if self.nVersion & (1 << 15):
+            self.utreexo_leaves = struct.unpack("<Q", f.read(8))[0]
+            self.utreexo_roots = deser_uint256_vector(f)
+        if is_dyna:
+            self.m_signblock_witness.stack = deser_string_vector(f)
         self.sha256 = None
         self.hash = None
 
@@ -1219,9 +1227,12 @@ class CBlockHeader:
         r += struct.pack("<I", self.block_height)
         if is_dyna:
             r += self.m_dynafed_params.serialize()
-            r += ser_string_vector(self.m_signblock_witness.stack)
         else:
             r += self.proof.serialize()
+        if self.nVersion & (1 << 15):
+            r += struct.pack("<Q", self.utreexo_leaves) + ser_uint256_vector(self.utreexo_roots)
+        if is_dyna:
+            r += ser_string_vector(self.m_signblock_witness.stack)
         return r
 
     def calc_sha256(self):
@@ -1242,6 +1253,8 @@ class CBlockHeader:
                 r += self.m_dynafed_params.serialize()
             else:
                 r += self.proof.serialize_for_hash()
+            if self.nVersion & (1 << 15):
+                r += struct.pack("<Q", self.utreexo_leaves) + ser_uint256_vector(self.utreexo_roots)
             self.sha256 = uint256_from_str(hash256(r))
             self.hash = hash256(r)[::-1].hex()
 

@@ -7,6 +7,7 @@
 #endif
 
 #include <common/args.h>
+#include <chainparamsbase.h>
 #include <sync.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
@@ -86,6 +87,38 @@ struct TestArgsManager : public ArgsManager
     using ArgsManager::m_network;
     using ArgsManager::m_settings;
 };
+
+BOOST_AUTO_TEST_CASE(elements_network_defaults)
+{
+    for (const auto& [option, name] : std::vector<std::pair<std::string,std::string>>{
+        {"","elements"},{"-signet","signet"},{"-regtest","regtest"},
+        {"-testnet","test"},{"-testnet4","testnet4"}}) {
+        TestArgsManager args;
+        if (!option.empty()) args.ForceSetArg(option,"1");
+        BOOST_CHECK_EQUAL(args.GetChainTypeString(),name);
+        const auto meta=args.GetChainTypeMeta();
+        BOOST_CHECK_EQUAL(meta.chain_name,name);
+        BOOST_CHECK(meta.chain_type==*ChainTypeFromString(name));
+        if (!option.empty()) {
+            args.ForceSetArg("-chain","elements");
+            BOOST_CHECK_THROW(args.GetChainTypeString(),std::runtime_error);
+            BOOST_CHECK_THROW(args.GetChainTypeMeta(),std::runtime_error);
+        }
+    }
+    for (const std::string network : {"elements","signet","liquidv1","custom"}) {
+        TestArgsManager args;
+        args.SetupArgs({{"-port",ArgsManager::ALLOW_ANY},{"-shared",ArgsManager::ALLOW_ANY}});
+        args.SetNetworkOnlyArg("-port");
+        args.ReadConfigString("port=123\nshared=yes\n");
+        args.SelectConfigNetwork(network);
+        BOOST_CHECK_EQUAL(args.GetArg("-port","unset"),network=="elements" ? "123" : "unset");
+        BOOST_CHECK_EQUAL(args.GetArg("-shared","unset"),"yes");
+        BOOST_CHECK_EQUAL(args.GetUnsuitableSectionOnlyArgs().count("-port"),network=="elements" ? 0U : 1U);
+        args.ReadConfigString("port=123\nshared=yes\n["+network+"]\nport=456\n");
+        BOOST_CHECK_EQUAL(args.GetArg("-port","unset"),"456");
+        BOOST_CHECK(args.GetUnsuitableSectionOnlyArgs().empty());
+    }
+}
 
 //! Test GetSetting and GetArg type coercion, negation, and default value handling.
 class CheckValueTest : public TestChain100Setup
@@ -647,6 +680,16 @@ BOOST_AUTO_TEST_CASE(util_GetArg)
 
 BOOST_AUTO_TEST_CASE(util_GetChainTypeString)
 {
+    BOOST_CHECK_EQUAL(BITCOIN_CONF_FILENAME, "elements.conf");
+    BOOST_CHECK_EQUAL(CBaseChainParams::DEFAULT, "elements");
+    BOOST_CHECK_EQUAL(CBaseChainParams::ELEMENTS, "elements");
+    BOOST_CHECK_EQUAL(CBaseChainParams::MAIN, "main");
+    BOOST_CHECK_EQUAL(CBaseChainParams::TESTNET, "test");
+    BOOST_CHECK_EQUAL(CBaseChainParams::SIGNET, "signet");
+    BOOST_CHECK_EQUAL(CBaseChainParams::REGTEST, "regtest");
+    BOOST_CHECK_EQUAL(CBaseChainParams::LIQUID1, "liquidv1");
+    BOOST_CHECK_EQUAL(CBaseChainParams::LIQUID1TEST, "liquidv1test");
+    BOOST_CHECK_EQUAL(CBaseChainParams::LIQUIDTESTNET, "liquidtestnet");
     TestArgsManager test_args;
     const auto testnet = std::make_pair("-testnet", ArgsManager::ALLOW_ANY);
     const auto testnet4 = std::make_pair("-testnet4", ArgsManager::ALLOW_ANY);

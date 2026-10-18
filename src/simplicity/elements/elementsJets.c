@@ -12,422 +12,12 @@
 #include "../simplicity_assert.h"
 
 #include <string.h>
+#include "../../haskell/simplicity_ffi.h"
 
-#define ECX_SP1_ANNEX_HEADER_LEN ((size_t)79)
-#define ECX_SP1_LEGACY_GROTH16_ANNEX_LEN (ECX_SP1_ANNEX_HEADER_LEN + ECX_SP1_GROTH16_PROOF_LEN)
-#define ECX_SP1_GROTH16_V4_ANNEX_LEN (ECX_SP1_LEGACY_GROTH16_ANNEX_LEN + ECX_SP1_PUBLIC_VALUES_V4_LEN)
-#define ECX_SP1_GROTH16_V5_ANNEX_LEN (ECX_SP1_LEGACY_GROTH16_ANNEX_LEN + ECX_SP1_PUBLIC_VALUES_V5_LEN)
-#define ECX_SP1_GROTH16_V5_INCREMENTAL_ACTIVATION_ANNEX_LEN \
-  (ECX_SP1_LEGACY_GROTH16_ANNEX_LEN + ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN)
-#define ECX_SP1_GROTH16_V6_INCREMENTAL_SUCCESSOR_ANNEX_LEN \
-  (ECX_SP1_LEGACY_GROTH16_ANNEX_LEN + ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN)
-#define ECX_SP1_KOALA_BEAR_MODULUS UINT32_C(0x7f000001)
-
-/* The interpreter consumes the BIP341 0x50 discriminator before exposing the
- * annex payload to Simplicity. The canonical wire annex is 0x50 || payload. */
-static const unsigned char ECX_SP1_ANNEX_MAGIC[7] = {
-  'E', 'C', 'X', 'S', 'P', '1', 0x00
-};
-
-static uint32_t ecxReadU32Be(const unsigned char input[4]) {
-  return ((uint32_t)input[0] << 24) | ((uint32_t)input[1] << 16) |
-         ((uint32_t)input[2] << 8) | (uint32_t)input[3];
-}
-
-static uint64_t ecxReadU64Be(const unsigned char input[8]) {
-  uint64_t result = 0;
-  for (size_t i = 0; i < 8; ++i) result = (result << 8) | input[i];
-  return result;
-}
-
-typedef struct ecxU128 {
-  uint64_t high;
-  uint64_t low;
-} ecxU128;
-
-static ecxU128 ecxReadU128Be(const unsigned char input[16]) {
-  return (ecxU128){ecxReadU64Be(input), ecxReadU64Be(input + 8)};
-}
-
-static int ecxCmpU128(ecxU128 left, ecxU128 right) {
-  if (left.high != right.high) return left.high < right.high ? -1 : 1;
-  if (left.low != right.low) return left.low < right.low ? -1 : 1;
-  return 0;
-}
-
-static bool ecxIsZeroU128(ecxU128 value) {
-  return 0 == value.high && 0 == value.low;
-}
-
-static bool ecxAddU128(ecxU128 left, ecxU128 right, ecxU128* output) {
-  output->low = left.low + right.low;
-  const uint64_t carry = output->low < left.low;
-  output->high = left.high + right.high;
-  if (output->high < left.high) return false;
-  const uint64_t beforeCarry = output->high;
-  output->high += carry;
-  return output->high >= beforeCarry;
-}
-
-/* Precondition: left >= right. */
-static ecxU128 ecxSubU128(ecxU128 left, ecxU128 right) {
-  ecxU128 output;
-  const uint64_t borrow = left.low < right.low;
-  output.low = left.low - right.low;
-  output.high = left.high - right.high - borrow;
-  return output;
-}
-
-static ecxU128 ecxShrU128(ecxU128 value, unsigned int bits) {
-  if (0 == bits) return value;
-  if (bits < 64) return (ecxU128){value.high >> bits, (value.low >> bits) | (value.high << (64 - bits))};
-  if (bits < 128) return (ecxU128){0, value.high >> (bits - 64)};
-  return (ecxU128){0, 0};
-}
-
-static bool ecxShl1U128(ecxU128 value, ecxU128* output) {
-  if (value.high >> 63) return false;
-  output->high = (value.high << 1) | (value.low >> 63);
-  output->low = value.low << 1;
-  return true;
-}
-
-static bool ecxAddSmallU128(ecxU128 value, uint64_t addend, ecxU128* output) {
-  return ecxAddU128(value, (ecxU128){0, addend}, output);
-}
-
-static bool ecxBitU128(ecxU128 value, unsigned int bit) {
-  return bit < 64 ? 0 != ((value.low >> bit) & 1) : 0 != ((value.high >> (bit - 64)) & 1);
-}
-
-static void ecxSetBitU128(ecxU128* value, unsigned int bit) {
-  if (bit < 64) value->low |= UINT64_C(1) << bit;
-  else value->high |= UINT64_C(1) << (bit - 64);
-}
-
-static ecxU128 ecxDivU128(ecxU128 dividend, ecxU128 divisor) {
-  ecxU128 quotient = {0, 0};
-  ecxU128 remainder = {0, 0};
-  for (int bit = 127; bit >= 0; --bit) {
-    ecxU128 doubled;
-    /* remainder < divisor, so overflow is impossible for the only case where
-     * the doubled value is retained without immediate subtraction. */
-    const bool shifted = ecxShl1U128(remainder, &doubled);
-    if (!shifted) {
-      doubled.high = (remainder.high << 1) | (remainder.low >> 63);
-      doubled.low = remainder.low << 1;
-    }
-    if (ecxBitU128(dividend, (unsigned int)bit)) {
-      doubled.low |= 1;
-    }
-    remainder = doubled;
-    if (!shifted || ecxCmpU128(remainder, divisor) >= 0) {
-      remainder = ecxSubU128(remainder, divisor);
-      ecxSetBitU128(&quotient, (unsigned int)bit);
-    }
-  }
-  return quotient;
-}
-
-/* Exact counterpart of PublicValuesV4's overflow-safe floor(value *
- * multiplier / divisor). */
-static bool ecxMulU128U64Div(
-  ecxU128 value,
-  uint64_t multiplier,
-  ecxU128 divisor,
-  ecxU128* output
-) {
-  if (ecxIsZeroU128(divisor)) return false;
-  const ecxU128 valueQuotient = ecxDivU128(value, divisor);
-  const ecxU128 valueRemainder = ecxSubU128(value, (ecxU128){
-    0, 0
-  });
-  /* Obtain value % divisor without a 256-bit product by the same bitwise
-   * division used above. */
-  ecxU128 remainderOnly = {0, 0};
-  for (int bit = 127; bit >= 0; --bit) {
-    ecxU128 doubled;
-    const bool shifted = ecxShl1U128(remainderOnly, &doubled);
-    if (!shifted) {
-      doubled.high = (remainderOnly.high << 1) | (remainderOnly.low >> 63);
-      doubled.low = remainderOnly.low << 1;
-    }
-    if (ecxBitU128(valueRemainder, (unsigned int)bit)) doubled.low |= 1;
-    remainderOnly = doubled;
-    if (!shifted || ecxCmpU128(remainderOnly, divisor) >= 0) {
-      remainderOnly = ecxSubU128(remainderOnly, divisor);
-    }
-  }
-
-  ecxU128 quotient = {0, 0};
-  ecxU128 remainder = {0, 0};
-  for (int bit = 63; bit >= 0; --bit) {
-    ecxU128 divisorMinusRemainder = ecxSubU128(divisor, remainder);
-    ecxU128 nextRemainder;
-    uint64_t carry = 0;
-    if (ecxCmpU128(remainder, divisorMinusRemainder) >= 0) {
-      nextRemainder = ecxSubU128(remainder, divisorMinusRemainder);
-      carry = 1;
-    } else if (!ecxAddU128(remainder, remainder, &nextRemainder)) {
-      return false;
-    }
-    remainder = nextRemainder;
-    if (!ecxShl1U128(quotient, &quotient) || !ecxAddSmallU128(quotient, carry, &quotient)) return false;
-    if ((multiplier >> bit) & 1) {
-      divisorMinusRemainder = ecxSubU128(divisor, remainderOnly);
-      if (ecxCmpU128(remainder, divisorMinusRemainder) >= 0) {
-        remainder = ecxSubU128(remainder, divisorMinusRemainder);
-        carry = 1;
-      } else {
-        if (!ecxAddU128(remainder, remainderOnly, &remainder)) return false;
-        carry = 0;
-      }
-      if (!ecxAddU128(quotient, valueQuotient, &quotient) ||
-          !ecxAddSmallU128(quotient, carry, &quotient)) return false;
-    }
-  }
-  *output = quotient;
-  return true;
-}
-
-static bool ecxEqual32(const unsigned char left[32], const unsigned char right[32]) {
-  unsigned char difference = 0;
-  for (size_t i = 0; i < 32; ++i) difference |= left[i] ^ right[i];
-  return 0 == difference;
-}
-
-static bool ecxNonzero32(const unsigned char value[32]) {
-  unsigned char accumulator = 0;
-  for (size_t i = 0; i < 32; ++i) accumulator |= value[i];
-  return 0 != accumulator;
-}
-
-static bool ecxCanonicalPublicValuesV4(const unsigned char values[ECX_SP1_PUBLIC_VALUES_V4_LEN]) {
-  static const size_t requiredHashOffsets[] = {
-    0, 36, 68, 100, 132, 164, 196, 244, 276, 308, 340, 372, 404, 436
-  };
-  const uint64_t parentHeight = ecxReadU64Be(values + 228);
-  const uint64_t parentMtp = ecxReadU64Be(values + 236);
-  const ecxU128 reserve = ecxReadU128Be(values + 468);
-  const uint64_t outstanding = ecxReadU64Be(values + 484);
-  const ecxU128 nav = ecxReadU128Be(values + 492);
-  const ecxU128 deficit = ecxReadU128Be(values + 508);
-  const ecxU128 target = ecxReadU128Be(values + 524);
-  const ecxU128 coverage = ecxReadU128Be(values + 540);
-  const uint64_t minimumPrice = ecxReadU64Be(values + 557);
-  const uint64_t maximumPrice = ecxReadU64Be(values + 565);
-  const int32_t fundingRate = (int32_t)ecxReadU32Be(values + 581);
-  const uint64_t redemptionHead = ecxReadU64Be(values + 585);
-  const uint64_t redemptionTail = ecxReadU64Be(values + 593);
-  const uint64_t queued = ecxReadU64Be(values + 601);
-  ecxU128 expectedTarget;
-  ecxU128 expectedCoverage;
-  ecxU128 expectedNav;
-  const ecxU128 quarter = ecxShrU128(deficit, 2);
-  const uint64_t remainder = deficit.low & 3;
-
-  if (ecxReadU32Be(values + 32) != 4 || values[556] > 2 ||
-      minimumPrice == 0 || maximumPrice <= minimumPrice) return false;
-  for (size_t i = 0; i < sizeof(requiredHashOffsets) / sizeof(requiredHashOffsets[0]); ++i) {
-    if (!ecxNonzero32(values + requiredHashOffsets[i])) return false;
-  }
-  if (parentHeight == 0 || parentMtp == 0 || reserve.high >> 63 || deficit.high >> 63 ||
-      outstanding > UINT64_C(2100000000000000)) return false;
-  if (!ecxAddU128(deficit, quarter, &expectedTarget) ||
-      !ecxAddSmallU128(expectedTarget, remainder != 0, &expectedTarget) ||
-      0 != ecxCmpU128(expectedTarget, target)) return false;
-  if (ecxIsZeroU128(deficit)) {
-    expectedCoverage = (ecxU128){0, 12500};
-  } else if (!ecxMulU128U64Div(reserve, 10000, deficit, &expectedCoverage)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedCoverage, coverage)) return false;
-  const uint8_t expectedMode = ecxCmpU128(reserve, target) >= 0 ? 0 :
-                               ecxCmpU128(reserve, deficit) >= 0 ? 1 : 2;
-  if (values[556] != expectedMode) return false;
-  if (outstanding == 0) {
-    expectedNav = (ecxU128){0, 0};
-  } else if (!ecxMulU128U64Div(reserve, UINT64_C(100000000), (ecxU128){0, outstanding}, &expectedNav)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedNav, nav) || redemptionHead > redemptionTail ||
-      queued > outstanding || ((redemptionHead == redemptionTail) != (queued == 0)) ||
-      fundingRate < -10000 || fundingRate > 10000) return false;
-
-  return true;
-}
-
-/* Canonical PublicValuesV5 is the only statement accepted by the live bond
- * singleton.  The arithmetic prefix deliberately repeats the V4 checks, then
- * validates every additive oracle/availability/inbox/execution projection. */
-static bool ecxCanonicalPublicValuesV5(const unsigned char values[ECX_SP1_PUBLIC_VALUES_V5_LEN]) {
-  static const size_t requiredHashOffsets[] = {
-    0, 36, 68, 100, 132, 164, 196, 244, 276, 308, 340, 372, 404, 436,
-    609, 650, 682, 722, 762, 802
-  };
-  const uint64_t parentHeight = ecxReadU64Be(values + 228);
-  const uint64_t parentMtp = ecxReadU64Be(values + 236);
-  const ecxU128 reserve = ecxReadU128Be(values + 468);
-  const uint64_t outstanding = ecxReadU64Be(values + 484);
-  const ecxU128 nav = ecxReadU128Be(values + 492);
-  const ecxU128 deficit = ecxReadU128Be(values + 508);
-  const ecxU128 target = ecxReadU128Be(values + 524);
-  const ecxU128 coverage = ecxReadU128Be(values + 540);
-  const uint64_t minimumPrice = ecxReadU64Be(values + 557);
-  const uint64_t maximumPrice = ecxReadU64Be(values + 565);
-  const int32_t fundingRate = (int32_t)ecxReadU32Be(values + 581);
-  const uint64_t redemptionHead = ecxReadU64Be(values + 585);
-  const uint64_t redemptionTail = ecxReadU64Be(values + 593);
-  const uint64_t queued = ecxReadU64Be(values + 601);
-  const uint64_t oracleValidThrough = ecxReadU64Be(values + 641);
-  const uint64_t entryCount = ecxReadU64Be(values + 714);
-  const uint64_t processedCursor = ecxReadU64Be(values + 754);
-  const uint64_t outcomeCount = ecxReadU64Be(values + 794);
-  const uint64_t previousExecutionSequence = ecxReadU64Be(values + 834);
-  const uint64_t nextExecutionSequence = ecxReadU64Be(values + 842);
-  ecxU128 expectedTarget;
-  ecxU128 expectedCoverage;
-  ecxU128 expectedNav;
-  const ecxU128 quarter = ecxShrU128(deficit, 2);
-  const uint64_t remainder = deficit.low & 3;
-
-  if (ecxReadU32Be(values + 32) != 5 || values[556] > 2 || values[649] > 3 ||
-      minimumPrice == 0 || maximumPrice <= minimumPrice) return false;
-  for (size_t i = 0; i < sizeof(requiredHashOffsets) / sizeof(requiredHashOffsets[0]); ++i) {
-    if (!ecxNonzero32(values + requiredHashOffsets[i])) return false;
-  }
-  if (parentHeight == 0 || parentMtp == 0 || oracleValidThrough < parentMtp ||
-      reserve.high >> 63 || deficit.high >> 63 ||
-      outstanding > UINT64_C(2100000000000000)) return false;
-  if (!ecxAddU128(deficit, quarter, &expectedTarget) ||
-      !ecxAddSmallU128(expectedTarget, remainder != 0, &expectedTarget) ||
-      0 != ecxCmpU128(expectedTarget, target)) return false;
-  if (ecxIsZeroU128(deficit)) {
-    expectedCoverage = (ecxU128){0, 12500};
-  } else if (!ecxMulU128U64Div(reserve, 10000, deficit, &expectedCoverage)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedCoverage, coverage)) return false;
-  {
-    const uint8_t expectedMode = ecxCmpU128(reserve, target) >= 0 ? 0 :
-                                 ecxCmpU128(reserve, deficit) >= 0 ? 1 : 2;
-    if (values[556] != expectedMode) return false;
-  }
-  if (outstanding == 0) {
-    expectedNav = (ecxU128){0, 0};
-  } else if (!ecxMulU128U64Div(reserve, UINT64_C(100000000), (ecxU128){0, outstanding}, &expectedNav)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedNav, nav) || redemptionHead > redemptionTail ||
-      queued > outstanding || ((redemptionHead == redemptionTail) != (queued == 0)) ||
-      fundingRate < -10000 || fundingRate > 10000 ||
-      processedCursor > entryCount || outcomeCount != processedCursor ||
-      (processedCursor == entryCount && !ecxEqual32(values + 682, values + 722)) ||
-      nextExecutionSequence < previousExecutionSequence) return false;
-  return true;
-}
-
-static bool ecxCanonicalIncrementalActivationPublicValues(
-  const unsigned char values[ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN]
-) {
-  const uint64_t height = NULL == values ? 0 : ecxReadU64Be(values + 324);
-  const uint64_t parentMtp = NULL == values ? 0 : ecxReadU64Be(values + 332);
-  const uint64_t mark = NULL == values ? 0 : ecxReadU64Be(values + 340);
-  const uint64_t lower = NULL == values ? 0 : ecxReadU64Be(values + 348);
-  const uint64_t upper = NULL == values ? 0 : ecxReadU64Be(values + 356);
-  if (NULL == values || ecxReadU32Be(values) != 1 || 0 == height ||
-      0 == parentMtp || 0 == mark || 0 == lower || 0 == upper ||
-      lower > mark || mark > upper) return false;
-  for (size_t i = 0; i < 10; ++i) {
-    if (!ecxNonzero32(values + 4 + 32 * i)) return false;
-  }
-  /* Finite config, successor config, and predecessor state are independent
-   * typed identities; aliasing any of these three is noncanonical. */
-  return !ecxEqual32(values + 4, values + 36) &&
-         !ecxEqual32(values + 4, values + 100) &&
-         !ecxEqual32(values + 36, values + 100);
-}
-
-static bool ecxCanonicalIncrementalSuccessorPublicValues(
-  const unsigned char values[ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN]
-) {
-  const size_t scalarOffset = 4 + 40 * 32;
-  const uint64_t parentHeight = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset);
-  const uint64_t parentMtp = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 8);
-  const uint64_t sidechainHeight = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 16);
-  const uint64_t mark = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 24);
-  const uint64_t lower = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 32);
-  const uint64_t upper = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 40);
-  const uint64_t issued = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 48);
-  const uint64_t outstanding = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 56);
-  const uint64_t inventory = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 64);
-  const uint64_t queued = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 72);
-  const uint64_t fundingEpoch = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 80);
-  const uint64_t oracleValidThrough = NULL == values ? 0 : ecxReadU64Be(values + scalarOffset + 88);
-  const size_t wideOffset = scalarOffset + 96 + 16;
-  const ecxU128 lowerDeficit = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset);
-  const ecxU128 upperDeficit = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 16);
-  const ecxU128 fullDeficit = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 32);
-  const ecxU128 target = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 48);
-  const ecxU128 reserve = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 64);
-  const ecxU128 nav = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 112);
-  const ecxU128 coverage = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 128);
-  const ecxU128 redemptionHead = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 144);
-  const ecxU128 redemptionTail = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 160);
-  const ecxU128 inboxEntryCount = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 176);
-  const ecxU128 inboxCursor = NULL == values ? (ecxU128){0, 0} : ecxReadU128Be(values + wideOffset + 192);
-  ecxU128 expectedTarget;
-  ecxU128 expectedNav;
-  ecxU128 expectedCoverage;
-  const ecxU128 expectedFull = ecxCmpU128(lowerDeficit, upperDeficit) >= 0
-    ? lowerDeficit : upperDeficit;
-  const ecxU128 quarter = ecxShrU128(fullDeficit, 2);
-  const uint64_t remainder = fullDeficit.low & 3;
-  const size_t fundingRateOffset = wideOffset + 14 * 16;
-  const int32_t fundingRate = NULL == values ? 0 : (int32_t)ecxReadU32Be(values + fundingRateOffset);
-  const size_t modeOffset = fundingRateOffset + 4;
-
-  if (NULL == values || ecxReadU32Be(values) != 23 ||
-      parentHeight == 0 || parentMtp == 0 || sidechainHeight == 0 ||
-      mark == 0 || lower == 0 || upper == 0 || lower > mark || mark > upper ||
-      issued != UINT64_C(2100000000000000) || outstanding > issued ||
-      inventory != issued - outstanding || queued > outstanding ||
-      (lowerDeficit.high >> 63) || (upperDeficit.high >> 63) ||
-      (fullDeficit.high >> 63) || (target.high >> 63) || (reserve.high >> 63) ||
-      fundingEpoch != parentMtp / UINT64_C(28800) || oracleValidThrough == 0 ||
-      fundingRate < -10000 || fundingRate > 10000 ||
-      values[modeOffset] > 2 || values[modeOffset + 1] > 3 ||
-      values[modeOffset + 2] > 1) return false;
-  for (size_t i = 0; i < 40; ++i) {
-    if (!ecxNonzero32(values + 4 + 32 * i)) return false;
-  }
-  if (0 != ecxCmpU128(fullDeficit, expectedFull) ||
-      !ecxAddU128(fullDeficit, quarter, &expectedTarget) ||
-      !ecxAddSmallU128(expectedTarget, remainder != 0, &expectedTarget) ||
-      0 != ecxCmpU128(expectedTarget, target)) return false;
-  if (outstanding == 0) {
-    expectedNav = (ecxU128){0, 0};
-  } else if (!ecxMulU128U64Div(
-      reserve, UINT64_C(100000000), (ecxU128){0, outstanding}, &expectedNav)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedNav, nav)) return false;
-  if (ecxIsZeroU128(fullDeficit)) {
-    expectedCoverage = (ecxU128){0, 12500};
-  } else if (!ecxMulU128U64Div(reserve, 10000, fullDeficit, &expectedCoverage)) {
-    return false;
-  }
-  if (0 != ecxCmpU128(expectedCoverage, coverage) ||
-      ecxCmpU128(redemptionHead, redemptionTail) > 0 ||
-      (0 == ecxCmpU128(redemptionHead, redemptionTail)) != (queued == 0) ||
-      ecxCmpU128(inboxCursor, inboxEntryCount) > 0) return false;
-  {
-    const uint8_t expectedMode = ecxCmpU128(reserve, target) >= 0 ? 0 :
-                                 ecxCmpU128(reserve, fullDeficit) >= 0 ? 1 : 2;
-    if (values[modeOffset] != expectedMode) return false;
-  }
-  return true;
-}
+_Static_assert(ECX_SP1_GROTH16_PROOF_LEN == 356, "Haskell Groth16 proof contract");
+_Static_assert(ECX_SP1_PUBLIC_VALUES_V4_LEN == 609 && ECX_SP1_PUBLIC_VALUES_V5_LEN == 850 &&
+  ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN == 364 &&
+  ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN == 1627, "Haskell Groth16 layout contract");
 
 static bool ecxSha256(
   unsigned char outputBytes[32],
@@ -442,137 +32,35 @@ static bool ecxSha256(
 }
 
 bool simplicity_elements_parse_sp1_groth16_v2_annex(
-  const unsigned char* annex,
-  size_t annexLen,
-  unsigned char programId[32],
-  unsigned char publicValuesSha256[32],
-  unsigned char publicValuesV4[ECX_SP1_PUBLIC_VALUES_V4_LEN]
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_PUBLIC_VALUES_V4_LEN]
 ) {
-  unsigned char computedHash[32];
-  bool nonzeroProgramId = false;
-  if (NULL == annex || NULL == programId || NULL == publicValuesSha256 ||
-      NULL == publicValuesV4 || annexLen != ECX_SP1_GROTH16_V4_ANNEX_LEN ||
-      0 != memcmp(annex, ECX_SP1_ANNEX_MAGIC, sizeof(ECX_SP1_ANNEX_MAGIC)) ||
-      annex[7] != 3 || annex[8] != 2 || annex[9] != 1 || annex[10] != 0 ||
-      ecxReadU32Be(annex + 75) != ECX_SP1_GROTH16_PROOF_LEN) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    const uint32_t word = ecxReadU32Be(annex + 11 + 4 * i);
-    if (word >= ECX_SP1_KOALA_BEAR_MODULUS) return false;
-    nonzeroProgramId = nonzeroProgramId || word != 0;
-  }
-  if (!nonzeroProgramId ||
-      !ecxCanonicalPublicValuesV4(annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN) ||
-      !ecxSha256(
-        computedHash,
-        annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-        ECX_SP1_PUBLIC_VALUES_V4_LEN) ||
-      !ecxEqual32(computedHash, annex + 43)) return false;
-  memcpy(programId, annex + 11, 32);
-  memcpy(publicValuesSha256, annex + 43, 32);
-  memcpy(
-    publicValuesV4,
-    annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-    ECX_SP1_PUBLIC_VALUES_V4_LEN);
-  return true;
+  return elements_haskell_parse_groth16(1, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_PUBLIC_VALUES_V4_LEN, ecxSha256);
 }
 
 bool simplicity_elements_parse_sp1_groth16_v4_public_values_v5_annex(
-  const unsigned char* annex,
-  size_t annexLen,
-  unsigned char programId[32],
-  unsigned char publicValuesSha256[32],
-  unsigned char publicValuesV5[ECX_SP1_PUBLIC_VALUES_V5_LEN]
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_PUBLIC_VALUES_V5_LEN]
 ) {
-  unsigned char computedHash[32];
-  bool nonzeroProgramId = false;
-  if (NULL == annex || NULL == programId || NULL == publicValuesSha256 ||
-      NULL == publicValuesV5 || annexLen != ECX_SP1_GROTH16_V5_ANNEX_LEN ||
-      0 != memcmp(annex, ECX_SP1_ANNEX_MAGIC, sizeof(ECX_SP1_ANNEX_MAGIC)) ||
-      annex[7] != 4 || annex[8] != 2 || annex[9] != 1 || annex[10] != 0 ||
-      ecxReadU32Be(annex + 75) != ECX_SP1_GROTH16_PROOF_LEN) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    const uint32_t word = ecxReadU32Be(annex + 11 + 4 * i);
-    if (word >= ECX_SP1_KOALA_BEAR_MODULUS) return false;
-    nonzeroProgramId = nonzeroProgramId || word != 0;
-  }
-  if (!nonzeroProgramId ||
-      !ecxCanonicalPublicValuesV5(annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN) ||
-      !ecxSha256(computedHash, annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-                 ECX_SP1_PUBLIC_VALUES_V5_LEN) ||
-      !ecxEqual32(computedHash, annex + 43)) return false;
-  memcpy(programId, annex + 11, 32);
-  memcpy(publicValuesSha256, annex + 43, 32);
-  memcpy(publicValuesV5, annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-         ECX_SP1_PUBLIC_VALUES_V5_LEN);
-  return true;
+  return elements_haskell_parse_groth16(2, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_PUBLIC_VALUES_V5_LEN, ecxSha256);
 }
 
 bool simplicity_elements_parse_sp1_groth16_v5_incremental_activation_annex(
-  const unsigned char* annex,
-  size_t annexLen,
-  unsigned char programId[32],
-  unsigned char publicValuesSha256[32],
-  unsigned char publicValues[ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN]
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN]
 ) {
-  unsigned char computedHash[32];
-  bool nonzeroProgramId = false;
-  if (NULL == annex || NULL == programId || NULL == publicValuesSha256 ||
-      NULL == publicValues ||
-      annexLen != ECX_SP1_GROTH16_V5_INCREMENTAL_ACTIVATION_ANNEX_LEN ||
-      0 != memcmp(annex, ECX_SP1_ANNEX_MAGIC, sizeof(ECX_SP1_ANNEX_MAGIC)) ||
-      annex[7] != 5 || annex[8] != 2 || annex[9] != 1 || annex[10] != 0 ||
-      ecxReadU32Be(annex + 75) != ECX_SP1_GROTH16_PROOF_LEN) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    const uint32_t word = ecxReadU32Be(annex + 11 + 4 * i);
-    if (word >= ECX_SP1_KOALA_BEAR_MODULUS) return false;
-    nonzeroProgramId = nonzeroProgramId || word != 0;
-  }
-  if (!nonzeroProgramId ||
-      !ecxCanonicalIncrementalActivationPublicValues(
-        annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN) ||
-      !ecxSha256(computedHash,
-        annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-        ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN) ||
-      !ecxEqual32(computedHash, annex + 43)) return false;
-  memcpy(programId, annex + 11, 32);
-  memcpy(publicValuesSha256, annex + 43, 32);
-  memcpy(publicValues, annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-         ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN);
-  return true;
+  return elements_haskell_parse_groth16(3, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN, ecxSha256);
 }
 
 bool simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex(
-  const unsigned char* annex,
-  size_t annexLen,
-  unsigned char programId[32],
-  unsigned char publicValuesSha256[32],
-  unsigned char publicValues[ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN]
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN]
 ) {
-  unsigned char computedHash[32];
-  bool nonzeroProgramId = false;
-  if (NULL == annex || NULL == programId || NULL == publicValuesSha256 ||
-      NULL == publicValues ||
-      annexLen != ECX_SP1_GROTH16_V6_INCREMENTAL_SUCCESSOR_ANNEX_LEN ||
-      0 != memcmp(annex, ECX_SP1_ANNEX_MAGIC, sizeof(ECX_SP1_ANNEX_MAGIC)) ||
-      annex[7] != 6 || annex[8] != 2 || annex[9] != 1 || annex[10] != 0 ||
-      ecxReadU32Be(annex + 75) != ECX_SP1_GROTH16_PROOF_LEN) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    const uint32_t word = ecxReadU32Be(annex + 11 + 4 * i);
-    if (word >= ECX_SP1_KOALA_BEAR_MODULUS) return false;
-    nonzeroProgramId = nonzeroProgramId || word != 0;
-  }
-  if (!nonzeroProgramId ||
-      !ecxCanonicalIncrementalSuccessorPublicValues(
-        annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN) ||
-      !ecxSha256(computedHash,
-        annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-        ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN) ||
-      !ecxEqual32(computedHash, annex + 43)) return false;
-  memcpy(programId, annex + 11, 32);
-  memcpy(publicValuesSha256, annex + 43, 32);
-  memcpy(publicValues, annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN,
-         ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN);
-  return true;
+  return elements_haskell_parse_groth16(4, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN, ecxSha256);
 }
 
 /* A production build defines HAVE_USDD_SP1_VERIFIER only when it links the
@@ -580,6 +68,15 @@ bool simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex(
  * upstream/library builds remain safely unavailable and return False. */
 #if defined(HAVE_USDD_SP1_VERIFIER)
 #include "../../script/usdd_sp1_verifier_ffi.h"
+_Static_assert(USDD_SP1_VERIFIER_ABI_VERSION == 1 && USDD_SP1_VERIFIER_ACCEPTED == 0, "Haskell Rust ABI contract");
+static bool readSp1Annex(const void* context, const unsigned char** bytes, size_t* size) {
+  const txEnv* env = context;
+  rawElementsBuffer annex = {0};
+  if (!simplicity_elements_getInputFullAnnex(env->tx, (uint32_t)env->ix, &annex)) return false;
+  *bytes = annex.buf;
+  *size = annex.len;
+  return true;
+}
 #endif
 
 /* Read a 256-bit hash value from the 'src' frame, advancing the cursor 256 cells.
@@ -768,45 +265,33 @@ bool simplicity_current_sidechain_height_required(
   const txEnv* env
 ) {
   (void)src;
-  if (!env->bondV2ProjectionPresent || 0 == env->currentSidechainHeight) return false;
+  if (!elements_haskell_jet_height(env->bondV2ProjectionPresent, env->currentSidechainHeight)) return false;
   simplicity_write64(dst, env->currentSidechainHeight);
   return true;
 }
 
-bool simplicity_bond_v2_insurance_reserve_input_required(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env
-) {
-  const uint_fast32_t inputIndex = simplicity_read32(&src);
-  (void)dst;
-  if (NULL == env || NULL == env->tx || inputIndex != env->ix ||
-      inputIndex < 2 || inputIndex >= env->tx->numInputs ||
-      env->tx->input[inputIndex].isPegin ||
-      env->tx->input[inputIndex].issuance.type != NO_ISSUANCE ||
-      !env->bondV2IdentityPresent) return false;
-  return 0 == memcmp(
-    env->tx->input[inputIndex].txo.scriptPubKey.s,
-    env->bondV2InsuranceReserveScriptSha256.s,
-    sizeof(env->bondV2InsuranceReserveScriptSha256.s));
+static bool simplicity_bond_v2_input_required(frameItem src, const txEnv* env, bool collateral) {
+  const uint_fast32_t index = simplicity_read32(&src);
+  if (NULL == env || NULL == env->tx || index >= env->tx->numInputs ||
+      NULL == env->tx->input) return false;
+  const sigInput* input = &env->tx->input[index];
+  _Static_assert(sizeof(input->txo.scriptPubKey.s) == 32, "Haskell script hash contract");
+  const uint32_t flags = (input->isPegin ? 1U : 0U) |
+    (input->issuance.type != NO_ISSUANCE ? 2U : 0U) | (env->bondV2IdentityPresent ? 4U : 0U);
+  const sha256_midstate* expected = collateral ? &env->bondV2CollateralVaultScriptSha256
+                                              : &env->bondV2InsuranceReserveScriptSha256;
+  return elements_haskell_bond_input(index, env->ix, flags,
+    (const unsigned char*)input->txo.scriptPubKey.s, (const unsigned char*)expected->s);
 }
 
-bool simplicity_bond_v2_collateral_vault_input_required(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env
-) {
-  const uint_fast32_t inputIndex = simplicity_read32(&src);
+bool simplicity_bond_v2_insurance_reserve_input_required(frameItem* dst, frameItem src, const txEnv* env) {
   (void)dst;
-  if (NULL == env || NULL == env->tx || inputIndex != env->ix ||
-      inputIndex < 2 || inputIndex >= env->tx->numInputs ||
-      env->tx->input[inputIndex].isPegin ||
-      env->tx->input[inputIndex].issuance.type != NO_ISSUANCE ||
-      !env->bondV2IdentityPresent) return false;
-  return 0 == memcmp(
-    env->tx->input[inputIndex].txo.scriptPubKey.s,
-    env->bondV2CollateralVaultScriptSha256.s,
-    sizeof(env->bondV2CollateralVaultScriptSha256.s));
+  return simplicity_bond_v2_input_required(src, env, false);
+}
+
+bool simplicity_bond_v2_collateral_vault_input_required(frameItem* dst, frameItem src, const txEnv* env) {
+  (void)dst;
+  return simplicity_bond_v2_input_required(src, env, true);
 }
 
 /* verify_sp1_groth16_sha256 : TWO^256 * TWO^256 |- TWO
@@ -819,283 +304,72 @@ bool simplicity_bond_v2_collateral_vault_input_required(
  * delegating cryptographic verification to the node-supplied frozen backend.
  */
 bool simplicity_elements_verify_sp1_groth16_annex_sha256(
-  const unsigned char* annex,
-  size_t annexLen,
-  const unsigned char expectedProgramIdBytes[32],
-  const unsigned char expectedPublicValuesHashBytes[32],
-  ecx_sp1_groth16_verify_fn verify,
-  void* verifyContext,
-  bool requirePublicValuesV4
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext, bool requirePublicValuesV4
 ) {
-  uint32_t programIdWords[8];
-  unsigned char annexProgramIdBytes[32];
-  unsigned char encodedPublicValuesHash[32];
-  bool carriesPublicValues;
-  bool valid = true;
-
-  carriesPublicValues = NULL != annex && annexLen == ECX_SP1_GROTH16_V4_ANNEX_LEN;
-  valid = valid && NULL != annex &&
-          (annexLen == ECX_SP1_LEGACY_GROTH16_ANNEX_LEN || carriesPublicValues);
-  valid = valid && (!requirePublicValuesV4 || carriesPublicValues);
-  valid = valid && NULL != expectedProgramIdBytes &&
-          NULL != expectedPublicValuesHashBytes && NULL != verify;
-  valid = valid && ecxNonzero32(expectedProgramIdBytes);
-  if (valid) {
-    valid = 0 == memcmp(annex, ECX_SP1_ANNEX_MAGIC, sizeof(ECX_SP1_ANNEX_MAGIC)) &&
-            annex[7] == (carriesPublicValues ? 3 : 2) &&
-            annex[8] == 2 && annex[9] == 1 && annex[10] == 0 &&
-            ecxReadU32Be(annex + 75) == ECX_SP1_GROTH16_PROOF_LEN;
-  }
-  if (valid) {
-    bool nonzeroProgramId = false;
-    for (size_t i = 0; i < 8; ++i) {
-      const uint32_t word = ecxReadU32Be(annex + 11 + 4 * i);
-      if (word >= ECX_SP1_KOALA_BEAR_MODULUS) valid = false;
-      programIdWords[i] = word;
-      nonzeroProgramId = nonzeroProgramId || 0 != word;
-      annexProgramIdBytes[4 * i] = (unsigned char)(word >> 24);
-      annexProgramIdBytes[4 * i + 1] = (unsigned char)(word >> 16);
-      annexProgramIdBytes[4 * i + 2] = (unsigned char)(word >> 8);
-      annexProgramIdBytes[4 * i + 3] = (unsigned char)word;
-    }
-    valid = valid && nonzeroProgramId;
-  }
-  if (valid) {
-    valid = ecxEqual32(annexProgramIdBytes, expectedProgramIdBytes) &&
-            ecxEqual32(annex + 43, expectedPublicValuesHashBytes);
-  }
-  if (valid && carriesPublicValues) {
-    const unsigned char* publicValues = annex + ECX_SP1_LEGACY_GROTH16_ANNEX_LEN;
-    valid = ecxCanonicalPublicValuesV4(publicValues) &&
-            ecxSha256(encodedPublicValuesHash, publicValues, ECX_SP1_PUBLIC_VALUES_V4_LEN) &&
-            ecxEqual32(encodedPublicValuesHash, annex + 43);
-  }
-  if (valid) {
-    valid = verify(
-      verifyContext,
-      annex + ECX_SP1_ANNEX_HEADER_LEN,
-      ECX_SP1_GROTH16_PROOF_LEN,
-      programIdWords,
-      annex + 43);
-  }
-  return valid;
+  return elements_haskell_groth16_proof(requirePublicValuesV4 ? 1 : 0, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
 }
 
 bool simplicity_elements_verify_sp1_groth16_v4_public_values_v5_annex_sha256(
-  const unsigned char* annex,
-  size_t annexLen,
-  const unsigned char expectedProgramIdBytes[32],
-  const unsigned char expectedPublicValuesHashBytes[32],
-  ecx_sp1_groth16_verify_fn verify,
-  void* verifyContext
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext
 ) {
-  unsigned char programIdBytes[32];
-  unsigned char publicValuesHash[32];
-  unsigned char publicValues[ECX_SP1_PUBLIC_VALUES_V5_LEN];
-  uint32_t programIdWords[8];
-  if (NULL == expectedProgramIdBytes || NULL == expectedPublicValuesHashBytes ||
-      NULL == verify ||
-      !simplicity_elements_parse_sp1_groth16_v4_public_values_v5_annex(
-        annex, annexLen, programIdBytes, publicValuesHash, publicValues) ||
-      !ecxEqual32(programIdBytes, expectedProgramIdBytes) ||
-      !ecxEqual32(publicValuesHash, expectedPublicValuesHashBytes)) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    programIdWords[i] = ecxReadU32Be(programIdBytes + 4 * i);
-  }
-  return verify(
-    verifyContext,
-    annex + ECX_SP1_ANNEX_HEADER_LEN,
-    ECX_SP1_GROTH16_PROOF_LEN,
-    programIdWords,
-    annex + 43);
+  return elements_haskell_groth16_proof(2, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
 }
 
 bool simplicity_elements_verify_sp1_groth16_v5_incremental_activation_annex_sha256(
-  const unsigned char* annex,
-  size_t annexLen,
-  const unsigned char expectedProgramIdBytes[32],
-  const unsigned char expectedPublicValuesHashBytes[32],
-  ecx_sp1_groth16_verify_fn verify,
-  void* verifyContext
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext
 ) {
-  unsigned char programIdBytes[32];
-  unsigned char publicValuesHash[32];
-  unsigned char publicValues[ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN];
-  uint32_t programIdWords[8];
-  if (NULL == expectedProgramIdBytes || NULL == expectedPublicValuesHashBytes ||
-      NULL == verify ||
-      !simplicity_elements_parse_sp1_groth16_v5_incremental_activation_annex(
-        annex, annexLen, programIdBytes, publicValuesHash, publicValues) ||
-      !ecxEqual32(programIdBytes, expectedProgramIdBytes) ||
-      !ecxEqual32(publicValuesHash, expectedPublicValuesHashBytes)) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    programIdWords[i] = ecxReadU32Be(programIdBytes + 4 * i);
-  }
-  return verify(
-    verifyContext,
-    annex + ECX_SP1_ANNEX_HEADER_LEN,
-    ECX_SP1_GROTH16_PROOF_LEN,
-    programIdWords,
-    annex + 43);
+  return elements_haskell_groth16_proof(3, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
 }
 
 bool simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha256(
-  const unsigned char* annex,
-  size_t annexLen,
-  const unsigned char expectedProgramIdBytes[32],
-  const unsigned char expectedPublicValuesHashBytes[32],
-  ecx_sp1_groth16_verify_fn verify,
-  void* verifyContext
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext
 ) {
-  unsigned char programIdBytes[32];
-  unsigned char publicValuesHash[32];
-  unsigned char publicValues[ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN];
-  uint32_t programIdWords[8];
-  if (NULL == expectedProgramIdBytes || NULL == expectedPublicValuesHashBytes ||
-      NULL == verify ||
-      !simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex(
-        annex, annexLen, programIdBytes, publicValuesHash, publicValues) ||
-      !ecxEqual32(programIdBytes, expectedProgramIdBytes) ||
-      !ecxEqual32(publicValuesHash, expectedPublicValuesHashBytes)) return false;
-  for (size_t i = 0; i < 8; ++i) {
-    programIdWords[i] = ecxReadU32Be(programIdBytes + 4 * i);
-  }
-  return verify(
-    verifyContext,
-    annex + ECX_SP1_ANNEX_HEADER_LEN,
-    ECX_SP1_GROTH16_PROOF_LEN,
-    programIdWords,
-    annex + 43);
+  return elements_haskell_groth16_proof(4, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
+}
+
+static bool simplicity_verify_groth16_frame(frameItem* dst, frameItem src, const txEnv* env, uint32_t kind) {
+  sha256_midstate expectedProgramId, expectedPublicValuesHash;
+  unsigned char program[32], digest[32];
+  readHash(&expectedProgramId, &src);
+  readHash(&expectedPublicValuesHash, &src);
+  sha256_fromMidstate(program, expectedProgramId.s);
+  sha256_fromMidstate(digest, expectedPublicValuesHash.s);
+  const sigInput* input = &env->tx->input[env->ix];
+  writeBit(dst, elements_haskell_groth16_proof(kind, input->annex, input->annexLen,
+    program, digest, ecxSha256, env->verifySp1Groth16, env->verifySp1Groth16Context));
+  return true;
 }
 
 bool simplicity_verify_sp1_groth16_sha256(frameItem* dst, frameItem src, const txEnv* env) {
-  sha256_midstate expectedProgramId;
-  sha256_midstate expectedPublicValuesHash;
-  unsigned char expectedProgramIdBytes[32];
-  unsigned char expectedPublicValuesHashBytes[32];
-  const sigInput* input;
-  bool valid;
-
-  readHash(&expectedProgramId, &src);
-  readHash(&expectedPublicValuesHash, &src);
-  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
-  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
-  input = &env->tx->input[env->ix];
-  valid = simplicity_elements_verify_sp1_groth16_annex_sha256(
-    input->annex,
-    input->annexLen,
-    expectedProgramIdBytes,
-    expectedPublicValuesHashBytes,
-    env->verifySp1Groth16,
-    env->verifySp1Groth16Context,
-    false);
-  writeBit(dst, valid);
-  return true;
+  return simplicity_verify_groth16_frame(dst, src, env, 0);
 }
 
 bool simplicity_verify_sp1_groth16_v3_public_values_v4_sha256(frameItem* dst, frameItem src, const txEnv* env) {
-  sha256_midstate expectedProgramId;
-  sha256_midstate expectedPublicValuesHash;
-  unsigned char expectedProgramIdBytes[32];
-  unsigned char expectedPublicValuesHashBytes[32];
-  const sigInput* input;
-  bool valid;
-
-  readHash(&expectedProgramId, &src);
-  readHash(&expectedPublicValuesHash, &src);
-  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
-  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
-  input = &env->tx->input[env->ix];
-  valid = simplicity_elements_verify_sp1_groth16_annex_sha256(
-    input->annex,
-    input->annexLen,
-    expectedProgramIdBytes,
-    expectedPublicValuesHashBytes,
-    env->verifySp1Groth16,
-    env->verifySp1Groth16Context,
-    true);
-  writeBit(dst, valid);
-  return true;
+  return simplicity_verify_groth16_frame(dst, src, env, 1);
 }
 
 bool simplicity_verify_sp1_groth16_v4_public_values_v5_sha256(frameItem* dst, frameItem src, const txEnv* env) {
-  sha256_midstate expectedProgramId;
-  sha256_midstate expectedPublicValuesHash;
-  unsigned char expectedProgramIdBytes[32];
-  unsigned char expectedPublicValuesHashBytes[32];
-  const sigInput* input;
-  bool valid;
-
-  readHash(&expectedProgramId, &src);
-  readHash(&expectedPublicValuesHash, &src);
-  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
-  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
-  input = &env->tx->input[env->ix];
-  valid = simplicity_elements_verify_sp1_groth16_v4_public_values_v5_annex_sha256(
-    input->annex,
-    input->annexLen,
-    expectedProgramIdBytes,
-    expectedPublicValuesHashBytes,
-    env->verifySp1Groth16,
-    env->verifySp1Groth16Context);
-  writeBit(dst, valid);
-  return true;
+  return simplicity_verify_groth16_frame(dst, src, env, 2);
 }
 
-bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env
-) {
-  sha256_midstate expectedProgramId;
-  sha256_midstate expectedPublicValuesHash;
-  unsigned char expectedProgramIdBytes[32];
-  unsigned char expectedPublicValuesHashBytes[32];
-  const sigInput* input;
-  bool valid;
-
-  readHash(&expectedProgramId, &src);
-  readHash(&expectedPublicValuesHash, &src);
-  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
-  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
-  input = &env->tx->input[env->ix];
-  valid = simplicity_elements_verify_sp1_groth16_v5_incremental_activation_annex_sha256(
-    input->annex,
-    input->annexLen,
-    expectedProgramIdBytes,
-    expectedPublicValuesHashBytes,
-    env->verifySp1Groth16,
-    env->verifySp1Groth16Context);
-  writeBit(dst, valid);
-  return true;
+bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* dst, frameItem src, const txEnv* env) {
+  return simplicity_verify_groth16_frame(dst, src, env, 3);
 }
 
-bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env
-) {
-  sha256_midstate expectedProgramId;
-  sha256_midstate expectedPublicValuesHash;
-  unsigned char expectedProgramIdBytes[32];
-  unsigned char expectedPublicValuesHashBytes[32];
-  const sigInput* input;
-  bool valid;
-
-  readHash(&expectedProgramId, &src);
-  readHash(&expectedPublicValuesHash, &src);
-  sha256_fromMidstate(expectedProgramIdBytes, expectedProgramId.s);
-  sha256_fromMidstate(expectedPublicValuesHashBytes, expectedPublicValuesHash.s);
-  input = &env->tx->input[env->ix];
-  valid = simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha256(
-    input->annex,
-    input->annexLen,
-    expectedProgramIdBytes,
-    expectedPublicValuesHashBytes,
-    env->verifySp1Groth16,
-    env->verifySp1Groth16Context);
-  writeBit(dst, valid);
-  return true;
+bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env) {
+  return simplicity_verify_groth16_frame(dst, src, env, 4);
 }
 
 /* Write an outpoint value to the 'dst' frame, advancing the cursor 288 cells.
@@ -1722,16 +996,9 @@ bool simplicity_verify_sp1_compressed_sha256(frameItem* dst, frameItem src, cons
   read8s(expectedPublicValuesSha256, sizeof(expectedPublicValuesSha256), &src);
 
 #if defined(HAVE_USDD_SP1_VERIFIER)
-  if (env && env->tx && usdd_sp1_verifier_abi_version() == USDD_SP1_VERIFIER_ABI_VERSION) {
-    rawElementsBuffer annex = {0};
-    if (simplicity_elements_getInputFullAnnex(env->tx, (uint32_t)env->ix, &annex) &&
-        annex.buf && 0 < annex.len && 0x50 == annex.buf[0]) {
-      accepted = USDD_SP1_VERIFIER_ACCEPTED == usdd_sp1_verify_annex(
-          USDD_SP1_VERIFIER_ABI_VERSION,
-          annex.buf, annex.len,
-          expectedProgramId, sizeof(expectedProgramId),
-          expectedPublicValuesSha256, sizeof(expectedPublicValuesSha256));
-    }
+  if (env && env->tx) {
+    accepted = elements_haskell_verify_jet(usdd_sp1_verifier_abi_version, usdd_sp1_verify_annex,
+        readSp1Annex, env, expectedProgramId, expectedPublicValuesSha256);
   }
 #else
   (void) env;

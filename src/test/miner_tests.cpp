@@ -146,6 +146,10 @@ void MinerTestingSetup::TestPackageSelection(const CScript& scriptPubKey, const 
     BOOST_REQUIRE(block_template);
     CBlock block{block_template->getBlock()};
     BOOST_REQUIRE_EQUAL(block.vtx.size(), 4U);
+    const auto fees{block_template->getTxFees()};
+    BOOST_REQUIRE_EQUAL(fees.size(), block.vtx.size());
+    BOOST_CHECK_EQUAL(-fees.at(0), 61000);
+    BOOST_CHECK_EQUAL(-fees.at(0), fees.at(1) + fees.at(2) + fees.at(3));
     BOOST_CHECK(block.vtx[1]->GetHash() == hashParentTx);
     BOOST_CHECK(block.vtx[2]->GetHash() == hashHighFeeTx);
     BOOST_CHECK(block.vtx[3]->GetHash() == hashMediumFeeTx);
@@ -676,6 +680,8 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
         // Simple block creation, nothing special yet:
         block_template = mining->createNewBlock(options);
         BOOST_REQUIRE(block_template);
+        BOOST_REQUIRE_EQUAL(block_template->getTxFees().size(), 1U);
+        BOOST_CHECK_EQUAL(block_template->getTxFees().at(0), 0);
 
         CBlock block{block_template->getBlock()};
         CMutableTransaction txCoinbase(*block.vtx[0]);

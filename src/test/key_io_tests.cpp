@@ -68,6 +68,43 @@ BOOST_AUTO_TEST_CASE(elements_lwk_address_aliases)
     SelectParams(ChainType::MAIN);
 }
 
+BOOST_AUTO_TEST_CASE(elements_lwk_alias_witness_matrix)
+{
+    CKey key;
+    key.MakeNewKey(true);
+    auto check = [&](auto destination) {
+        for (const bool confidential : {false, true}) {
+            destination.blinding_pubkey = confidential ? key.GetPubKey() : CPubKey{};
+            const CTxDestination expected{destination};
+            SelectParams("elementsregtest");
+            const auto alias = EncodeDestination(expected);
+            BOOST_REQUIRE(!alias.empty());
+            SelectParams("elements");
+            BOOST_CHECK(DecodeDestination(alias) == expected);
+            BOOST_CHECK(DecodeDestination(ToUpper(alias)) == expected);
+            const auto canonical = EncodeDestination(expected);
+            BOOST_CHECK(canonical != alias);
+            BOOST_CHECK(EncodeDestination(DecodeDestination(alias)) == canonical);
+            BOOST_CHECK(DecodeDestination(canonical) == expected);
+            std::string error;
+            BOOST_CHECK(!IsValidDestination(DecodeParentDestination(alias, error)));
+            for (const auto* chain : {"main", "test", "liquidv1", "liquidtestnet"}) {
+                SelectParams(std::string{chain});
+                BOOST_CHECK(!IsValidDestination(DecodeDestination(alias)));
+            }
+        }
+    };
+    check(WitnessV0KeyHash(key.GetPubKey()));
+    check(WitnessV0ScriptHash(CScript{} << OP_TRUE));
+    check(WitnessV1Taproot(XOnlyPubKey(key.GetPubKey())));
+    for (const int version : {2, 16}) {
+        for (const size_t size : {2U, 40U}) {
+            check(WitnessUnknown(version, std::vector<unsigned char>(size, 0x42)));
+        }
+    }
+    SelectParams(ChainType::MAIN);
+}
+
 // Goal: check that parsed keys match test payload
 BOOST_AUTO_TEST_CASE(key_io_valid_parse)
 {

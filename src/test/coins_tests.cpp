@@ -168,6 +168,75 @@ BOOST_AUTO_TEST_CASE(spent_pegin_snapshot_rejects_malformed_records)
     BOOST_CHECK_THROW(snapshot(), dbwrapper_error);
 }
 
+BOOST_AUTO_TEST_CASE(spent_pegin_snapshot_metadata_admission)
+{
+    const auto rejected = [](const auto& mutate, const char* expected) {
+        CDBWrapper db{{.path = "metadata-raw", .cache_bytes = 1 << 20, .memory_only = true}};
+        db.Write(uint8_t{'B'}, uint256::ONE);
+        mutate(db);
+        BOOST_CHECK_EXCEPTION(
+            CSpentPeginCursor(std::unique_ptr<CDBIterator>{db.NewIterator()}), dbwrapper_error,
+            [&](const auto& error) { return std::string(error.what()) == expected; });
+    };
+    const char* metadata = "Missing or malformed checkpoint best block";
+    const char* transition = "Cannot snapshot an incomplete chainstate transition";
+    rejected([](auto& db) { db.Erase(uint8_t{'B'}); }, metadata);
+    rejected([](auto& db) { db.Write(uint8_t{'B'}, uint256{}); }, metadata);
+    rejected([](auto& db) { db.Write(uint8_t{'B'}, uint8_t{1}); }, metadata);
+    rejected([](auto& db) { db.Write(uint8_t{'B'}, std::make_pair(uint256::ONE, uint8_t{0})); }, metadata);
+    rejected([](auto& db) {
+        db.Erase(uint8_t{'B'});
+        db.Write(std::make_pair(uint8_t{'B'}, uint8_t{0}), uint256::ONE);
+    }, metadata);
+    rejected([](auto& db) { db.Write(uint8_t{'H'}, uint8_t{0}); }, transition);
+    rejected([](auto& db) { db.Write(std::make_pair(uint8_t{'H'}, uint8_t{0}), uint8_t{0}); }, transition);
+    rejected([](auto& db) {
+        db.Erase(uint8_t{'B'});
+        db.Write(uint8_t{'H'}, uint8_t{0});
+    }, transition);
+    CDBWrapper db{{.path = "metadata-neighbors", .cache_bytes = 1 << 20, .memory_only = true}};
+    db.Write(uint8_t{'B'}, uint256::ONE);
+    db.Write(uint8_t{'Z'}, uint8_t{0});
+    db.Write(uint8_t{'x'}, uint8_t{0});
+    CSpentPeginCursor cursor{std::unique_ptr<CDBIterator>{db.NewIterator()}};
+    BOOST_CHECK(!cursor.Valid());
+    BOOST_CHECK(cursor.GetBestBlock() == uint256::ONE);
+    cursor.Next();
+    BOOST_CHECK(!cursor.Valid());
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_coin_cursor_snapshot)
+{
+    CCoinsViewDB db{{.path = "checkpoint-coins", .cache_bytes = 1 << 20, .memory_only = true}, {}};
+    CCoinsViewCache cache{&db};
+    cache.SetBestBlock(uint256::ONE);
+    BOOST_REQUIRE(cache.Flush());
+    BOOST_CHECK(!db.CheckpointCoinCursor()->Valid());
+    const COutPoint outpoint{Txid::FromUint256(uint256::ONE), 7};
+    CTxOut output;
+    output.nValue = 123;
+    output.scriptPubKey = CScript{} << OP_TRUE;
+    cache.AddCoin(outpoint, Coin{std::move(output), 2, false}, false);
+    BOOST_CHECK(!db.CheckpointCoinCursor()->Valid());
+    BOOST_REQUIRE(cache.Flush());
+    auto cursor = db.CheckpointCoinCursor();
+    BOOST_REQUIRE(cursor->Valid());
+    BOOST_REQUIRE(cache.SpendCoin(outpoint));
+    BOOST_REQUIRE(cache.Flush());
+    BOOST_CHECK(!db.CheckpointCoinCursor()->Valid());
+    COutPoint key;
+    Coin coin;
+    BOOST_REQUIRE(cursor->GetKey(key));
+    BOOST_CHECK(key == outpoint);
+    BOOST_REQUIRE(cursor->GetValue(coin));
+    BOOST_CHECK_EQUAL(coin.out.nValue.GetAmount(), 123);
+    BOOST_CHECK_EQUAL(coin.nHeight, 2U);
+    cursor->Next();
+    BOOST_CHECK(!cursor->Valid());
+    BOOST_CHECK(!cursor->GetValue(coin));
+    BOOST_CHECK_EQUAL(coin.out.nValue.GetAmount(), 123); // exhausted reads preserve output
+}
+
 BOOST_AUTO_TEST_CASE(checkpoint_coin_cursor_rejects_malformed_records)
 {
     // Reopen the same test-owned database to inject bytes without exposing
@@ -186,7 +255,11 @@ BOOST_AUTO_TEST_CASE(checkpoint_coin_cursor_rejects_malformed_records)
             auto cursor = db.CheckpointCoinCursor();
             BOOST_REQUIRE(cursor->Valid());
             Coin coin;
+            coin.out.nValue = 321;
+            coin.nHeight = 9;
             BOOST_CHECK_THROW(cursor->GetValue(coin), dbwrapper_error);
+            BOOST_CHECK_EQUAL(coin.out.nValue.GetAmount(), 321);
+            BOOST_CHECK_EQUAL(coin.nHeight, 9U);
         }
     };
     check(uint8_t{'C'}, true); // truncated outpoint

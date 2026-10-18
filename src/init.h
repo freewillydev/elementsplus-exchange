@@ -10,6 +10,7 @@
 
 #include <asset.h>
 #include <consensus/amount.h>
+#include <haskell/bmm_constants.h>
 #include <mainchainrpc.h>
 
 #include <any>
@@ -27,11 +28,14 @@ static constexpr bool DEFAULT_DAEMON = false;
 //! Default value for -daemonwait option
 static constexpr bool DEFAULT_DAEMONWAIT = false;
 //! Default liveness-only BIP301 bid submitted to the local enforcer wallet.
-static constexpr CAmount DEFAULT_DRIVECHAIN_BMM_BID{1000};
+using drivechain::DEFAULT_DRIVECHAIN_BMM_BID;
 
 class ArgsManager;
+class CBlock;
+class ChainstateManager;
 namespace interfaces {
 struct BlockAndHeaderTipInfo;
+class WalletLoader;
 }
 namespace kernel {
 struct Context;
@@ -52,6 +56,12 @@ bool BuildDrivechainRewardScript(
     const std::function<bool(const CTxDestination&)>& is_spendable,
     CScript& script,
     std::string* error = nullptr);
+
+bool IsDrivechainRewardSpendable(interfaces::WalletLoader* loader, const CTxDestination& destination);
+
+/** Native producer adapters; Haskell selects nonce/witness and acceptance policy. */
+bool PrepareDrivechainBlock(ChainstateManager& chainman, CBlock& block);
+bool AcceptPreparedDrivechainBlock(ChainstateManager& chainman, const CBlock& block);
 
 /** Initialize node context shutdown and args variables. */
 void InitContext(node::NodeContext& node);

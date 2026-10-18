@@ -41,7 +41,8 @@
 #include <variant>
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
-const char * const BITCOIN_CONF_FILENAME = "elements.conf";
+#include <haskell/network_defaults.h>
+const char * const BITCOIN_CONF_FILENAME = drivechain::CONFIG_FILENAME;
 const char * const BITCOIN_SETTINGS_FILENAME = "settings.json";
 
 ArgsManager gArgs;
@@ -147,11 +148,8 @@ std::set<std::string> ArgsManager::GetUnsuitableSectionOnlyArgs() const
     // if there's no section selected, don't worry
     if (m_network.empty()) return std::set<std::string> {};
 
-    // if it's okay to use the default section for this network, don't worry
-    if (m_network == ChainTypeToString(ChainType::ELEMENTS)) return std::set<std::string> {};
-
     for (const auto& arg : m_network_only_args) {
-        if (OnlyHasDefaultSectionSetting(m_settings, m_network, SettingName(arg))) {
+        if (!UseDefaultSection(arg) && OnlyHasDefaultSectionSetting(m_settings, m_network, SettingName(arg))) {
             unsuitables.insert(arg);
         }
     }
@@ -833,12 +831,12 @@ std::variant<ChainType, std::string> ArgsManager::GetChainArg() const
     if (fSigNet) return ChainType::SIGNET;
     if (fTestNet) return ChainType::TESTNET;
     if (fTestNet4) return ChainType::TESTNET4;
-    return ChainType::ELEMENTS;
+    return drivechain::DEFAULT_CHAIN;
 }
 
 bool ArgsManager::UseDefaultSection(const std::string& arg) const
 {
-    return m_network == ChainTypeToString(ChainType::ELEMENTS) || m_network_only_args.count(arg) == 0;
+    return m_network == ChainTypeToString(drivechain::DEFAULT_CHAIN) || m_network_only_args.count(arg) == 0;
 }
 
 common::SettingsValue ArgsManager::GetSetting(const std::string& arg) const

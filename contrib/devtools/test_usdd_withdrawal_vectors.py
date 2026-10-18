@@ -6,7 +6,7 @@ import json
 import unittest
 from pathlib import Path
 
-from elements_identity_refreeze import Header, IDENTITY_HEADER, calculate_alphanet_v11
+from elements_identity_refreeze import Header, IDENTITY_HEADER, calculate_betanet_v11
 from fixtures.legacy_v7_identity import calculate_v7, assert_current_v7
 
 
@@ -26,23 +26,25 @@ def node_hash(left: bytes, right: bytes) -> bytes:
 class UsddWithdrawalVectorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        # These published vectors belong to V7, not the current Alpha chain.
+        # These published vectors belong to V7, not the current Betanet chain.
         # Preserve their independent derivation using the frozen historical
-        # serializer/header instead of rewriting vectors to look like Alpha.
+        # serializer/header instead of rewriting vectors to look like Betanet.
         cls.header = Header(Path(__file__).parent / "fixtures" / "elements-v7-identity.h")
         cls.identity = calculate_v7(cls.header)
         assert_current_v7(cls.header, cls.identity)
         cls.withdrawal = json.loads(WITHDRAWAL_VECTOR.read_text(encoding="utf-8"))
         cls.checkpoint = json.loads(CHECKPOINT_VECTOR.read_text(encoding="utf-8"))
 
-    def test_historical_vectors_cannot_be_mistaken_for_current_alpha(self) -> None:
-        alpha = Header(Path(IDENTITY_HEADER))
-        self.assertNotEqual(self.identity.genesis_hash, calculate_alphanet_v11(alpha).genesis_hash)
+    def test_historical_vectors_cannot_be_mistaken_for_current_betanet(self) -> None:
+        current = Header(Path(IDENTITY_HEADER))
+        genesis = calculate_betanet_v11(current).genesis_hash
+        self.assertEqual(genesis, current.string("GENESIS_HASH"))
+        self.assertNotEqual(self.identity.genesis_hash, genesis)
         # The algorithm is shared; the genesis domain is deliberately not.
         for name in ("WITHDRAWAL_BURN_ID_DOMAIN", "WITHDRAWAL_LEAF_DOMAIN"):
-            self.assertEqual(self.header.array(name), alpha.array(name))
+            self.assertEqual(self.header.array(name), current.array(name))
         for name in ("WITHDRAWAL_PROTOCOL_VERSION", "WITHDRAWAL_TREE_DEPTH", "USDD_UNITS_PER_USDT_MICRO"):
-            self.assertEqual(self.header.integer(name), alpha.integer(name))
+            self.assertEqual(self.header.integer(name), current.integer(name))
 
     def test_withdrawal_vector_is_self_consistent_and_bound_to_v7(self) -> None:
         document = self.withdrawal

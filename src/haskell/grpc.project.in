@@ -1,0 +1,9 @@
+packages: "@grpc_haskell_SOURCE_DIR@/core"
+          "@grpc_haskell_SOURCE_DIR@"
+          "@proto3_suite_SOURCE_DIR@"
+with-compiler: @ELEMENTS_GHC@
+index-state: 2026-10-18T12:24:19Z
+tests: False
+jobs: 1
+extra-include-dirs: "@ELEMENTS_GRPC_INCLUDE@"
+extra-lib-dirs: "@ELEMENTS_GRPC_LIBDIR@"

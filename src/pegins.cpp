@@ -4,6 +4,7 @@
 
 #include <pegins.h>
 #include <limits>
+#include <span>
 
 #include <addresstype.h>
 #include <arith_uint256.h>
@@ -14,6 +15,8 @@
 #include <consensus/validation.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
+#include <haskell/bridge.h>
+#include <haskell/resource_constants.h>
 #include <merkleblock.h>
 #include <pow.h>
 #include <primitives/transaction.h>
@@ -50,16 +53,10 @@ public:
 };
 static Secp256k1Ctx instance_of_secp256k1ctx;
 
-static const std::vector<unsigned char> DRIVECHAIN_DEPOSIT_MARKER{
-    'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'd', 'e', 'p', 'o', 's', 'i', 't', '-', 'v', '2'
-};
-
-static const std::vector<unsigned char> ECX_LEGACY_DEPOSIT_MARKER{
-    'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'd', 'e', 'p', 'o', 's', 'i', 't', '-', 'v', '1'
-};
-static const std::vector<unsigned char> DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER{
-    'd', 'r', 'i', 'v', 'e', 'c', 'h', 'a', 'i', 'n', '-', 'd', 'e', 'p', 'o', 's', 'i', 't', '-', 'v', '2'
-};
+static const std::vector<unsigned char> DRIVECHAIN_DEPOSIT_MARKER(
+    std::begin(ElementsDrivechainIdentity::DEPOSIT_MARKER), std::end(ElementsDrivechainIdentity::DEPOSIT_MARKER));
+static const std::vector<unsigned char> ECX_LEGACY_DEPOSIT_MARKER(
+    std::begin(ElementsDrivechainIdentity::LEGACY_DEPOSIT_MARKER), std::end(ElementsDrivechainIdentity::LEGACY_DEPOSIT_MARKER));
 
 template <typename T>
 static bool DeserializeExactly(const std::vector<unsigned char>& bytes, T& value)
@@ -81,6 +78,19 @@ static std::vector<unsigned char> SerializeEvidenceField(const T& value)
     return std::vector<unsigned char>(
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size());
+}
+
+static int32_t HashDepositTransaction(const unsigned char* bytes, uint32_t size, unsigned char* hash)
+{
+    try {
+        Sidechain::Bitcoin::CMutableTransaction tx;
+        DataStream stream{Span<const unsigned char>{bytes, size}};
+        stream >> TX_WITH_WITNESS(tx);
+        if (!stream.empty()) return 0;
+        const uint256 txid = tx.GetHash();
+        std::copy(txid.begin(), txid.end(), hash);
+        return 1;
+    } catch (...) { return 0; }
 }
 
 static bool ReadPeginWitnessPrefix(const CScriptWitness& pegin_witness, CAmount& value, CAsset& asset, uint256& genesis_hash, CScript& claim_script, std::string& err_msg)
@@ -318,55 +328,11 @@ bool CheckParentProofOfWork(uint256 hash, unsigned int nBits, const Consensus::P
     return true;
 }
 
-static bool IsValidEcxPeginWitness(const CScriptWitness& pegin_witness, const std::vector<std::pair<CScript, CScript>>& fedpegscripts, const COutPoint& prevout, std::string& err_msg, bool check_depth, bool* depth_failed) {
-    if (depth_failed) {
-        *depth_failed = false;
-    }
-
-    // Format on stack is as follows:
-    // 1) value - the value of the pegin output
-    // 2) asset type - the asset type being pegged in
-    // 3) genesis blockhash - genesis block of the parent chain
-    // 4) claim script - script to be evaluated for spend authorization
-    // 5) serialized transaction - serialized bitcoin transaction
-    // 6) txout proof - merkle proof connecting transaction to header
-    //
-    // First 4 values(plus prevout) are enough to validate a peg-in without any internal knowledge
-    // of Bitcoin serialization. This is useful for further abstraction by outsourcing
-    // the other validity checks to RPC calls.
-
-    const std::vector<std::vector<unsigned char> >& stack = pegin_witness.stack;
-    // Must include all elements
-    if (stack.size() != 6 && stack.size() != 11) {
-        err_msg = "Not enough stack items.";
-        return false;
-    }
-
-    CAmount value;
-    CAsset asset;
-    uint256 gen_hash;
-    CScript claim_script;
-    if (!ReadPeginWitnessPrefix(pegin_witness, value, asset, gen_hash, claim_script, err_msg)) return false;
-
-    // Drivechain deposits are anchored by the bridge/two-way-peg data instead of
-    // the legacy Elements parent-chain merkle proof, so recognize this marker
-    // before applying the legacy parent-chain-enabled guard below.
-    if (stack[4] == ECX_LEGACY_DEPOSIT_MARKER || stack[4] == DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER) {
-        if (!IsDrivechainDepositPeginWitness(pegin_witness, prevout, nullptr, nullptr)) {
-            err_msg = "Invalid drivechain deposit pegin witness.";
-            return false;
-        }
-        if (gen_hash != Params().ParentGenesisBlockHash()) {
-            err_msg = "Parent genesis block mismatch.";
-            return false;
-        }
-        if (asset != Params().GetConsensus().pegged_asset) {
-            err_msg = "Pegin asset is not the pegged asset.";
-            return false;
-        }
-        return true;
-    }
-
+static bool CheckFederatedPegin(const std::vector<std::vector<unsigned char>>& stack,
+    const std::vector<std::pair<CScript, CScript>>& fedpegscripts, const COutPoint& prevout,
+    CAmount value, const CAsset& asset, const uint256& gen_hash, const CScript& claim_script,
+    std::string& err_msg, bool check_depth, bool* depth_failed)
+{
     // 0) Return false if !consensus.has_parent_chain
     if (!Params().GetConsensus().has_parent_chain) {
         err_msg = "Parent chain is not enabled on this network.";
@@ -468,15 +434,14 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
     }
 
     const auto& items = pegin_witness.stack;
-    const bool ecx_format = (items.size() == 6 && items[4] == ECX_LEGACY_DEPOSIT_MARKER) ||
-        (items.size() == 11 && items[4] == DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER);
-    if (ecx_format) {
-        if (Params().GetConsensus().drivechain_slot.has_value()) {
-            err_msg = "ECX deposit evidence is not a native Alpha CTIP witness.";
-            return false;
-        }
-        return IsValidEcxPeginWitness(pegin_witness, fedpegscripts, prevout,
-                                     err_msg, check_depth, depth_failed);
+    const auto routing = drivechain::haskell::SelectDepositRoute(items.size(),
+        items.size() >= 5 && items[4] == ECX_LEGACY_DEPOSIT_MARKER,
+        items.size() >= 5 && items[4] == DRIVECHAIN_DEPOSIT_MARKER,
+        Params().GetConsensus().drivechain_slot.has_value());
+    const auto route = routing.route;
+    if (route == drivechain::haskell::DepositRoute::REJECT_ECX) {
+        err_msg = "ECX deposit evidence is not a native Alpha CTIP witness.";
+        return false;
     }
 
     // Format on stack is as follows:
@@ -492,8 +457,8 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
     // the other validity checks to RPC calls.
 
     const std::vector<std::vector<unsigned char> >& stack = pegin_witness.stack;
-    const bool is_drivechain_deposit = stack.size() >= 5 && stack[4] == DRIVECHAIN_DEPOSIT_MARKER;
-    const size_t expected_stack_size = is_drivechain_deposit ? 8 : 6;
+    const bool is_drivechain_deposit = route == drivechain::haskell::DepositRoute::NATIVE;
+    const size_t expected_stack_size = routing.expected_stack_size;
     if (stack.size() != expected_stack_size) {
         err_msg = strprintf("Peg-in witness has %u stack items; expected %u.", stack.size(), expected_stack_size);
         return false;
@@ -505,140 +470,66 @@ bool IsValidPeginWitness(const CScriptWitness& pegin_witness,
     CScript claim_script;
     if (!ReadPeginWitnessPrefix(pegin_witness, value, asset, gen_hash, claim_script, err_msg)) return false;
 
+    if (route == drivechain::haskell::DepositRoute::ECX) {
+        const bool valid = IsDrivechainDepositPeginWitness(pegin_witness, prevout, nullptr, nullptr);
+        if (!valid) err_msg = "Invalid drivechain deposit pegin witness.";
+        return valid;
+    }
+
     // Drivechain deposits are anchored by the bridge/two-way-peg data instead of
     // the legacy Elements parent-chain merkle proof, so recognize this marker
     // before applying the legacy parent-chain-enabled guard below.
     if (is_drivechain_deposit) {
         const auto& drivechain_slot = Params().GetConsensus().drivechain_slot;
-        if (!drivechain_slot.has_value()) {
-            err_msg = "Drivechain deposits are not enabled on this network.";
-            return false;
-        }
         uint256 mainchain_block_hash;
         std::vector<unsigned char> address;
-        if (!IsDrivechainDepositPeginWitness(pegin_witness, prevout, nullptr, nullptr, &mainchain_block_hash, &address)) {
-            err_msg = "Invalid drivechain deposit pegin witness.";
-            return false;
-        }
-        if (gen_hash != Params().ParentGenesisBlockHash()) {
-            err_msg = "Parent genesis block mismatch.";
-            return false;
-        }
-        if (asset != Params().GetConsensus().pegged_asset) {
-            err_msg = "Pegin asset is not the pegged asset.";
-            return false;
-        }
-        if (claim_script != CScript() << OP_TRUE) {
-            err_msg = "Drivechain deposit claim script must be OP_TRUE.";
-            return false;
-        }
-
         std::string deposit_error;
-        const DrivechainDepositStatus deposit_status = GetConfirmedDrivechainDepositStatus(
-            mainchain_block_hash, *drivechain_slot, prevout, value, address,
-            &deposit_error, child_height);
-        if (deposit_status != DrivechainDepositStatus::VALID) {
-            if (deposit_status == DrivechainDepositStatus::UNAVAILABLE && parent_unavailable) {
-                *parent_unavailable = true;
-            }
-            err_msg = strprintf("BIP300 deposit is not confirmed on the mainchain: %s", deposit_error);
-            return false;
-        }
-        return true;
+        DrivechainDepositStatus deposit_status{};
+        static const char* errors[]{"", "Drivechain deposits are not enabled on this network.",
+            "Invalid drivechain deposit pegin witness.", "Parent genesis block mismatch.",
+            "Pegin asset is not the pegged asset.", "Drivechain deposit claim script must be OP_TRUE."};
+        const auto result = drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::NATIVE_DEPOSIT_ADMISSION,
+            [&](uint32_t step) -> uint32_t {
+                switch (step) {
+                case 1: return drivechain_slot.has_value();
+                case 2: return IsDrivechainDepositPeginWitness(pegin_witness, prevout, nullptr, nullptr, &mainchain_block_hash, &address);
+                case 3: return gen_hash == Params().ParentGenesisBlockHash();
+                case 4: return asset == Params().GetConsensus().pegged_asset;
+                case 5: return claim_script == (CScript() << OP_TRUE);
+                case 6:
+                    deposit_status = GetConfirmedDrivechainDepositStatus(mainchain_block_hash, *drivechain_slot,
+                        prevout, value, address, &deposit_error, child_height);
+                    return deposit_status == DrivechainDepositStatus::VALID;
+                case 7: return deposit_status == DrivechainDepositStatus::UNAVAILABLE;
+                case 8: if (parent_unavailable) *parent_unavailable = true; return 0;
+                case 9: case 10: case 11: case 12: case 13: err_msg = errors[step - 8]; return 0;
+                case 14: err_msg = strprintf("BIP300 deposit is not confirmed on the mainchain: %s", deposit_error); return 0;
+                default: throw std::runtime_error("Unknown native deposit admission step");
+                }
+            });
+        if (result > 1) throw std::runtime_error("Invalid native deposit admission result");
+        return result == 0;
     }
 
     // A slot-assigned Drivechain uses only native CTIP deposits. Accepting a
     // legacy federated pegin on the same network would create a second minting
     // path for the identical pegged asset, outside the BIP300 treasury delta
     // and duplicate-claim domain.
-    if (Params().GetConsensus().drivechain_slot.has_value()) {
+    if (route == drivechain::haskell::DepositRoute::REJECT_FEDERATED) {
         err_msg = "Legacy federated peg-ins are disabled on a Drivechain network.";
         return false;
     }
 
-    // 0) Return false if !consensus.has_parent_chain
-    if (!Params().GetConsensus().has_parent_chain) {
-        err_msg = "Parent chain is not enabled on this network.";
-        return false;
-    }
+    return CheckFederatedPegin(stack, fedpegscripts, prevout, value, asset, gen_hash,
+                               claim_script, err_msg, check_depth, depth_failed);
+}
 
-    uint256 block_hash;
-    uint256 tx_hash;
-    int num_txs;
-    unsigned int tx_index = 0;
-    // Get txout proof
-    if (Params().GetConsensus().ParentChainHasPow()) {
-        Sidechain::Bitcoin::CMerkleBlock merkle_block_pow;
-        if (!GetBlockAndTxFromMerkleBlock(block_hash, tx_hash, tx_index, merkle_block_pow, stack[5])) {
-            err_msg = "Could not extract block and tx from merkleblock.";
-            return false;
-        }
-        if (!CheckParentProofOfWork(block_hash, merkle_block_pow.header.nBits, Params().GetConsensus())) {
-            err_msg = "Parent proof of work is invalid or insufficient.";
-            return false;
-        }
-
-        Sidechain::Bitcoin::CTransactionRef pegtx;
-        if (!CheckPeginTx(stack[4], pegtx, prevout, value, claim_script, fedpegscripts)) {
-            err_msg = "Peg-in tx is invalid.";
-            return false;
-        }
-
-        num_txs = merkle_block_pow.txn.GetNumTransactions();
-    } else {
-        CMerkleBlock merkle_block;
-        if (!GetBlockAndTxFromMerkleBlock(block_hash, tx_hash, tx_index, merkle_block, stack[5])) {
-            err_msg = "Could not extract block and tx from merkleblock.";
-            return false;
-        }
-
-        if (!CheckProofSignedParent(merkle_block.header, Params().GetConsensus())) {
-            err_msg = "Parent signed block is invalid.";
-            return false;
-        }
-
-        CTransactionRef pegtx;
-        if (!CheckPeginTx(stack[4], pegtx, prevout, value, claim_script, fedpegscripts)) {
-            err_msg = "Peg-in tx is invalid.";
-            return false;
-        }
-
-        num_txs = merkle_block.txn.GetNumTransactions();
-    }
-
-    // Check that the merkle proof corresponds to the txid
-    if (prevout.hash != tx_hash) {
-        err_msg = "Merkle proof and txid mismatch.";
-        return false;
-    }
-
-    // Check the genesis block corresponds to a valid peg (only one for now)
-    if (gen_hash != Params().ParentGenesisBlockHash()) {
-        err_msg = "Parent genesis block mismatch.";
-        return false;
-    }
-
-    // Check the asset type corresponds to a valid pegged asset (only one for now)
-    if (asset != Params().GetConsensus().pegged_asset) {
-        return false;
-    }
-
-    // Finally, validate peg-in via rpc call
-    if (check_depth && gArgs.GetBoolArg("-validatepegin", Params().GetConsensus().has_parent_chain)) {
-        unsigned int required_depth = Params().GetConsensus().pegin_min_depth;
-        // Don't allow coinbase output claims before coinbase maturity
-        if (tx_index == 0) {
-            required_depth = std::max(required_depth, (unsigned int)COINBASE_MATURITY);
-        }
-        if (!IsConfirmedBitcoinBlock(block_hash, required_depth, num_txs)) {
-            err_msg = "Needs more confirmations.";
-            if (depth_failed) {
-                *depth_failed = true;
-            }
-            return false;
-        }
-    }
-    return true;
+int32_t DepositWitnessKind(const CScriptWitness& witness, const COutPoint& prevout,
+                          uint32_t mode, CAmount& value)
+{
+    return drivechain::haskell::DepositWitness(witness.stack, mode,
+        Params().GetConsensus().pegged_asset.begin(), Params().ParentGenesisBlockHash().begin(),
+        prevout.hash.ToUint256().begin(), HashDepositTransaction, value);
 }
 
 bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
@@ -649,35 +540,10 @@ bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
                                      std::vector<unsigned char>* out_address)
 {
     const auto& stack = pegin_witness.stack;
-    if (stack.size() == 6 || stack.size() == 11) {
-        // Do not provide native block/address fields for an ECX witness.
-        if (out_mainchain_block_hash || out_address) return false;
-        CAmount value;
-        CScript claim;
-        uint256 txid;
-        if (!GetDrivechainDepositPeginData(pegin_witness, prevout, value, claim, txid)) return false;
-        if (out_value) *out_value = value;
-        if (out_claim_script) *out_claim_script = claim;
-        return true;
-    }
-    if (stack.size() != 8 || stack[4] != DRIVECHAIN_DEPOSIT_MARKER ||
-        stack[0].size() != sizeof(CAmount) ||
-        stack[5].size() != 32 || stack[6].size() != 32 ||
-        stack[7].empty() || stack[7].size() > 128) return false;
-
     CAmount value;
-    CAsset asset;
-    uint256 genesis_hash;
-    CScript claim_script;
-    std::string err_msg;
-    if (!ReadPeginWitnessPrefix(pegin_witness, value, asset, genesis_hash, claim_script, err_msg)) return false;
-    if (value <= 0 || asset != Params().GetConsensus().pegged_asset || genesis_hash != Params().ParentGenesisBlockHash()) return false;
-
-    const uint256 mainchain_txid(stack[5]);
-    if (prevout.hash != mainchain_txid) return false;
-
+    if (!DepositWitnessKind(pegin_witness, prevout, out_mainchain_block_hash || out_address ? 2 : 0, value)) return false;
     if (out_value != nullptr) *out_value = value;
-    if (out_claim_script != nullptr) *out_claim_script = claim_script;
+    if (out_claim_script != nullptr) *out_claim_script = CScript(stack[3].begin(), stack[3].end());
     if (out_mainchain_block_hash != nullptr) *out_mainchain_block_hash = uint256(stack[6]);
     if (out_address != nullptr) *out_address = stack[7];
     return true;
@@ -689,118 +555,59 @@ bool CheckDrivechainDepositOutputs(const CTransaction& tx, const unsigned int pe
         err_msg = "Drivechain deposit input or witness index is out of range.";
         return false;
     }
-    unsigned int drivechain_pegin_inputs{0};
+    std::vector<unsigned char> inputs, outputs;
+    std::vector<int64_t> amounts;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
-        if (i < tx.witness.vtxinwit.size() &&
-            IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, tx.vin[i].prevout)) {
-            ++drivechain_pegin_inputs;
-        } else if (tx.vin[i].m_is_pegin) {
-            err_msg = "Drivechain deposit transactions cannot mix deposit and legacy pegin inputs.";
-            return false;
-        }
-    }
-    if (drivechain_pegin_inputs != 1) {
-        err_msg = "Drivechain deposit transactions must contain exactly one drivechain pegin input.";
-        return false;
-    }
-    if (!tx.vin[pegin_index].assetIssuance.IsNull()) {
-        err_msg = "Drivechain deposit inputs cannot contain an asset issuance.";
-        return false;
+        const bool recognized = i < tx.witness.vtxinwit.size() &&
+            IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, tx.vin[i].prevout);
+        inputs.push_back(recognized | (tx.vin[i].m_is_pegin << 1));
     }
 
     CAmount deposit_value{0};
     CScript claim_script;
     std::vector<unsigned char> address_bytes;
-    if (!IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_index].m_pegin_witness,
-                                         tx.vin[pegin_index].prevout,
-                                         &deposit_value,
-                                         &claim_script,
-                                         nullptr,
-                                         &address_bytes)) {
-        err_msg = "Invalid drivechain deposit witness while checking outputs.";
-        return false;
-    }
-    if (claim_script != CScript() << OP_TRUE) {
-        err_msg = "Drivechain deposit claim script must be OP_TRUE.";
-        return false;
-    }
-
+    const bool native = IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_index].m_pegin_witness,
+        tx.vin[pegin_index].prevout, &deposit_value, &claim_script, nullptr, &address_bytes);
     const std::string address(address_bytes.begin(), address_bytes.end());
     const CTxDestination destination = DecodeDestination(address);
-    if (!IsValidDestination(destination)) {
-        err_msg = "BIP300 deposit commits to an invalid Elements destination address.";
-        return false;
-    }
     const CScript expected_script = GetScriptForDestination(destination);
-
-    unsigned int recipient_outputs{0};
     for (const CTxOut& output : tx.vout) {
-        if (output.scriptPubKey != expected_script) continue;
-        ++recipient_outputs;
-        if (!output.nAsset.IsExplicit() || output.nAsset.GetAsset() != Params().GetConsensus().pegged_asset ||
-            !output.nValue.IsExplicit() || output.nNonce.IsCommitment() ||
-            output.nValue.GetAmount() != deposit_value) {
-            err_msg = "The committed deposit recipient must receive the exact explicit pegged-asset amount.";
-            return false;
-        }
+        outputs.push_back((output.scriptPubKey == expected_script) |
+            ((output.nAsset.IsExplicit() && output.nAsset.GetAsset() == Params().GetConsensus().pegged_asset) << 1) |
+            (output.nValue.IsExplicit() << 2) | (output.nNonce.IsCommitment() << 3));
+        amounts.push_back(output.nValue.IsExplicit() ? output.nValue.GetAmount() : 0);
     }
-
-    if (recipient_outputs != 1) {
-        err_msg = "Drivechain deposit transaction must contain exactly one recipient output.";
-        return false;
-    }
-    // Any extra inputs and outputs are ordinary signed wallet funds. They may
-    // sponsor relay/mining fees, but cannot reduce or redirect the amount
-    // minted from the permissionless pegin. Normal asset conservation below
-    // accounts for those inputs and outputs.
-    return true;
+    const uint32_t facts = !tx.vin[pegin_index].assetIssuance.IsNull() | (native << 1) |
+        ((claim_script == (CScript() << OP_TRUE)) << 2) | (IsValidDestination(destination) << 3);
+    return drivechain::haskell::DepositOutputs(facts, deposit_value, inputs, outputs, amounts, err_msg);
 }
 
 bool IsCanonicalFeeFreeDrivechainDeposit(const CTransaction& tx)
 {
-    if (tx.vin.size() != 1 || tx.vout.size() != 1 ||
-        tx.witness.vtxinwit.size() != 1 || !tx.vin[0].m_is_pegin ||
-        !tx.vin[0].assetIssuance.IsNull() ||
-        !IsDrivechainDepositPeginWitness(
-            tx.witness.vtxinwit[0].m_pegin_witness, tx.vin[0].prevout)) {
-        return false;
-    }
-
     std::string error;
-    return CheckDrivechainDepositOutputs(tx, 0, error);
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::FEE_FREE_DEPOSIT,
+        [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return tx.vin.size() == 1;
+            case 2: return tx.vout.size() == 1;
+            case 3: return tx.witness.vtxinwit.size() == 1;
+            case 4: return tx.vin[0].m_is_pegin;
+            case 5: return tx.vin[0].assetIssuance.IsNull();
+            case 6: return IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[0].m_pegin_witness, tx.vin[0].prevout);
+            case 7: return CheckDrivechainDepositOutputs(tx, 0, error);
+            default: return 0;
+            }
+        });
 }
 
 bool GetDrivechainDepositPeginData(const CScriptWitness& pegin_witness, const COutPoint& prevout, CAmount& out_value, CScript& out_claim_script, uint256& out_mainchain_txid)
 {
-    const auto& stack = pegin_witness.stack;
-    const bool legacy = stack.size() == 6 && stack[4] == ECX_LEGACY_DEPOSIT_MARKER && stack[5].size() == 32;
-    const bool deterministic = stack.size() == 11 && stack[4] == DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER;
-    if (!legacy && !deterministic) return false;
-
     CAmount value;
-    CAsset asset;
-    uint256 genesis_hash;
-    CScript claim_script;
-    std::string err_msg;
-    if (!ReadPeginWitnessPrefix(pegin_witness, value, asset, genesis_hash, claim_script, err_msg)) return false;
-    if (value <= 0 || asset != Params().GetConsensus().pegged_asset || genesis_hash != Params().ParentGenesisBlockHash()) return false;
-
-    uint256 mainchain_txid;
-    if (legacy) {
-        mainchain_txid = uint256(stack[5]);
-    } else {
-        Sidechain::Bitcoin::CMutableTransaction deposit_tx;
-        if (stack[5].size() > MAX_BLOCK_SERIALIZED_SIZE ||
-            !DeserializeExactly(stack[5], deposit_tx)) {
-            return false;
-        }
-        mainchain_txid = deposit_tx.GetHash();
-    }
-    if (prevout.hash != mainchain_txid) return false;
-
+    if (!DepositWitnessKind(pegin_witness, prevout, 1, value)) return false;
     out_value = value;
-    out_claim_script = claim_script;
-    out_mainchain_txid = mainchain_txid;
+    const auto& claim = pegin_witness.stack[3];
+    out_claim_script = CScript(claim.begin(), claim.end());
+    out_mainchain_txid = prevout.hash.ToUint256();
     return true;
 }
 
@@ -808,17 +615,14 @@ bool IsEcxDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
                                        const COutPoint& prevout)
 {
     CAmount value;
-    CScript claim_script;
-    uint256 mainchain_txid;
-    return GetDrivechainDepositPeginData(
-        pegin_witness, prevout, value, claim_script, mainchain_txid);
+    return DepositWitnessKind(pegin_witness, prevout, 1, value) != 0;
 }
 
 bool IsLegacyDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness)
 {
-    return pegin_witness.stack.size() == 6 &&
-        pegin_witness.stack[4] == ECX_LEGACY_DEPOSIT_MARKER &&
-        pegin_witness.stack[5].size() == 32;
+    int64_t unused{0};
+    return drivechain::haskell::DepositWitness(pegin_witness.stack,3,
+        nullptr,nullptr,nullptr,nullptr,unused) != 0;
 }
 
 bool GetDrivechainDepositEvidence(
@@ -828,43 +632,27 @@ bool GetDrivechainDepositEvidence(
     std::string& error)
 {
     const auto& stack = pegin_witness.stack;
-    if (stack.size() != 11 || stack[4] != DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER) {
-        error = "drivechain deposit witness does not contain deterministic v2 evidence";
-        return false;
-    }
-    if (stack[5].empty() || stack[5].size() > MAX_BLOCK_SERIALIZED_SIZE ||
-        stack[6].empty() || stack[6].size() > MAX_BLOCK_SERIALIZED_SIZE ||
-        stack[7].empty() || stack[7].size() > MAX_BLOCK_SERIALIZED_SIZE ||
-        stack[10].empty() || stack[10].size() > 2017 * 80 + 16) {
-        error = "drivechain deposit evidence field is empty or exceeds its consensus bound";
-        return false;
-    }
-
-    Sidechain::Bitcoin::CMutableTransaction deposit_tx;
-    if (!DeserializeExactly(stack[5], deposit_tx) || deposit_tx.GetHash() != prevout.hash) {
-        error = "drivechain deposit transaction encoding or txid is invalid";
-        return false;
-    }
-    if (!DeserializeExactly(stack[8], evidence.sequence_number) ||
-        !DeserializeExactly(stack[9], evidence.previous_sequence_number) ||
-        !DeserializeExactly(stack[10], evidence.headers)) {
-        error = "drivechain deposit sequence or header encoding is non-canonical";
-        return false;
-    }
-    if (evidence.sequence_number < 0 || evidence.previous_sequence_number < 0 ||
-        evidence.previous_sequence_number == std::numeric_limits<int64_t>::max() ||
-        evidence.sequence_number != evidence.previous_sequence_number + 1) {
-        error = "drivechain deposit sequence transition is invalid";
-        return false;
-    }
-    if (evidence.headers.empty() || evidence.headers.size() > 2017) {
-        error = "drivechain deposit header chain length is invalid";
-        return false;
-    }
-
-    evidence.deposit_tx = stack[5];
-    evidence.txout_proof = stack[6];
-    evidence.previous_ctip_tx = stack[7];
+    struct Context {
+        const std::vector<std::vector<unsigned char>>& stack;
+        DrivechainDepositEvidence decoded;
+    } context{stack, {}};
+    // Invoked only after Haskell has checked the stack shape and byte bounds.
+    const auto decode = +[](void* opaque, int64_t* result) -> int32_t {
+        auto& [fields, value] = *static_cast<Context*>(opaque);
+        if (!DeserializeExactly(fields[8], value.sequence_number) ||
+            !DeserializeExactly(fields[9], value.previous_sequence_number) ||
+            !DeserializeExactly(fields[10], value.headers)) return 0;
+        result[0] = value.sequence_number;
+        result[1] = value.previous_sequence_number;
+        result[2] = value.headers.size();
+        return 1;
+    };
+    if (!drivechain::haskell::DepositEvidence(stack, prevout.hash.ToUint256().begin(),
+            HashDepositTransaction, decode, &context, error)) return false;
+    context.decoded.deposit_tx = stack[5];
+    context.decoded.txout_proof = stack[6];
+    context.decoded.previous_ctip_tx = stack[7];
+    evidence = std::move(context.decoded);
     return true;
 }
 
@@ -1038,6 +826,27 @@ CScriptWitness CreatePeginWitness(const CAmount& value, const CAsset& asset, con
     return CreatePeginWitnessInner(value, asset, genesis_hash, claim_script, tx_ref, merkle_block);
 }
 
+static std::vector<unsigned char> SerializeDepositValue(const CAmount& value)
+{
+    try {
+        return SerializeEvidenceField(value);
+    } catch (...) {
+        throw std::ios_base::failure("Amount serialization is invalid.");
+    }
+}
+
+static CScriptWitness AssembleDepositWitness(std::span<const unsigned char> layout,
+    std::vector<std::vector<unsigned char>> fields)
+{
+    CScriptWitness witness;
+    for (const auto field : layout) {
+        if (field == 254) witness.stack.push_back(DRIVECHAIN_DEPOSIT_MARKER);
+        else if (field == 255) witness.stack.push_back(ECX_LEGACY_DEPOSIT_MARKER);
+        else witness.stack.push_back(std::move(fields.at(field)));
+    }
+    return witness;
+}
+
 CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
                                                    const CAsset& asset,
                                                    const uint256& genesis_hash,
@@ -1046,49 +855,21 @@ CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value,
                                                    const uint256& mainchain_block_hash,
                                                    const std::vector<unsigned char>& address)
 {
-    if (address.empty() || address.size() > 128) {
+    if (!drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::NONEMPTY_BOUNDED, 0, 0, address.size(), ElementsDrivechainIdentity::DEPOSIT_ADDRESS_LIMIT)) {
         throw std::invalid_argument("Drivechain deposit address must contain 1..128 bytes.");
     }
-    std::vector<unsigned char> value_bytes;
-    VectorWriter ss_val(value_bytes, 0);
-    try {
-        ss_val << value;
-    } catch (...) {
-        throw std::ios_base::failure("Amount serialization is invalid.");
-    }
-
-    CScriptWitness pegin_witness;
-    auto& stack = pegin_witness.stack;
-    stack.push_back(value_bytes);
-    stack.push_back(std::vector<unsigned char>(asset.begin(), asset.end()));
-    stack.push_back(std::vector<unsigned char>(genesis_hash.begin(), genesis_hash.end()));
-    stack.push_back(std::vector<unsigned char>(claim_script.begin(), claim_script.end()));
-    stack.push_back(DRIVECHAIN_DEPOSIT_MARKER);
-    stack.push_back(std::vector<unsigned char>(mainchain_outpoint.hash.ToUint256().begin(), mainchain_outpoint.hash.ToUint256().end()));
-    stack.push_back(std::vector<unsigned char>(mainchain_block_hash.begin(), mainchain_block_hash.end()));
-    stack.push_back(address);
-    return pegin_witness;
+    return AssembleDepositWitness(ElementsDrivechainIdentity::NATIVE_DEPOSIT_LAYOUT,
+        {SerializeDepositValue(value), {asset.begin(),asset.end()}, {genesis_hash.begin(),genesis_hash.end()},
+         {claim_script.begin(),claim_script.end()},
+         {mainchain_outpoint.hash.ToUint256().begin(),mainchain_outpoint.hash.ToUint256().end()},
+         {mainchain_block_hash.begin(),mainchain_block_hash.end()}, address});
 }
 
 CScriptWitness CreateDrivechainDepositPeginWitness(const CAmount& value, const CAsset& asset, const uint256& genesis_hash, const CScript& claim_script, const uint256& mainchain_txid)
 {
-    std::vector<unsigned char> value_bytes;
-    VectorWriter ss_val(value_bytes, 0);
-    try {
-        ss_val << value;
-    } catch (...) {
-        throw std::ios_base::failure("Amount serialization is invalid.");
-    }
-
-    CScriptWitness pegin_witness;
-    auto& stack = pegin_witness.stack;
-    stack.push_back(value_bytes);
-    stack.push_back(std::vector<unsigned char>(asset.begin(), asset.end()));
-    stack.push_back(std::vector<unsigned char>(genesis_hash.begin(), genesis_hash.end()));
-    stack.push_back(std::vector<unsigned char>(claim_script.begin(), claim_script.end()));
-    stack.push_back(ECX_LEGACY_DEPOSIT_MARKER);
-    stack.push_back(std::vector<unsigned char>(mainchain_txid.begin(), mainchain_txid.end()));
-    return pegin_witness;
+    return AssembleDepositWitness(ElementsDrivechainIdentity::LEGACY_DEPOSIT_LAYOUT,
+        {SerializeDepositValue(value), {asset.begin(),asset.end()}, {genesis_hash.begin(),genesis_hash.end()},
+         {claim_script.begin(),claim_script.end()}, {mainchain_txid.begin(),mainchain_txid.end()}});
 }
 
 CScriptWitness CreateDrivechainDepositPeginWitness(
@@ -1098,24 +879,11 @@ CScriptWitness CreateDrivechainDepositPeginWitness(
     const CScript& claim_script,
     const DrivechainDepositEvidence& evidence)
 {
-    std::vector<unsigned char> value_bytes;
-    VectorWriter value_writer(value_bytes, 0);
-    value_writer << value;
-
-    CScriptWitness pegin_witness;
-    auto& stack = pegin_witness.stack;
-    stack.push_back(value_bytes);
-    stack.push_back(std::vector<unsigned char>(asset.begin(), asset.end()));
-    stack.push_back(std::vector<unsigned char>(genesis_hash.begin(), genesis_hash.end()));
-    stack.push_back(std::vector<unsigned char>(claim_script.begin(), claim_script.end()));
-    stack.push_back(DRIVECHAIN_DEPOSIT_EVIDENCE_MARKER);
-    stack.push_back(evidence.deposit_tx);
-    stack.push_back(evidence.txout_proof);
-    stack.push_back(evidence.previous_ctip_tx);
-    stack.push_back(SerializeEvidenceField(evidence.sequence_number));
-    stack.push_back(SerializeEvidenceField(evidence.previous_sequence_number));
-    stack.push_back(SerializeEvidenceField(evidence.headers));
-    return pegin_witness;
+    return AssembleDepositWitness(ElementsDrivechainIdentity::EVIDENCE_DEPOSIT_LAYOUT,
+        {SerializeEvidenceField(value), {asset.begin(),asset.end()}, {genesis_hash.begin(),genesis_hash.end()},
+         {claim_script.begin(),claim_script.end()}, evidence.deposit_tx, evidence.txout_proof, evidence.previous_ctip_tx,
+         SerializeEvidenceField(evidence.sequence_number), SerializeEvidenceField(evidence.previous_sequence_number),
+         SerializeEvidenceField(evidence.headers)});
 }
 
 bool DecomposePeginWitness(const CScriptWitness& witness, CAmount& value, CAsset& asset, uint256& genesis_hash, CScript& claim_script, std::variant<std::monostate, Sidechain::Bitcoin::CTransactionRef, CTransactionRef>& tx, std::variant<std::monostate, Sidechain::Bitcoin::CMerkleBlock, CMerkleBlock>& merkle_block)

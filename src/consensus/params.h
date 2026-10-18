@@ -175,9 +175,8 @@ struct Params {
     uint32_t pegin_min_depth;
     /** Negative disables explicit-only creation; activation must be release-pinned. */
     int explicit_only_height{-1};
-    bool ExplicitOnlyActive(int height) const {
-        return explicit_only_height >= 0 && height >= explicit_only_height;
-    }
+    bool ExplicitOnlyConfigured() const;
+    bool ExplicitOnlyActive(int height) const;
     CScript parent_chain_signblockscript;
     /** BIP325 challenge when the parent is Signet, empty for non-Signet parents. */
     std::vector<uint8_t> parent_signet_challenge;
@@ -202,6 +201,8 @@ struct Params {
     bool start_p2wsh_script = false;
     /** BIP300/301 slot for a native drivechain, absent on ordinary networks. */
     std::optional<uint8_t> drivechain_slot;
+    /** Fresh elementsutreexo test chain: mandatory post-genesis accumulator. */
+    bool utreexo{false};
     /**
      * Immutable parent-chain launch identity for a native drivechain.  These
      * fields are empty on ordinary Elements networks.  The proposal hash is a
@@ -240,10 +241,7 @@ struct Params {
      * CTIP decreases for all active slots.
      */
     bool drivechain_m6_withdrawal_validation{false};
-    bool DrivechainWithdrawalValidationEnabled() const
-    {
-        return drivechain_slot.has_value() && drivechain_m6_withdrawal_validation;
-    }
+    bool DrivechainWithdrawalValidationEnabled() const;
     /** Apply the fail-closed USDD SP1 annex envelope rules to Simplicity spends. */
     bool enable_usdd_sp1_annex = false;
 };

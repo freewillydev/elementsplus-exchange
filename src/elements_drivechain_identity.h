@@ -13,11 +13,12 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <haskell/resource_constants.h>
 
 /**
  * Frozen identity of the sole built-in Elements Drivechain network.
  *
- * These values are intentionally collected in one dependency-free header so
+ * These values and the generated resource table have no runtime dependencies, so
  * startup gates, chain parameters, and wire codecs cannot silently drift.
  * Changing any network/consensus value defines a different network and
  * requires a new genesis. The explicitly labelled enforcer compatibility pin
@@ -148,20 +149,7 @@ inline constexpr char WITHDRAWAL_BIP301_CHECKPOINT_DOMAIN[]{
 // network identity and its new genesis/datadir. V7 activates this lane for
 // prototype consensus testing; P99 and independent audit gates remain release
 // requirements rather than mutable consensus switches.
-inline constexpr uint32_t CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE{6'000'000U};
-inline constexpr uint32_t CONSENSUS_MAX_BLOCK_WEIGHT{6'000'000U};
-inline constexpr uint32_t USDD_SP1_ANNEXES_PER_BLOCK{1U};
-inline constexpr uint32_t USDD_SP1_PROOF_TX_MAX_WEIGHT{1'500'000U};
-inline constexpr uint32_t USDD_SP1_ANNEX_MAX_BYTES{1'310'720U}; // 1.25 MiB
-inline constexpr uint32_t USDD_SP1_PUBLIC_VALUES_MAX_BYTES{16U * 1024U};
-inline constexpr uint32_t USDD_SP1_MEASURED_RAW_PROOF_BYTES{1'272'546U};
-inline constexpr uint32_t USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES{1'001U};
-inline constexpr uint32_t USDD_SP1_MEASURED_ANNEX_BYTES{1'273'602U};
-// Witness attribution for one annex item is CompactSize(payload) plus payload.
-// A payload above 65535 bytes uses a five-byte CompactSize encoding.
-inline constexpr uint32_t USDD_SP1_MEASURED_ANNEX_WEIGHT{1'273'607U};
-inline constexpr uint32_t USDD_SP1_MAX_ANNEX_WEIGHT{1'310'725U};
-inline constexpr uint32_t USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT{189'275U};
+// Values are generated from Haskell; retain native compile-time relationships.
 static_assert(USDD_SP1_PROOF_TX_MAX_WEIGHT * 4U <=
               CONSENSUS_MAX_BLOCK_WEIGHT);
 static_assert(USDD_SP1_MEASURED_RAW_PROOF_BYTES +

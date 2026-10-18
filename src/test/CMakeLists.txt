@@ -43,6 +43,7 @@ add_executable(test_elements
   disconnected_transactions.cpp
   dynafed_tests.cpp
   drivechain_bmm_tests.cpp
+  utreexo_tests.cpp
   drivechain_peg_tests.cpp
   drivechain_treasury_tests.cpp
   drivechain_withdrawal_tests.cpp

@@ -323,7 +323,7 @@ void BenchmarkActivationV5Groth16(benchmark::Bench& bench, bool tampered)
     if (path == nullptr || path[0] == '\0') {
         throw std::runtime_error{"ECX_BENCH_VALID_ACTIVATION_V5_ANNEX is required"};
     }
-    Context context = MakeContext(nullptr, path);
+    Context context = MakeContext(nullptr, nullptr, nullptr, path);
     bench.run([&] {
         const bool valid = ecx_simplicity_bench_activation_v5_groth16(context.get(), tampered);
         ankerl::nanobench::doNotOptimizeAway(valid);
@@ -422,7 +422,7 @@ void BenchmarkEvalActivationV5Groth16(benchmark::Bench& bench, bool tampered)
     if (path == nullptr || path[0] == '\0') {
         throw std::runtime_error{"ECX_BENCH_VALID_ACTIVATION_V5_ANNEX is required"};
     }
-    Context context = MakeContext(nullptr, path);
+    Context context = MakeContext(nullptr, nullptr, nullptr, path);
     bench.run([&] {
         const bool valid =
             ecx_simplicity_bench_eval_activation_v5_groth16(context.get(), tampered);
