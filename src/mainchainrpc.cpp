@@ -409,7 +409,7 @@ static void http_error_cb(enum evhttp_request_error err, void *ctx)
 }
 #endif
 
-static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const UniValue& params)
+static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const UniValue& params, const std::string& endpoint)
 {
     CheckDrivechainParentDeadline();
     std::string host = gArgs.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT);
@@ -484,7 +484,7 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
     assert(output_buffer);
     evbuffer_add(output_buffer, strRequest.data(), strRequest.size());
 
-    int r = evhttp_make_request(evcon.get(), req.get(), EVHTTP_REQ_POST, "/");
+    int r = evhttp_make_request(evcon.get(), req.get(), EVHTTP_REQ_POST, endpoint.c_str());
     req.release(); // ownership moved to evcon in above call
     if (r != 0) {
         throw CConnectionFailed("send http request failed");
@@ -516,11 +516,11 @@ static UniValue CallMainChainRPCUncircuit(const std::string& strMethod, const Un
     return reply;
 }
 
-UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
+static UniValue CallMainChainRPCAt(const std::string& strMethod, const UniValue& params, const std::string& endpoint)
 {
     CheckDrivechainParentRpcCircuit();
     const auto call = [&] {
-        UniValue reply = CallMainChainRPCUncircuit(strMethod, params);
+        UniValue reply = CallMainChainRPCUncircuit(strMethod, params, endpoint);
         MarkDrivechainParentRpcAvailable();
         return reply;
     };
@@ -551,6 +551,21 @@ UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params)
         MarkDrivechainParentRpcUnavailable();
         throw;
     }
+}
+
+UniValue CallMainChainRPC(const std::string& method, const UniValue& params)
+{
+    return CallMainChainRPCAt(method, params, "/");
+}
+
+UniValue CallMainChainWalletRPC(const std::string& wallet, const std::string& method, const UniValue& params)
+{
+    if (wallet.empty()) throw std::runtime_error("Set -drivechainbmmwallet to an explicitly funded parent wallet");
+    char* encoded = evhttp_uriencode(wallet.data(), wallet.size(), false);
+    if (!encoded) throw std::runtime_error("Cannot encode parent wallet endpoint");
+    const std::string endpoint = "/wallet/" + std::string(encoded);
+    free(encoded);
+    return CallMainChainRPCAt(method, params, endpoint);
 }
 
 UniValue CheckDrivechainRPCReply(const std::string& method, const UniValue& reply, bool require_result)

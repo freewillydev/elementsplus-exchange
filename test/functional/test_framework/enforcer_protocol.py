@@ -11,7 +11,8 @@ def load_protocol(directory):
     output = Path(directory) / "enforcer-descriptor.pb"
     subprocess.run(["protoc", f"--proto_path={root}", "--include_imports",
                     f"--descriptor_set_out={output}",
-                    "cusf/mainchain/v1/validator.proto", "cusf/mainchain/v1/wallet.proto"],
+                    "cusf/mainchain/v1/validator.proto", "cusf/mainchain/v1/wallet.proto",
+                    "cusf/mainchain/v1/block_producer.proto"],
                    check=True, capture_output=True)
     descriptor = descriptor_pb2.FileDescriptorSet.FromString(output.read_bytes())
     pool = descriptor_pool.DescriptorPool()

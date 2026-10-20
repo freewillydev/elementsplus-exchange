@@ -38,10 +38,54 @@ rely on trusted same-host isolation. Remote wallet access needs a separately
 authenticated TLS tunnel/proxy with a narrow allowlist; never expose raw RPC.
 This configuration does not protect against compromise of the host/user.
 
-## Enforcer mutual TLS
+## Local BMM funding
 
-All active enforcer operations, including BMM, withdrawal submission and
-validation-data queries, use the same authenticated unary gRPC path. There is
+Elements constructs the BIP301 M8 request as output zero of a normal parent
+transaction. It funds and signs through an **explicit existing Bitcoin Core
+wallet**, then uses parent `testmempoolaccept` and `sendrawtransaction`. It does
+not request coins or signatures from an enforcer wallet, create/load a wallet,
+or fall back to the parent's default wallet.
+
+```ini
+# Keep production disabled until the wallet, chain and spending policy are checked.
+drivechainl1blocksync=0
+drivechainbmmwallet=elements-bids
+drivechainbmmbid=250
+drivechainbmmreplacementextra=0
+```
+
+The named wallet must be loaded, unlocked for signing when necessary, and have
+confirmed funds. Restrict it to the bid budget; do not select a savings wallet.
+The configured bid is a minimum per-candidate transaction fee, not a total
+spending cap: candidate fees can raise it under the existing pricing policy.
+The fee is selected before signing; no fee-estimator adjustment can silently
+raise it. Funding requires confirmed inputs and at least 1,000 sats of change.
+The parent genesis and configured fork checkpoint, slot, current parent hash/height, funding outputs, and signed
+transaction are checked before broadcast.
+
+Signed requests are synchronously journaled in `bmm-bids/` under the network
+data directory, scoped by parent genesis, wallet and slot. Keep this directory
+across restarts. Lost replies retry the identical transaction; a different
+candidate for the same parent is refused. An unmined stale request reuses its
+inputs when possible, replacing it only within the selected fee plus the
+explicit replacement allowance. A rejected replacement waits for a later
+attempt; it does not silently fund another conflicting bid. Do not share one
+bid wallet across independent producers.
+
+Mempool acceptance is not block acceptance. A compatible miner must include
+the matching M7 commitment and M8 request. Elements still independently checks
+the authenticated parent evidence. The parent can advance between the last
+tip check and broadcast; no remote RPC sequence can make those atomic.
+
+## Miner enforcer mutual TLS
+
+Withdrawal proposals and optional enforcer queries use the authenticated unary
+gRPC path. BMM funding/broadcast does not use gRPC. Withdrawal submission calls
+the wallet-free `cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle`,
+not the deprecated wallet-service alias. The miner operates the enforcer;
+Elements needs only its endpoint and credentials, not a local enforcer daemon.
+Submission is not approval: the genuine BIP300 vote and mined M6 remain required.
+There is
 no plaintext ConnectJSON fallback, bearer-cookie alternative, or PATH search.
 
 The Haskell client is linked into the node and uses the gRPC C core directly.
@@ -57,8 +101,14 @@ Do not forward that plaintext listener to another host or an untrusted network.
 
 ```sh
 contrib/drivechain-mtls/generate-certs.sh /absolute/path/to/elements-v11/enforcer-tls
-contrib/drivechain-mtls/run-stunnel-proxy.sh /absolute/path/to/elements-v11/enforcer-tls
+contrib/drivechain-mtls/run-mtls-proxy.sh /absolute/path/to/elements-v11/enforcer-tls
 ```
+
+Install HAProxy (`brew install haproxy` on macOS). The helper verifies client
+certificates and the `elements-client` identity, requires TLS 1.2 or later, and
+negotiates HTTP/2 using ALPN `h2`. A TLS tunnel without ALPN is not compatible
+with the gRPC C core, even if a grpcurl probe succeeds. The old
+`run-stunnel-proxy.sh` name delegates to this helper for compatibility.
 
 Configure absolute paths (relative credential paths resolve under the network
 data directory):
@@ -73,8 +123,13 @@ drivechainbmmgrpcauthority=enforcer.local
 
 On POSIX, credential files and their immediate directory must be owned by the
 Elements user and not group/other writable; files must not be symlinks. The
-client private key requires mode 0600. The endpoint must be numeric loopback,
-even with TLS. An optional deprecated `drivechainbmmwalletaddr` must exactly
+client private key requires mode 0600. Numeric loopback is the default endpoint
+policy. For a miner-operated remote endpoint, explicitly set
+`drivechainenforcerremote=1`, use its IP or DNS name in `drivechainbmmgrpcaddr`,
+and install the miner-issued client credentials and trusted CA. Set
+`drivechainbmmgrpcauthority` to the server certificate's authenticated DNS name.
+Remote opt-in does not relax mTLS, allow plaintext, or permit remote parent
+wallet HTTP. An optional deprecated `drivechainbmmwalletaddr` must exactly
 match it; `drivechainbmmconnectauthcookie` is unsupported.
 The overall Haskell migration still requires a native macOS/Linux toolchain;
 Windows packaging is not qualified. This transport change does not change that.
@@ -85,15 +140,22 @@ Run isolated transport regression tests (no live enforcer or funds):
 
 ```sh
 cmake --build build --target haskell_grpc_probe -j1
-python3 src/haskell/test/grpc_transport.py build/bin/haskell_grpc_probe /path/to/temporary-directory
+python3 src/haskell/test/grpc_transport.py build/bin/haskell_grpc_probe /path/to/temporary-directory build/bin/elements-functional-test-node
 ```
 
-Tests require Python grpcio/protobuf, protoc, bash, and openssl. The build needs
+Tests require Python grpcio/protobuf, protoc, bash, openssl, and HAProxy. The build needs
 Cabal and gRPC C-core development libraries; Haskell dependency sources are pinned
 in `src/haskell/GrpcDependencies.cmake`. Match native dependency deployment targets
 to the intended release OS; locally installed libraries are not portable releases.
 Missing/wrong client credentials must fail the TLS handshake. No plaintext or
 insecure-certificate fallback is provided.
+
+Daemon startup re-executes the node after detaching, retaining the initialization
+pipe for `-daemonwait`. Configuration parsing already uses the threaded Haskell
+runtime; using that runtime after a raw fork loses its worker threads and can
+hang the first asynchronous gRPC request. The optional test-node argument above
+checks daemon startup, read-only enforcer queries, and shutdown with isolated
+fixtures. No live transactions are created.
 
 ## Production and rotation
 

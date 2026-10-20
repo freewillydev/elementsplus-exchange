@@ -281,7 +281,7 @@ static UniValue BroadcastDrivechainWithdrawalBundle(const CheckpointWithdrawalBu
         "broadcast_response",
         CallAuthenticatedDrivechainJSONResult(
             enforcer,
-            "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+            "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle",
             payload));
     return result;
 }

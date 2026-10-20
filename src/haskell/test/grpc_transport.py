@@ -3,6 +3,7 @@
 import concurrent.futures
 import json
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,8 +14,10 @@ from google.protobuf import json_format
 root = pathlib.Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(root / "test/functional"))
 from test_framework.enforcer_protocol import load_protocol
+from grpc_daemon import check_daemon, unused_port
 
-probe, temporary_root = sys.argv[1:]
+probe, temporary_root = sys.argv[1:3]
+node = sys.argv[3] if len(sys.argv) > 3 else None
 cases = [
     ("ValidatorService", "GetChainInfo", {}, {"network": "NETWORK_SIGNET"}),
     ("ValidatorService", "GetChainTip", {}, {"blockHeaderInfo": {
@@ -24,7 +27,8 @@ cases = [
     ("ValidatorService", "GetSidechains", {}, {"sidechains": [{"sidechainNumber": 24,
         "description": {"hex": "aabb"}, "activationHeight": 100}]}),
     ("ValidatorService", "GetTwoWayPegData", {"sidechainId": 24, "endBlockHash": {"hex": "33" * 32}},
-        {"blocks": [{"blockInfo": {"events": [{"deposit": {"sequenceNumber": "3",
+        {"blocks": [{"blockHeaderInfo": {"blockHash": {"hex": "33" * 32}, "height": 123},
+         "blockInfo": {"events": [{"deposit": {"sequenceNumber": "3",
          "outpoint": {"txid": {"hex": "44" * 32}, "vout": 1},
          "output": {"address": {"hex": "abcd"}, "valueSats": "1000"}}},
          {"withdrawalBundle": {"m6id": {"hex": "99" * 32}, "event": {"submitted": {}}}}]}}]}),
@@ -32,6 +36,7 @@ cases = [
         "height": 123, "criticalHash": {"hex": "55" * 32}, "prevBytes": {"hex": "66" * 32}},
         {"txid": {"hex": "77" * 32}}),
     ("WalletService", "BroadcastWithdrawalBundle", {"sidechainId": 24, "transaction": "AAEC"}, {}),
+    ("BlockProducerService", "ProposeWithdrawalBundle", {"sidechainId": 24, "transaction": "AAEC"}, {}),
 ]
 
 with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as directory:
@@ -56,7 +61,8 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
         expected_message = json_format.ParseDict(expected, request_type())
         response_message = json_format.ParseDict(response, response_type())
         def invoke(wire, context):
-            assert context.auth_context()["x509_common_name"] == [b"elements-client"]
+            if "x509_common_name" in context.auth_context():
+                assert context.auth_context()["x509_common_name"] == [b"elements-client"]
             assert request_type.FromString(wire) == expected_message
             calls.append(method)
             if behavior in ("deadline", "cancel"):
@@ -83,6 +89,7 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
             ((certs / "server-key.pem").read_bytes(), (certs / "server.pem").read_bytes())],
             root_certificates=(certs / "ca.pem").read_bytes(), require_client_auth=True)
         port = server.add_secure_port("127.0.0.1:0", credentials)
+        plaintext_port = server.add_insecure_port("127.0.0.1:0")
         assert port
         server.start()
         def run(service, method, request, mode="valid"):
@@ -109,8 +116,39 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
                 assert time.monotonic() - started < 5
                 print("PASS", behavior, flush=True)
             behavior = "valid"
+            if node:
+                check_daemon(node, directory, certs, port, calls)
+            # Qualify the shipped HTTP/2 proxy, not just direct gRPC TLS.
+            secure_port = port
+            port = unused_port()
+            with tempfile.TemporaryFile() as proxy_log:
+                proxy = subprocess.Popen(["bash", str(root / "contrib/drivechain-mtls/run-mtls-proxy.sh"),
+                    str(certs), f"127.0.0.1:{port}", f"127.0.0.1:{plaintext_port}"],
+                    stdout=proxy_log, stderr=proxy_log)
+                try:
+                    for _ in range(100):
+                        try:
+                            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                                break
+                        except OSError:
+                            assert proxy.poll() is None, "HTTP/2 proxy exited"
+                            time.sleep(0.05)
+                    for service, method, request, response in cases:
+                        before = len(calls)
+                        status, output = run(service, method, request)
+                        assert status == 0, (method, status, output)
+                        assert len(calls) == before + 1
+                    if node:
+                        proxy_directory = pathlib.Path(directory) / "proxied"
+                        proxy_directory.mkdir()
+                        check_daemon(node, proxy_directory, certs, port, calls)
+                    print("PASS authenticated HTTP/2 proxy: all allowed methods", flush=True)
+                finally:
+                    proxy.terminate()
+                    proxy.wait(timeout=10)
+                    port = secure_port
             before = len(calls)
-            assert run("ValidatorService", "GetChainInfo", {}, "wrong-authority")[0] != 0
+            assert run("ValidatorService", "GetChainInfo", {}, "wrong-authority")[0] == 14
             assert len(calls) == before
             assert run("ValidatorService", "Stop", {})[0] == -1
             assert len(calls) == before

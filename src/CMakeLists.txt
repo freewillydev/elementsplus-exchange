@@ -327,6 +327,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   kernel/coinstats.cpp
   mainchainrpc.cpp
   mainchainrpc_ecx.cpp
+  drivechain_bid_wallet.cpp
   kernel/context.cpp
   kernel/cs_main.cpp
   kernel/disconnected_transactions.cpp

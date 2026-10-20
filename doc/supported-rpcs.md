@@ -33,9 +33,9 @@ methods can change state or spend funds. Listing a method is not advice to execu
 | `getdrivechainpegevents` | Scans active-chain peg events. Optional `include_l1` queries the enforcer's `GetTwoWayPegData`; this is not the native deposit-validation authority. |
 | `getdrivechainwithdrawalbundle` | Derives a canonical blinded M6 from a confirmed native pegged-asset burn. Does not submit it. |
 | `verifydrivechainwithdrawalbundle` | Checks a proposed blinded M6 against its confirmed burn. Does not submit it or cast a vote. |
-| `submitdrivechainwithdrawal` | Derives and idempotently submits the burn's bundle to the configured enforcer. Submission is not approval or mined M6 inclusion. |
+| `submitdrivechainwithdrawal` | Derives and idempotently submits the burn's bundle to the miner enforcer's wallet-free `BlockProducerService/ProposeWithdrawalBundle`. Submission is not approval or mined M6 inclusion. |
 | `getbmmconsensuscontext` | Returns the active tip's authenticated prior-parent context. Does not choose a future block's parent or activate ECX. |
-| `submitbmmworkbid` | Submits a work-funded BIP301 bid through the configured enforcer, subject to candidate fee, verification-work and reserve limits. Can spend bid funds. |
+| `submitbmmworkbid` | Constructs, funds, signs and broadcasts a BIP301 M8 transaction through the explicit `drivechainbmmwallet` on parent RPC, subject to candidate fee, verification-work and reserve limits. Can spend bid funds; never falls back to an enforcer wallet. |
 | `getecxconsensuscontext` | Returns ECX source heads and authenticated BMM clock used by mempool/next-block Simplicity execution. |
 | `getecxstateutxoroot` | Computes the ECX header root for an existing unspent output; intended for freezing an activated-regtest genesis singleton. |
 | `getecxbondinboxentries` | Reconstructs a bounded range of node-verified bond-inbox entries and source transactions from archival blocks. |
@@ -45,9 +45,10 @@ methods can change state or spend funds. Listing a method is not advice to execu
 | `getsimplicityinfo` | Reports Simplicity information for the node. |
 | `getsidechaininfo` | Reports Elements sidechain configuration/information. |
 
-Enforcer gRPC methods such as `CreateBmmCriticalDataTransaction` and
-`BroadcastWithdrawalBundle` are **not Elements JSON-RPC methods**. The node's
-submission paths call them through its authenticated enforcer client. Native
+Enforcer gRPC methods are **not Elements JSON-RPC methods**. Withdrawals use
+the miner's `ProposeWithdrawalBundle`; BMM bids use ordinary authenticated
+parent wallet RPC and `sendrawtransaction`, not `CreateBmmCriticalDataTransaction`.
+See [funding and miner endpoint setup](drivechain-rpc-security.md). Native
 deposit validation uses local authenticated parent replay, with mainchain RPC
 checks where needed. Platform and configuration restrictions still apply to
 submissions; consult [peg operations](drivechain-peg-operations.md).

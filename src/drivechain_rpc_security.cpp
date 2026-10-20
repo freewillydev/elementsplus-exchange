@@ -31,6 +31,28 @@ struct DrivechainGrpcTLSConfig {
     std::string authority;
 };
 
+bool IsEnforcerHostAllowed(const std::string& host, bool allow_remote)
+{
+    if (IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true)) return true;
+    if (!allow_remote) return false;
+    // Admit only IP literals or DNS names, never gRPC resolver URIs or paths.
+    if (const auto ip = LookupHost(host, /*fAllowLookup=*/false)) {
+        return ip->IsIPv4() || ip->IsIPv6();
+    }
+    if (host.empty() || host.size() > 253) return false;
+    size_t label_start{0};
+    for (size_t i = 0; i <= host.size(); ++i) {
+        if (i == host.size() || host[i] == '.') {
+            if (i == label_start || i - label_start > 63 ||
+                host[label_start] == '-' || host[i - 1] == '-') return false;
+            label_start = i + 1;
+        } else if (!IsDigit(host[i]) && !(ToLower(host[i]) >= 'a' && ToLower(host[i]) <= 'z') && host[i] != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
 fs::path ResolveDrivechainGrpcCredentialPath(const ArgsManager& args,
                                              const std::string& argument,
                                              const std::string& fallback)
@@ -188,7 +210,7 @@ bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error
         "-drivechainbmmgrpcaddr must be a host:port endpoint without a URL scheme",
         "-drivechainbmmgrpcaddr contains whitespace, control characters, or excessive data",
         "-drivechainbmmgrpcaddr must contain a non-empty host and nonzero port",
-        "-drivechainbmmgrpcaddr requires numeric loopback (IPv4 127/8 or IPv6 ::1)",
+        "-drivechainbmmgrpcaddr requires numeric loopback unless -drivechainenforcerremote=1; remote endpoints must be IP literals or DNS names",
         "-drivechainpegoutenforcer and -drivechainbmmgrpcaddr must select the same authenticated endpoint",
         "-drivechainbmmwalletaddr and -drivechainbmmgrpcaddr must select the same authenticated endpoint",
         "Connect bearer authentication is no longer supported; configure enforcer mTLS",
@@ -208,7 +230,7 @@ bool ValidateDrivechainGrpcTLSConfig(const ArgsManager& args, std::string* error
         case 5:
             SplitHostPort(config.address,port,host);
             return !host.empty() | (!host.starts_with('-') << 1) | ((port!=0) << 2);
-        case 7: return IsMainchainRPCHostAllowed(host, /*native_drivechain=*/true);
+        case 7: return IsEnforcerHostAllowed(host, args.GetBoolArg("-drivechainenforcerremote", false));
         // Compatibility endpoints must identify the same authenticated enforcer.
         case 9: return args.IsArgSet("-drivechainpegoutenforcer");
         case 20: return args.GetArg("-drivechainpegoutenforcer","")==config.address;

@@ -32,6 +32,10 @@ select method payload = case C.unpack method of
     codec (Proxy @W.CreateBmmCriticalDataTransactionRequest) (Proxy @W.CreateBmmCriticalDataTransactionResponse) payload
   "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle" ->
     codec (Proxy @W.BroadcastWithdrawalBundleRequest) (Proxy @W.BroadcastWithdrawalBundleResponse) payload
+  -- The pinned miner service uses exactly the same fields as its deprecated
+  -- wallet alias (sidechain_id=1, transaction=2, empty response).
+  "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle" ->
+    codec (Proxy @W.BroadcastWithdrawalBundleRequest) (Proxy @W.BroadcastWithdrawalBundleResponse) payload
   "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData" ->
     codec (Proxy @V.GetTwoWayPegDataRequest) (Proxy @V.GetTwoWayPegDataResponse) payload
   "cusf.mainchain.v1.ValidatorService/GetChainInfo" ->
@@ -77,6 +81,7 @@ normalizeRequest method payload = do
     "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction" ->
       Right ["sidechain_id","value_sats","height","critical_hash","prev_bytes"]
     "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle" -> Right ["sidechain_id","transaction"]
+    "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle" -> Right ["sidechain_id","transaction"]
     "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData" -> Right ["sidechain_id","start_block_hash","end_block_hash"]
     "cusf.mainchain.v1.ValidatorService/GetCtip" -> Right ["sidechain_number"]
     "cusf.mainchain.v1.ValidatorService/GetChainInfo" -> Right []

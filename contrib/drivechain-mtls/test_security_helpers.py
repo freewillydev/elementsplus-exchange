@@ -133,9 +133,10 @@ class CertificateTests(unittest.TestCase):
                     self.assertEqual(success, expected)
                     self.assertEqual(outcomes, [expected])
 
-    @unittest.skipUnless(shutil.which("stunnel"), "stunnel required")
+    @unittest.skipUnless(shutil.which("haproxy"), "HAProxy required")
     def test_proxy_forwards_authenticated_client(self):
         client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client.set_alpn_protocols(["h2"])
         client.load_verify_locations(str(self.credentials / "ca.pem"))
         client.load_cert_chain(str(self.credentials / "elements-client.pem"),
                                str(self.credentials / "elements-client-key.pem"))
@@ -179,9 +180,28 @@ class CertificateTests(unittest.TestCase):
                             time.sleep(0.05)
                     with connection:
                         with client.wrap_socket(connection, server_hostname="enforcer.local") as tls:
+                            self.assertEqual(tls.selected_alpn_protocol(), "h2")
                             tls.sendall(b"x")
                             self.assertEqual(tls.recv(1), b"y")
                     self.assertEqual(outcomes, [True])
+                    for identity, alpn in ((False, True), (True, False)):
+                        rejected = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        rejected.load_verify_locations(str(self.credentials / "ca.pem"))
+                        if identity:
+                            rejected.load_cert_chain(str(self.credentials / "elements-client.pem"),
+                                                     str(self.credentials / "elements-client-key.pem"))
+                        if alpn:
+                            rejected.set_alpn_protocols(["h2"])
+                        try:
+                            with socket.create_connection(endpoint, timeout=2) as connection:
+                                with rejected.wrap_socket(connection, server_hostname="enforcer.local") as tls:
+                                    tls.sendall(b"x")
+                                    self.assertEqual(tls.recv(1), b"")
+                        except ssl.SSLError:
+                            pass
+                        upstream.settimeout(0.2)
+                        with self.assertRaises(TimeoutError):
+                            upstream.accept()
                 finally:
                     process.terminate()
                     try:
@@ -192,7 +212,7 @@ class CertificateTests(unittest.TestCase):
                     worker.join(12)
                     self.assertFalse(worker.is_alive())
 
-    @unittest.skipUnless(shutil.which("stunnel"), "stunnel required")
+    @unittest.skipUnless(shutil.which("haproxy"), "HAProxy required")
     def test_proxy_rejects_non_numeric_or_non_loopback_endpoints(self):
         for endpoint in ("127.attacker.example:50051", "localhost:50051", "192.168.1.1:50051",
                          "0.0.0.0:55051", "127.0.0.256:1", "127.01.0.1:1", "127.0.0.1:0",

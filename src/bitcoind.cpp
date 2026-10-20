@@ -30,8 +30,13 @@
 #include <util/translation.h>
 
 #include <any>
+#include <cstdlib>
 #include <functional>
 #include <optional>
+
+#if HAVE_DECL_FORK
+#include <sys/stat.h>
+#endif
 
 using node::NodeContext;
 
@@ -42,29 +47,39 @@ const TranslateFn G_TRANSLATION_FUN{nullptr};
 /** Custom implementation of daemon(). This implements the same order of operations as glibc.
  * Opens a pipe to the child process to be able to wait for an event to occur.
  *
- * @returns 0 if successful, and in child process.
- *          >0 if successful, and in parent process.
+ * @returns >0 if successful, and in parent process. The child re-executes argv.
  *          -1 in case of error (in parent process).
  *
  *          In case of success, endpoint will be one end of a pipe from the child to parent process,
  *          which can be used with TokenWrite (in the child) or TokenRead (in the parent).
  */
-int fork_daemon(bool nochdir, bool noclose, TokenPipeEnd& endpoint)
+int fork_daemon(bool nochdir, bool noclose, TokenPipeEnd& endpoint, char* const argv[])
 {
-    // communication pipe with child process
-    std::optional<TokenPipe> umbilical = TokenPipe::Make();
-    if (!umbilical) {
-        return -1; // pipe or pipe2 failed.
-    }
+    // Parameter validation has already entered the threaded Haskell RTS. A raw
+    // fork cannot keep its workers alive: the child must exec before using it.
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    TokenPipeEnd reader{fds[0]}, original_writer{fds[1]};
+    const int writer_fd = fcntl(fds[1], F_DUPFD, 3);
+    if (writer_fd < 0) return -1;
+    TokenPipeEnd writer{writer_fd};
+    original_writer.Close();
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        setenv("ELEMENTS_DAEMON_PIPE", std::to_string(writer_fd).c_str(), 1) != 0) return -1;
 
     int pid = fork();
+    if (pid != 0) {
+        const int saved_errno = errno;
+        unsetenv("ELEMENTS_DAEMON_PIPE");
+        errno = saved_errno;
+    }
     if (pid < 0) {
         return -1; // fork failed.
     }
     if (pid != 0) {
         // Parent process gets read end, closes write end.
-        endpoint = umbilical->TakeReadEnd();
-        umbilical->TakeWriteEnd().Close();
+        endpoint = std::move(reader);
+        writer.Close();
 
         int status = endpoint.TokenRead();
         if (status != 0) { // Something went wrong while setting up child process.
@@ -75,18 +90,18 @@ int fork_daemon(bool nochdir, bool noclose, TokenPipeEnd& endpoint)
         return pid;
     }
     // Child process gets write end, closes read end.
-    endpoint = umbilical->TakeWriteEnd();
-    umbilical->TakeReadEnd().Close();
+    endpoint = std::move(writer);
+    reader.Close();
 
 #if HAVE_DECL_SETSID
     if (setsid() < 0) {
-        exit(1); // setsid failed.
+        _exit(1); // setsid failed.
     }
 #endif
 
     if (!nochdir) {
         if (chdir("/") != 0) {
-            exit(1); // chdir failed.
+            _exit(1); // chdir failed.
         }
     }
     if (!noclose) {
@@ -98,14 +113,15 @@ int fork_daemon(bool nochdir, bool noclose, TokenPipeEnd& endpoint)
             // Don't close if fd<=2 to try to handle the case where the program was invoked without any file descriptors open.
             if (fd > 2) close(fd);
             if (err) {
-                exit(1); // dup2 failed.
+                _exit(1); // dup2 failed.
             }
         } else {
-            exit(1); // open /dev/null failed.
+            _exit(1); // open /dev/null failed.
         }
     }
-    endpoint.TokenWrite(0); // Success
-    return 0;
+    endpoint.TokenWrite(0); // Session setup succeeded; initialization follows exec.
+    execvp(argv[0], argv);
+    _exit(1); // Closing the pipe reports exec failure to the waiting parent.
 }
 
 #endif
@@ -165,7 +181,7 @@ static bool ProcessInitCommands(ArgsManager& args)
     return false;
 }
 
-static bool AppInit(NodeContext& node)
+static bool AppInit(NodeContext& node, char* const argv[], int daemon_fd)
 {
     bool fRet = false;
     ArgsManager& args = *Assert(node.args);
@@ -176,7 +192,7 @@ static bool AppInit(NodeContext& node)
     // that the parent process can quit, and whether it was successful/unsuccessful.
     // - an unexpected shutdown of the child process creates an unexpected end of stream at the parent
     // end, which is interpreted as failure to start.
-    TokenPipeEnd daemon_ep;
+    TokenPipeEnd daemon_ep{daemon_fd};
 #endif
     std::any context{&node};
     try
@@ -207,28 +223,28 @@ static bool AppInit(NodeContext& node)
 
         if (args.GetBoolArg("-daemon", DEFAULT_DAEMON) || args.GetBoolArg("-daemonwait", DEFAULT_DAEMONWAIT)) {
 #if HAVE_DECL_FORK
-            tfm::format(std::cout, CLIENT_NAME " starting\n");
-
-            // Daemonize
-            switch (fork_daemon(1, 0, daemon_ep)) { // don't chdir (1), do close FDs (0)
-            case 0: // Child: continue.
+            if (daemon_ep.IsOpen()) {
+                // The re-executed child owns a fresh Haskell runtime.
                 // If -daemonwait is not enabled, immediately send a success token the parent.
                 if (!args.GetBoolArg("-daemonwait", DEFAULT_DAEMONWAIT)) {
                     daemon_ep.TokenWrite(1);
                     daemon_ep.Close();
                 }
-                break;
-            case -1: // Error happened.
-                return InitError(Untranslated(strprintf("fork_daemon() failed: %s", SysErrorString(errno))));
-            default: { // Parent: wait and exit.
-                int token = daemon_ep.TokenRead();
-                if (token) { // Success
-                    exit(EXIT_SUCCESS);
-                } else { // fRet = false or token read error (premature exit).
-                    tfm::format(std::cerr, "Error during initialization - check debug.log for details\n");
-                    exit(EXIT_FAILURE);
+            } else {
+                tfm::format(std::cout, CLIENT_NAME " starting\n");
+                switch (fork_daemon(1, 0, daemon_ep, argv)) {
+                case -1: // Error happened.
+                    return InitError(Untranslated(strprintf("fork_daemon() failed: %s", SysErrorString(errno))));
+                default: { // Parent: wait and exit.
+                    int token = daemon_ep.TokenRead();
+                    if (token == 1) { // EOF and errors must not report startup success.
+                        exit(EXIT_SUCCESS);
+                    } else { // fRet = false or token read error (premature exit).
+                        tfm::format(std::cerr, "Error during initialization - check debug.log for details\n");
+                        exit(EXIT_FAILURE);
+                    }
                 }
-            }
+                }
             }
 #else
             return InitError(Untranslated("-daemon is not supported on this operating system"));
@@ -260,6 +276,20 @@ static bool AppInit(NodeContext& node)
 
 MAIN_FUNCTION
 {
+    int daemon_fd{-1};
+#if HAVE_DECL_FORK
+    if (const char* value = std::getenv("ELEMENTS_DAEMON_PIPE")) {
+        struct stat info{};
+        if (!ParseInt32(value, &daemon_fd) || daemon_fd < 3 ||
+            fstat(daemon_fd, &info) != 0 || !S_ISFIFO(info.st_mode) ||
+            (fcntl(daemon_fd, F_GETFL) & O_ACCMODE) != O_WRONLY ||
+            fcntl(daemon_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            tfm::format(std::cerr, "Invalid daemon initialization pipe\n");
+            return EXIT_FAILURE;
+        }
+        unsetenv("ELEMENTS_DAEMON_PIPE");
+    }
+#endif
 #ifdef WIN32
     common::WinCmdLineArgs winArgs;
     std::tie(argc, argv) = winArgs.get();
@@ -286,7 +316,7 @@ MAIN_FUNCTION
     if (ProcessInitCommands(args)) return EXIT_SUCCESS;
 
     // Start application
-    if (!AppInit(node) || !Assert(node.shutdown_signal)->wait()) {
+    if (!AppInit(node, argv, daemon_fd) || !Assert(node.shutdown_signal)->wait()) {
         node.exit_status = EXIT_FAILURE;
     }
     Interrupt(node);

@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.22)
+if(NOT DEFINED TEST_TMP)
+  message(FATAL_ERROR "Set TEST_TMP to an isolated temporary directory")
+endif()
+file(MAKE_DIRECTORY "${TEST_TMP}")
+set(mock "${TEST_TMP}/mock-cabal")
+foreach(version IN ITEMS 3.8.1.0 3.10.3.0 3.14.1.0 3.14.2.0 3.16.1.0 4.0.0.0 malformed 3.16.1.0junk)
+  file(WRITE "${mock}" "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --numeric-version ] || exit 9\nprintf '%s\\n' '${version}'\n")
+  file(CHMOD "${mock}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE)
+  execute_process(COMMAND "${CMAKE_COMMAND}" "-DELEMENTS_CABAL=${mock}"
+    -P "${CMAKE_CURRENT_LIST_DIR}/../CheckCabal.cmake"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(version MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" AND NOT version VERSION_LESS "3.14.2.0")
+    if(NOT result STREQUAL "0")
+      message(FATAL_ERROR "Supported Cabal ${version} rejected: ${error}")
+    endif()
+  elseif(result STREQUAL "0" OR NOT error MATCHES "DELEMENTS_CABAL=/absolute/path/to/cabal")
+    message(FATAL_ERROR "Cabal ${version} did not produce actionable rejection: ${output}${error}")
+  endif()
+endforeach()
+file(WRITE "${mock}" "#!/bin/sh\nprintf '3.16.1.0\\n'\nexit 1\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DELEMENTS_CABAL=${mock}"
+  -P "${CMAKE_CURRENT_LIST_DIR}/../CheckCabal.cmake" RESULT_VARIABLE result
+  OUTPUT_QUIET ERROR_QUIET)
+if(result STREQUAL "0")
+  message(FATAL_ERROR "Failing Cabal executable was accepted")
+endif()
+file(REMOVE "${mock}")
+execute_process(COMMAND "${CMAKE_COMMAND}" "-DELEMENTS_CABAL=${mock}"
+  -P "${CMAKE_CURRENT_LIST_DIR}/../CheckCabal.cmake" RESULT_VARIABLE result
+  OUTPUT_QUIET ERROR_VARIABLE error)
+if(result STREQUAL "0" OR NOT error MATCHES "DELEMENTS_CABAL=/absolute/path/to/cabal")
+  message(FATAL_ERROR "Missing Cabal executable did not produce actionable rejection")
+endif()
+message(STATUS "Cabal version checks passed (ten cases)")

@@ -672,6 +672,7 @@ grpcMethod method
   where methods =
             ["cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
              "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+             "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle",
              "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
              "cusf.mainchain.v1.ValidatorService/GetChainInfo",
              "cusf.mainchain.v1.ValidatorService/GetChainTip",

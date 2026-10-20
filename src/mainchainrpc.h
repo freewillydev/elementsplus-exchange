@@ -467,6 +467,8 @@ private:
 };
 
 UniValue CallMainChainRPC(const std::string& strMethod, const UniValue& params);
+/** Same authenticated loopback transport, explicitly scoped to a parent wallet. */
+UniValue CallMainChainWalletRPC(const std::string& wallet, const std::string& method, const UniValue& params);
 /** Validate an RPC envelope and copy its result; errors take precedence even when null is allowed. */
 UniValue CheckDrivechainRPCReply(const std::string& method, const UniValue& reply, bool require_result = true);
 UniValue CallMainChainRPCChecked(const std::string& method, const UniValue& params);
@@ -487,7 +489,7 @@ bool CallAuthenticatedDrivechainJSON(
 UniValue BuildDrivechainBmmRequest(int sidechain_slot, uint64_t bid_sats, int64_t parent_height,
     const uint256& critical_hash, const uint256& previous_parent_hash);
 /**
- * Submit a BIP301 M8 bid through the BitWindow/CUSF enforcer wallet.
+ * Fund, sign and broadcast a BIP301 M8 bid through the explicit parent RPC wallet.
  *
  * The bid is paid on the parent chain. The committed critical hash identifies
  * the Elements candidate whose policy-asset fees are collected by its
@@ -500,7 +502,8 @@ bool SubmitDrivechainBmmBid(
     const uint256& critical_hash,
     const uint256& previous_parent_hash,
     uint256& request_txid,
-    std::string* error = nullptr);
+    std::string* error = nullptr,
+    const std::function<bool()>& cancelled = [] { return false; });
 bool GetDrivechainTwoWayPegData(int sidechain_slot, UniValue& response, std::string* error = nullptr);
 bool VerifyDrivechainDeposit(
     const CTransaction& tx,

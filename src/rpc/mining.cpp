@@ -1532,13 +1532,13 @@ static RPCHelpMan getbmmconsensuscontext()
 static RPCHelpMan submitbmmworkbid()
 {
     return RPCHelpMan{"submitbmmworkbid",
-        "Submit a work-funded BIP301 bid through the configured BitWindow enforcer.\n"
+        "Fund and submit a work-priced BIP301 bid through the explicit parent RPC wallet.\n"
         "The bid is capped by the policy-asset fees collected by the candidate, less\n"
         "the node-priced deterministic verification work and producer reserve. The candidate\n"
         "block must pay its fee total to the same producer that funds this parent-chain bid.\n",
         {
             {"critical_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Candidate Elements critical/block hash"},
-            {"sidechain_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Candidate Elements height"},
+            {"sidechain_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Current parent-chain height (legacy argument name)"},
             {"previous_mainchain_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "BIP301 prev-bytes parent hash"},
             {"collected_fee_sats", RPCArg::Type::NUM, RPCArg::Optional::NO, "Candidate policy-asset fees available to its producer, in satoshis"},
             {"simplicity_milliweight", RPCArg::Type::NUM, RPCArg::Optional::NO, "Deterministic Simplicity validation budget reported by getblocktemplate"},
@@ -1547,7 +1547,7 @@ static RPCHelpMan submitbmmworkbid()
         },
         RPCResult{RPCResult::Type::OBJ, "", "Accepted bid", {
             {RPCResult::Type::STR_HEX, "txid", "Parent-chain BMM request transaction"},
-            {RPCResult::Type::NUM, "bid_sats", "Bid submitted to the enforcer wallet"},
+            {RPCResult::Type::NUM, "bid_sats", "Selected parent transaction fee before any replacement allowance"},
             {RPCResult::Type::NUM, "verification_fee_sats", "Node-priced deterministic verification charge"},
             {RPCResult::Type::NUM, "producer_retained_sats", "Verification cost plus reserve retained by producer"},
             {RPCResult::Type::NUM, "producer_surplus_sats", "Uncommitted candidate fee surplus"},
@@ -1585,7 +1585,7 @@ static RPCHelpMan submitbmmworkbid()
                     previous_hash,
                     request_txid,
                     &error)) {
-                throw JSONRPCError(RPC_MISC_ERROR, "BitWindow enforcer rejected BMM bid: " + error);
+                throw JSONRPCError(RPC_MISC_ERROR, "Parent wallet BMM submission failed: " + error);
             }
             UniValue result(UniValue::VOBJ);
             result.pushKV("txid", request_txid.GetHex());

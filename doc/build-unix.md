@@ -7,6 +7,10 @@ Some notes on how to build Bitcoin Core in Unix.
 To Build
 ---------------------
 
+This fork additionally requires the [Haskell toolchain](#haskell-toolchain)
+below. Set it up before running `cabal update` or CMake; Ubuntu's distro Cabal
+may be too old. These requirements supplement the upstream dependencies below.
+
 ```bash
 cmake -B build
 cmake --build build    # use "-j N" for N parallel jobs
@@ -16,6 +20,77 @@ cmake --install build  # optional
 See below for instructions on how to [install the dependencies on popular Linux
 distributions](#linux-distribution-specific-instructions), or the
 [dependencies](#dependencies) section for a complete overview.
+
+## Haskell Toolchain
+
+Use GHC **9.6.7** (the version used by `src/haskell/grpc.project.freeze`) and
+**cabal-install >= 3.14.2.0**, this project's supported baseline. Cabal 3.16.1.0
+is recommended for new installs. Do not substitute Ubuntu 24.04's
+`cabal-install` 3.8.1.0: it predates GHC 9.6 support and can fail during Hackage
+root-key verification after the 2026 key rotation
+([upstream report](https://github.com/haskell/cabal/issues/12367)).
+The version floor is a project support policy, not a claim that every earlier
+release is broken. A successful version check does not replace `cabal update`'s
+repository-signature checks.
+
+Install GHC 9.6.7 using [GHCup](https://www.haskell.org/ghcup/) or an appropriate
+official bindist. The node also needs Rust/Cargo, gRPC C-core and protobuf
+development libraries. For Ubuntu, in addition to the dependencies below:
+
+```bash
+sudo apt-get install curl ca-certificates xz-utils patch libgrpc-dev libprotobuf-dev protobuf-compiler patchelf
+```
+
+For **Ubuntu 24.04 x86-64 only**, this bootstraps Cabal without relying on a
+broken older Cabal to build its replacement. Run from the repository root:
+
+```bash
+set -euo pipefail
+tools="$HOME/.local/opt/cabal-3.16.1.0"
+archive=cabal-install-3.16.1.0-x86_64-linux-ubuntu24_04.tar.xz
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  "https://downloads.haskell.org/~cabal/cabal-install-3.16.1.0/$archive" -o "$tmp/$archive"
+printf '%s  %s\n' \
+  f7284888f523ff0bb3d8bfc9e7b8c89ab3b95fe87792aefc06019801b9f6ef74 \
+  "$tmp/$archive" | sha256sum --check --strict
+tar -xJf "$tmp/$archive" -C "$tmp" cabal
+install -d "$tools"
+install -m 0755 "$tmp/cabal" "$tools/cabal"
+cmake -DELEMENTS_CABAL="$tools/cabal" -P src/haskell/CheckCabal.cmake
+
+# An isolated Cabal directory avoids inheriting obsolete/custom root-key config.
+# Keep this environment for both configuration and subsequent builds.
+export CABAL_DIR="$PWD/build-cabal"
+unset CABAL_CONFIG
+"$tools/cabal" update
+cmake -S . -B build -DELEMENTS_CABAL="$tools/cabal" \
+  -DELEMENTS_GHC="$(command -v ghc-9.6.7)"
+cmake --build build -j1
+```
+
+The digest is pinned from the official
+[SHA256 manifest](https://downloads.haskell.org/~cabal/cabal-install-3.16.1.0/SHA256SUMS).
+For another OS/architecture, select its matching official binary and verify its
+digest; do not run this Ubuntu binary. `ELEMENTS_CABAL` is cached by CMake:
+changing PATH alone will not replace a previously selected `/usr/bin/cabal`.
+Pass the explicit path again when reconfiguring an existing build.
+
+If `cabal update` still reports insufficient root signatures, check which
+executable and `CABAL_DIR`/`CABAL_CONFIG` are being used. A custom `CABAL_CONFIG`
+overrides the directory's normal config; unset it for the isolated setup above.
+Keep secure repository verification enabled. **Never use `secure: False`,
+lower the signature threshold, or delete authentication checks to proceed.**
+Preserve an existing config/cache instead of deleting it; use a separate clean
+directory when diagnosing. A fresh signed index download is required even
+though the project freezes dependency versions.
+
+The local, network-free version-check regression is:
+
+```bash
+cmake -DTEST_TMP="$PWD/build/cabal-check-test" -P src/haskell/test/cabal_check.cmake
+```
 
 ## Memory Requirements
 

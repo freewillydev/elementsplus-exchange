@@ -103,7 +103,7 @@ class EcxWithdrawalPositiveTest(FedPegTest):
                             state = json.load(state_file)
                     state["calls"].append(method)
 
-                    if method.endswith("/BroadcastWithdrawalBundle"):
+                    if method.endswith("/ProposeWithdrawalBundle"):
                         wire = base64.b64decode(payload["transaction"], validate=True)
                         assert_equal(wire[4:6], b"\x00\x01")
                         no_witness = wire[:4] + wire[6:]
@@ -138,7 +138,7 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         self.mock_executor = ThreadPoolExecutor(max_workers=2)
         self.mock_enforcer = grpc.server(self.mock_executor, options=[
             ("grpc.max_receive_message_length", 1024 * 1024)])
-        for service, method in (("WalletService", "BroadcastWithdrawalBundle"),
+        for service, method in (("BlockProducerService", "ProposeWithdrawalBundle"),
                                 ("ValidatorService", "GetTwoWayPegData")):
             full_name = "cusf.mainchain.v1." + service
             self.mock_enforcer.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
@@ -305,7 +305,7 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         assert_equal(
             mock_state["calls"],
             [
-                "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+                "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle",
                 "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
             ],
         )

@@ -1,5 +1,5 @@
 # Native C-core transport with typed protobuf codecs, never a grpcurl subprocess.
-find_program(ELEMENTS_CABAL cabal REQUIRED)
+# ELEMENTS_CABAL is selected and checked before dependency downloads.
 find_program(ELEMENTS_PATCH patch REQUIRED)
 find_path(ELEMENTS_GRPC_INCLUDE grpc/grpc.h REQUIRED)
 find_library(ELEMENTS_GRPC_LIBRARY grpc REQUIRED)

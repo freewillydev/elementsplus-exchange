@@ -108,7 +108,13 @@ exchange client call wire = do
   sent <- runOps (unsafeCC call) (clientCQ client)
     [OpSendInitialMetadata mempty, OpSendMessage wire, OpSendCloseFromClient]
   case sent of
-    Left failure -> pure (Left failure)
+    Left failure -> do
+      -- C-core may mark the send batch unsuccessful on a TLS/connection error.
+      -- Read the final status instead of misreporting every failure as timeout.
+      status <- runOps (unsafeCC call) (clientCQ client) [OpRecvStatusOnClient]
+      pure $ case status >>= compileNormalRequestResults of
+        Left actual@(GRPCIOBadStatusCode code _) | code /= StatusOk -> Left actual
+        _ -> Left failure
     Right initial -> do
       received <- runOps (unsafeCC call) (clientCQ client)
         [OpRecvInitialMetadata, OpRecvMessage, OpRecvStatusOnClient]

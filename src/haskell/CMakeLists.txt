@@ -2,6 +2,7 @@
 if(CMAKE_CROSSCOMPILING OR WIN32)
   message(FATAL_ERROR "The Haskell FFI migration currently requires a native macOS/Linux GHC toolchain; cross/Windows packaging is not qualified yet.")
 endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/CheckCabal.cmake")
 find_program(ELEMENTS_GHC ghc REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/BmmConstants.hs")
@@ -108,6 +109,9 @@ target_include_directories(elements_haskell PRIVATE "${CMAKE_CURRENT_BINARY_DIR}
 target_include_directories(elements_haskell SYSTEM PRIVATE ${rts_includes})
 target_link_libraries(elements_haskell PUBLIC elements_haskell_runtime elements_utreexo PRIVATE core_interface)
 if(BUILD_TESTS)
+  add_test(NAME haskell_cabal_version COMMAND "${CMAKE_COMMAND}"
+    "-DTEST_TMP=${CMAKE_CURRENT_BINARY_DIR}/cabal-version-test"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/test/cabal_check.cmake")
   add_executable(haskell_grpc_probe EXCLUDE_FROM_ALL test/grpc_probe.cpp)
   target_link_libraries(haskell_grpc_probe PRIVATE elements_haskell core_interface)
   set_target_properties(haskell_grpc_probe PROPERTIES SKIP_BUILD_RPATH FALSE BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")

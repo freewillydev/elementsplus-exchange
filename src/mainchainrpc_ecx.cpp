@@ -4,8 +4,11 @@
 
 #include <chainparams.h>
 #include <drivechain_bmm.h>
+#include <drivechain_bid_wallet.h>
+#include <dbwrapper.h>
 #include <drivechain_peg.h>
 #include <drivechain_treasury.h>
+#include <init.h>
 #include <logging.h>
 #include <pegins.h>
 #include <primitives/bitcoin/transaction.h>
@@ -18,6 +21,9 @@
 #include <tinyformat.h>
 
 #include <optional>
+#include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -90,12 +96,12 @@ bool SubmitDrivechainBmmBid(
     const uint256& critical_hash,
     const uint256& previous_parent_hash,
     uint256& request_txid,
-    std::string* error)
+    std::string* error,
+    const std::function<bool()>& cancelled)
 {
     return CatchParentError(error, [&]() -> bool {
         namespace hs = drivechain::haskell;
-        UniValue response;
-        return hs::ParentReplayAll<3>({[&] {
+        return hs::ParentReplayAll<2>({[&] {
         return hs::ParentReplayStore(hs::ReplayStoreFlow::BMM_BID_PREFLIGHT, [&](uint32_t step) -> uint32_t {
             switch (step) {
             case 1: return hs::ParentReplayRecord(hs::ReplayRecordKind::HEIGHT, 0, 0, static_cast<uint64_t>(sidechain_slot), 255);
@@ -111,30 +117,54 @@ bool SubmitDrivechainBmmBid(
             }
         });
         }, [&] {
-        const UniValue request = BuildDrivechainBmmRequest(sidechain_slot,bid_sats,parent_height,critical_hash,previous_parent_hash);
-        return CallAuthenticatedDrivechainJSON(
-                GetDrivechainGrpcAddress(gArgs),
-                "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
-                request,
-                response,
-                error);
-        }, [&] {
-        const UniValue* txid_value{nullptr};
-        const UniValue* hex{nullptr};
-        return hs::ParentReplayStore(hs::ReplayStoreFlow::BMM_BID_TXID, [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: txid_value = &response.get_obj()["txid"]; return 1;
-            case 2: return txid_value->isObject();
-            case 3: throw std::runtime_error("BMM wallet response has no transaction id");
-            case 4: hex = &txid_value->get_obj()["hex"]; return 1;
-            case 5: return hex->isStr();
-            case 6: return IsHex(hex->get_str());
-            case 7: return hex->get_str().size() == drivechain::PARENT_HASH_HEX_LENGTH;
-            case 8: throw std::runtime_error("BMM wallet returned a malformed transaction id");
-            case 9: request_txid = uint256S(hex->get_str()); return 1;
-            default: throw std::logic_error("invalid BMM bid transaction id action");
-            }
-        });
+        const std::string wallet = gArgs.GetArg("-drivechainbmmwallet", "");
+        if (wallet.empty()) throw std::runtime_error("Set -drivechainbmmwallet to an explicitly funded parent wallet");
+        // The spending transport remains authenticated numeric-loopback RPC.
+        if (!IsMainchainRPCHostAllowed(gArgs.GetArg("-mainchainrpchost", DEFAULT_RPCCONNECT), true))
+            throw std::runtime_error("Parent wallet RPC requires numeric loopback");
+        static std::mutex mutex;
+        std::lock_guard<std::mutex> guard{mutex};
+        static std::unique_ptr<CDBWrapper> store;
+        if (!store) store = std::make_unique<CDBWrapper>(DBParams{
+            .path = gArgs.GetDataDirNet() / "bmm-bids", .cache_bytes = 1 << 20});
+        const auto key = std::make_pair(Params().ParentGenesisBlockHash(), std::make_pair(wallet, sidechain_slot));
+        const auto node_rpc = [](const std::string& method, const UniValue& params) {
+            const auto reply = CallMainChainRPC(method, params);
+            if (method == "getmempoolentry" && reply["error"].isObject() &&
+                reply["error"]["code"].getInt<int>() == -5) return UniValue();
+            return CheckDrivechainRPCReply(method, reply);
+        };
+        UniValue genesis_params{UniValue::VARR};
+        genesis_params.push_back(0);
+        if (node_rpc("getblockhash", genesis_params).get_str() != Params().ParentGenesisBlockHash().GetHex())
+            throw std::runtime_error("Parent wallet is on the wrong genesis");
+        const auto& consensus = Params().GetConsensus();
+        if (consensus.drivechain_slot && sidechain_slot != *consensus.drivechain_slot)
+            throw std::runtime_error("BMM bid slot differs from the selected chain");
+        if (!consensus.drivechain_parent_state_hash.IsNull()) {
+            UniValue checkpoint_params{UniValue::VARR};
+            checkpoint_params.push_back(consensus.drivechain_parent_state_height);
+            if (node_rpc("getblockhash", checkpoint_params).get_str() != consensus.drivechain_parent_state_hash.GetHex())
+                throw std::runtime_error("Parent wallet is on the wrong fork checkpoint");
+        }
+        request_txid = drivechain::SubmitLocalBid(
+            {sidechain_slot,parent_height,previous_parent_hash,critical_hash,static_cast<CAmount>(bid_sats),
+                gArgs.GetIntArg("-drivechainbmmreplacementextra", 0)},
+            {node_rpc,
+                [&](const std::string& method, const UniValue& params) {
+                    return CheckDrivechainRPCReply(method, CallMainChainWalletRPC(wallet, method, params));
+                },
+                [&] {
+                    std::string saved;
+                    if (store->Exists(key) && !store->Read(key, saved))
+                        throw std::runtime_error("Corrupt persisted BMM bid");
+                    return saved;
+                },
+                [&](const std::string& hex) {
+                    if (!store->Write(key, hex, /*fSync=*/true)) throw std::runtime_error("Cannot persist BMM bid");
+                },
+                cancelled});
+        return true;
         }});
     });
 }

@@ -7107,6 +7107,7 @@ BOOST_AUTO_TEST_CASE(authenticated_enforcer_argument_plan)
     for (const auto& method : {
         "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction",
         "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle",
+        "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle",
         "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
         "cusf.mainchain.v1.ValidatorService/GetChainInfo",
         "cusf.mainchain.v1.ValidatorService/GetChainTip",
@@ -7282,6 +7283,27 @@ BOOST_AUTO_TEST_CASE(authenticated_enforcer_configuration_fails_closed)
     args.ForceSetArg("-drivechainbmmgrpckey", fs::PathToString(key));
     std::string error;
     BOOST_CHECK_MESSAGE(ValidateDrivechainGrpcTLSConfig(args, &error), error);
+
+    for (const auto& endpoint : {"miner.example:55051", "192.0.2.1:55051", "[2001:db8::1]:55051", "localhost:55051"}) {
+        args.ForceSetArg("-drivechainbmmgrpcaddr", endpoint);
+        args.ForceSetArg("-drivechainenforcerremote", "0");
+        BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+        args.ForceSetArg("-drivechainenforcerremote", "1");
+        BOOST_CHECK_MESSAGE(ValidateDrivechainGrpcTLSConfig(args, &error), error);
+    }
+    for (const auto& endpoint : {"dns:///miner.example:55051", "unix:/tmp/socket", "miner..example:55051",
+            "-miner.example:55051", "miner-.example:55051", "user@miner.example:55051",
+            "miner.example/path:55051", "miner.example:0", "miner.example:65536"}) {
+        args.ForceSetArg("-drivechainbmmgrpcaddr", endpoint);
+        BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    }
+    // Remote admission never skips credential checks.
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "miner.example:55051");
+    args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(tls_dir / "missing.pem"));
+    BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));
+    args.ForceSetArg("-drivechainbmmgrpcca", fs::PathToString(ca));
+    args.ForceSetArg("-drivechainbmmgrpcaddr", "127.0.0.1:55051");
+    args.ForceSetArg("-drivechainenforcerremote", "0");
 
     args.ForceSetArg("-drivechainpegoutenforcer", "127.0.0.1:55052");
     BOOST_CHECK(!ValidateDrivechainGrpcTLSConfig(args, &error));

@@ -597,7 +597,7 @@ bool SubmitDrivechainWithdrawalBundle(
     static constexpr size_t MAX_GRPC_OUTPUT{64 * 1024};
     static constexpr auto GRPC_TIMEOUT{std::chrono::seconds{10}};
     const BoundedCommandResult child = RunAuthenticatedDrivechainGrpc(
-        gArgs, "cusf.mainchain.v1.WalletService/BroadcastWithdrawalBundle", request,
+        gArgs, "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle", request,
         std::chrono::duration_cast<std::chrono::milliseconds>(GRPC_TIMEOUT),
         MAX_GRPC_OUTPUT,
         [&node] { return ShutdownRequested(node); });
@@ -608,81 +608,6 @@ bool SubmitDrivechainWithdrawalBundle(
     return true;
 #else
     throw std::runtime_error("Haskell withdrawal submission unexpectedly admitted Windows");
-#endif
-}
-
-static void SubmitDrivechainBmmGrpcRequest(NodeContext& node, const int sidechain_slot, const int64_t mainchain_tip_height, const uint256& mainchain_tip_hash, const uint256& critical_hash, const CAmount sidechain_fees)
-{
-#ifdef WIN32
-    throw std::runtime_error("BIP301 gRPC request is not supported on Windows builds");
-#else
-    CAmount selected_bid{0};
-    std::string bid_error;
-    CAmount configured_bid{0};
-    namespace hs = drivechain::haskell;
-    hs::ParentReplayStore(hs::ReplayStoreFlow::REQUIRED_PAIR, [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return GetConfiguredDrivechainBmmBid(gArgs, configured_bid, &bid_error);
-        case 2: return ComputeDrivechainBmmBid(configured_bid, sidechain_fees, selected_bid, &bid_error);
-        case 3: throw std::runtime_error(bid_error);
-        default: throw std::logic_error("invalid bid preparation action");
-        }
-    });
-
-    const CAmount extra = gArgs.GetIntArg("-drivechainbmmreplacementextra", 0);
-    const CAmount maximum_bid = drivechain::haskell::BmmReplacementLimit(selected_bid, extra);
-    if (maximum_bid == -1) throw std::runtime_error("Invalid BMM replacement allowance");
-    BoundedCommandResult child;
-    std::string child_error;
-    const int result = drivechain::haskell::BmmSubmit(selected_bid,maximum_bid,
-        [&](uint32_t action, uint64_t value) -> int64_t {
-        switch (action) {
-        case 1: return drivechain::haskell::ParentReplayAll<2>({[&] { return !ShutdownRequested(node); },
-            [&] { return GetMainchainBlockHash(GetMainchainBlockHeight()) == mainchain_tip_hash; }});
-        case 2: {
-        const std::string request = BuildDrivechainBmmRequest(
-            sidechain_slot,value,mainchain_tip_height,critical_hash,mainchain_tip_hash).write();
-
-        static constexpr size_t MAX_GRPC_OUTPUT{64 * 1024};
-        static constexpr auto GRPC_TIMEOUT{std::chrono::seconds{10}};
-        child = RunAuthenticatedDrivechainGrpc(
-            gArgs, "cusf.mainchain.v1.WalletService/CreateBmmCriticalDataTransaction", request,
-            std::chrono::duration_cast<std::chrono::milliseconds>(GRPC_TIMEOUT),
-            MAX_GRPC_OUTPUT,
-            [&node] { return ShutdownRequested(node); });
-        switch (ClassifyDrivechainGrpcResult(child,false,child_error)) {
-        case DrivechainGrpcStatus::PROCESS_FAILURE: return 0;
-        case DrivechainGrpcStatus::NONZERO_EXIT: return 1;
-        case DrivechainGrpcStatus::SUCCESS: return 2;
-        }
-        throw std::logic_error("Invalid BMM child status");
-        }
-        case 3: {
-            CAmount replacement{0};
-            return ComputeDrivechainBmmReplacementBid(child.output,value,maximum_bid,replacement) ? replacement : 0;
-        }
-        case 4:
-            LogPrintf("drivechain L1 block sync: replacing stale BMM input conflict, bid %d -> %d sats (cap %d)\n",
-                selected_bid,value,maximum_bid);
-            selected_bid = value;
-            break;
-        case 5: return drivechain::haskell::BmmMessageMatches(
-            drivechain::haskell::BmmMessageKind::DUPLICATE_REQUEST, child.output);
-        case 6:
-            if (value == 0) {
-                LogPrintf("drivechain L1 block sync: BIP301 BMM request already exists for sidechain %d at mainchain tip %s height %d\n",
-                    sidechain_slot,mainchain_tip_hash.GetHex(),mainchain_tip_height);
-            } else {
-                LogPrintf("drivechain L1 block sync: submitted BIP301 BMM request through enforcer gRPC, sidechain %d, mainchain tip %s at height %d, critical hash %s, candidate fees %s, bid %s, response %s\n",
-                    sidechain_slot,mainchain_tip_hash.GetHex(),mainchain_tip_height,
-                    critical_hash.GetHex(),FormatMoney(sidechain_fees),FormatMoney(selected_bid),child.output);
-            }
-            break;
-        default: throw std::logic_error("Invalid Haskell BMM submission action");
-        }
-        return 1;
-    });
-    if (result) throw std::runtime_error(result == 1 ? "BMM parent changed before submission" : child_error);
 #endif
 }
 
@@ -712,17 +637,27 @@ static bool SubmitNativeDrivechainBmm(NodeContext& node, const int sidechain_slo
         [&] { return IsCurrentDrivechainBidParent(parent_height, parent_hash); },
         [&] {
             try {
-                SubmitDrivechainBmmGrpcRequest(node, sidechain_slot, parent_height, parent_hash, critical_hash, sidechain_fees);
+                CAmount configured{0}, bid{0};
+                uint256 txid;
+                std::string error;
+                if (!GetConfiguredDrivechainBmmBid(gArgs, configured, &error) ||
+                    !ComputeDrivechainBmmBid(configured, sidechain_fees, bid, &error) ||
+                    ShutdownRequested(node) ||
+                    !SubmitDrivechainBmmBid(sidechain_slot, bid, parent_height, critical_hash, parent_hash, txid, &error,
+                        [&] { return ShutdownRequested(node); }))
+                    throw std::runtime_error(error.empty() ? "BMM submission cancelled" : error);
+                LogPrintf("drivechain L1 block sync: submitted local-wallet BMM bid %s for parent %s\n",
+                    txid.GetHex(), parent_hash.GetHex());
                 return true;
             } catch (const std::exception& e) {
-                LogPrintf("drivechain L1 block sync: BIP301 gRPC request failed: %s\n", e.what());
+                LogPrintf("drivechain L1 block sync: local-wallet BIP301 request failed: %s\n", e.what());
                 return false;
             }
         },
     });
 }
 
-static bool SubmitEcxDrivechainBmm(const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount bid)
+static bool SubmitEcxDrivechainBmm(node::NodeContext& node, const int sidechain_slot, const int64_t parent_height, const uint256& parent_hash, const uint256& sidechain_block_hash, const CAmount bid)
 {
     uint256 request_txid;
     std::string error;
@@ -731,7 +666,8 @@ static bool SubmitEcxDrivechainBmm(const int sidechain_slot, const int64_t paren
         switch (step) {
         case 1: return IsCurrentDrivechainBidParent(parent_height,parent_hash);
         case 2: return SubmitDrivechainBmmBid(sidechain_slot,static_cast<uint64_t>(bid),
-            static_cast<uint32_t>(parent_height),sidechain_block_hash,parent_hash,request_txid,&error);
+            static_cast<uint32_t>(parent_height),sidechain_block_hash,parent_hash,request_txid,&error,
+            [&] { return ShutdownRequested(node); });
         case 3: LogPrintf("drivechain L1 block sync: BIP301 work bid failed: %s\n",error); break;
         case 4:
             LogPrintf("drivechain L1 block sync: submitted funded BIP301 work bid %s for critical hash %s; parent request txid %s\n",
@@ -1066,7 +1002,7 @@ static bool MineEcxBlockForParentBlock(NodeContext& node, const int64_t parent_h
     case 17:
     critical_hash = block_template->block.GetBmmCriticalHash();
     return true;
-    case 10: return SubmitEcxDrivechainBmm(sidechain_slot, parent_height, parent_hash, critical_hash, bid);
+    case 10: return SubmitEcxDrivechainBmm(node, sidechain_slot, parent_height, parent_hash, critical_hash, bid);
     case 18:
     LogPrintf("drivechain L1 block sync: work-priced candidate fees=%s verification=%s reserve=%s bid=%s simplicity_milliweight=%u\n",
         FormatMoney(sidechain_fees), FormatMoney(verification_fee),
@@ -1871,10 +1807,12 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the funded local enforcer wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmreplacementextra=<sats>", "Maximum additional satoshis above the selected BMM bid for up to two replacement retries after Core fee-deficit rejections (default: 0, disabled)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", strprintf("Authenticated TLS enforcer endpoint for native BIP301 submission (default: %s). Enforcer responses are not consensus evidence.", DEFAULT_DRIVECHAIN_GRPC_ENDPOINT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Deprecated compatibility assertion; if supplied, must exactly match -drivechainbmmgrpcaddr. Withdrawals and BMM bids use the same authenticated enforcer endpoint.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the explicit parent RPC wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmreplacementextra=<sats>", "Maximum additional satoshis above the selected BMM bid when replacing a stale pending bid (default: 0, no extra allowance)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmgrpcaddr=<host:port>", strprintf("Authenticated TLS miner enforcer endpoint for withdrawal proposals and queries; BMM bids use parent RPC instead (default: %s). Responses are not consensus evidence.", DEFAULT_DRIVECHAIN_GRPC_ENDPOINT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainenforcerremote", "Allow a remote miner-operated enforcer endpoint. Requires mTLS credentials; does not start a local enforcer or change bid funding/consensus rules (default: 0).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainbmmwallet=<name>", "Explicit parent Bitcoin RPC wallet used to fund and sign BMM requests. Must already exist and be funded. No default wallet or enforcer-wallet fallback.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Deprecated compatibility assertion; if supplied, must exactly match -drivechainbmmgrpcaddr.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainpegoutmainfeesats=<sats>", strprintf("Positive L1 fee for historical ECX withdrawals only (default: %d). Must be less than the withdrawal amount; native withdrawals use their RPC fee parameter.", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainrewardaddress=<address>", "Unconfidential P2PKH/P2WPKH address owned by a loaded private-key-enabled Elements wallet, paid the automatic BMM candidate's fees and subsidy. Required for automatic bidding; absent, invalid, or unowned addresses pause bidding without stopping the node. No anyone-can-spend fallback. This does not refund the mainchain bid.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmwalletaddr=<host:port>", "Deprecated compatibility assertion; must exactly match -drivechainbmmgrpcaddr. All enforcer calls require mTLS.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
