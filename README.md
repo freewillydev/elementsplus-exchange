@@ -1,5 +1,7 @@
 # Elements Drivechain node
 
+RPC documentation: [Supported calls, availability and fork-specific methods](doc/supported-rpcs.md).
+
 Elements sidechain implementation targeting Betanet **slot 130** (historical Alpha slot 24). Use `-chain=elements`.
 This is not Liquid, Bitcoin mainnet, or the historical signet demo.
 Confidential transactions and explicit payments are supported. Rangeproof,
