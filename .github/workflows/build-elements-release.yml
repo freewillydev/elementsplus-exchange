@@ -47,13 +47,13 @@ jobs:
           [[ "$SOURCE_SHA" == bf8e9e1e5a6453b3a0573ff57cf9c92b2b3afe2b ]]
 
       - name: Check out release recipes
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: recipes
           persist-credentials: false
 
       - name: Check out exact source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source_sha }}
           path: source
