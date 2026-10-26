@@ -1,5 +1,1694 @@
 # Haskell migration
 
+## Native adapter ownership
+
+Fork-specific production adapters are compiled in existing upstream translation
+units. Their declarations remain in the focused headers. No implementation is
+hidden in an include file, and inherited native validation, cryptography and
+confidential-transaction caches are not moved into Haskell.
+
+| Existing owner | Fork-specific additions |
+| --- | --- |
+| `consensus/tx_check.cpp` | Checked domain ABI adapters and withdrawal encoding |
+| `script/interpreter.cpp` | Exception-safe C/Simplicity ABI adapters |
+| `mainchainrpc.cpp` | Parent RPC, authenticated transport, bid wallet, gRPC adapter |
+| `rpc/request.cpp` | Parent credential-file ownership and native I/O |
+| `block_proof.cpp` | BMM proofs and forced-v3 block commitments |
+| `pegins.cpp` | Drivechain deposit evidence and peg adapters |
+| `txdb.cpp` | Parent replay and exchange state adapters |
+| `consensus/tx_verify.cpp` | Custody projection and forced-v3 admission |
+| `node/blockstorage.cpp` | Parallel Utreexo accumulator adapter |
+| `node/transaction.cpp` | Automatic deposit import and withdrawal journal |
+| `node/chainstate.cpp` | Deployment identity persistence |
+| `wallet/rpc/elements.cpp` | Native withdrawal wallet helpers |
+| `qt/walletview.cpp` | Existing asset-issuance dialog implementation |
+
+The restored upstream `script/bitcoinconsensus.cpp` C API is retained. Separate
+tests, benchmarks and tooling are retained too; this is a production-source
+consolidation, not a claim that no additional test `.cpp` files exist.
+
+Run `python3 contrib/devtools/ffi_surface.py` from the repository root for the
+reproducible source inventory. There are 8 Haskell exports: 6 family
+entrypoints, gRPC and Utreexo. The 291 registered operations have 214
+production binding-use sites, plus one gRPC and one Utreexo entry site (216 total).
+Of those, 206 are in `tx_check.cpp`; eight are in `script/interpreter.cpp`.
+Caller-side workflow composition reuses these bindings and is counted separately.
+Direct ABI use is confined to four existing native
+files; wrappers remain callable from their normal owners. These are static
+source sites, not an execution profile or a reachability proof. Unused operation
+selectors remain reserved; existing section-local indices are not renumbered.
+
+## Six ABI families
+
+The private v2 interface groups the former 16 domain exports into six families:
+
+| Family | Fixed sections, in tag order |
+| --- | --- |
+| Node | Configuration, script policy |
+| Parent | Parent replay |
+| BMM | Admission, proof, codec, state |
+| Peg | Deposit, deposit state, deposit evidence, withdrawal |
+| Exchange | Core, codec, state, admission |
+| USDD | USDD |
+
+The implementation stays in focused Haskell modules rather than merging them
+into oversized files. `DomainABI.hs` has six generated entrypoints using the
+same checked transport. The high 16 selector bits identify a fixed section;
+the low 16 retain its operation index from `abi.def`. New operations cannot
+shift another section. Unknown sections and operations fail before argument
+memory or handler effects are accessed. Named typed C++ bindings remain intact.
+
+This is a private ABI break: rebuild the node and its Haskell library together.
+The old `*_api_v1` exports are absent, so an old native binary cannot silently
+interpret a v2 selector. There is no network, storage, proof or consensus change.
+Reducing 16 exports to 6 did not itself reduce the then-236 binding-use sites in
+`tx_check.cpp`, the then-250 whole-node sites, or runtime boundary crossings.
+The subsequent call-site pass removes eight duplicate sites by sharing adapters
+for export ranges, replay records and transaction shape. It preserves each
+caller's checked result and diagnostic, without claiming runtime-entry savings.
+The ninth site is removed by the composed BMM retarget workflow: it replaces two
+fine-grained production bindings with one workflow binding, while also removing
+two runtime entries on a retarget boundary. The fine-grained bindings remain
+only in the differential tests; all existing ABI selectors are retained.
+
+`ParentReplay.MessageWorkflow` now owns the complete ordered M1/M2/M3/M4
+message traversal, including M7 skipping after its earlier authentication.
+It composes the existing proposal/withdrawal/voting class methods inside
+Haskell. One `ReplayMessages` call replaces nested native traversal, dispatch,
+M2, M3 and M4 entries. Native callbacks retain map lookup/mutation, deadline
+checks and final action publication, with the same partial effects on failure.
+This removes two static production bindings; fine-grained M2/M3 adapters remain
+test-only, and the M4 rule remains covered directly and through this workflow.
+
+Four more static sites were test-only Simplicity adapters (`groth16_header`,
+`canonical_values`, `canonical_activation`, `muldiv128`). They now live in the
+test reference header rather than the production interpreter. Their Haskell
+rules, reserved selectors and tests remain. Removing those unused production
+wrappers does not reduce runtime calls on a live validation path. The eight
+remaining adapters validate execution context/annexes, parse and verify proof
+envelopes, bind bond inputs, and invoke the USDD verifier. No inherited script
+interpreter behavior or confidential proof cache was moved.
+
+## Capability-based FFI workflows
+
+### Persistent replay records
+
+`ReplayStore.Store` owns tip validation, load/reset, append admission/commit,
+record lookups and deposit pagination. Its `Operation` interpreter obtains payload equality
+before invoking `ReplayRecords`, `ReplayAdmission`, `ReplayCommit`,
+`ReplayLookup`, `ReplayScan`, `ReplayLoad` or `ReplayReset`. Append planning and commit share a helper that
+requires only the two relevant capabilities, not `Operation`.
+
+Haskell decodes the existing native record serialization, checks canonical
+CompactSize lengths and bounded fields, and validates deposit/edge/withdrawal
+records against their requested keys. Missing and corrupt records remain
+distinct; occurrence lookups still require the re-proposal schema. The same
+deposit and edge predicates are used for append and read admission.
+
+Pagination keeps the exclusive cursor, 1..64 record limit, key-prefix boundary,
+look-ahead behavior and all-or-nothing page publication. It checks the next key
+before deciding whether a full page needs a continuation cursor, without
+reading that next value. C++ retains LevelDB handles, native codecs, hash
+writers, batch operations, iterator ownership and output publication. Native
+callback faults still unwind through the original error boundaries. No new
+disk format or consensus rule is introduced.
+
+The append/tip pass removed 79 production C++ lines. The lookup/scan pass
+removes another 73 (74 from `txdb.cpp`, with one added status-adapter line).
+Its five direct bridge caller sites become two shared workflow sites;
+successful lookups use one Haskell entry instead of four, missing lookups one
+instead of three, and a deposit scan one instead of one plus its decoded record
+count. Native effects still cross back through callbacks. The global inventory
+remains 216 binding/entry sites, 201 production-used bindings and eight exports;
+all 291 existing operation registrations and selectors are preserved. These
+counts are different from caller-side sites and do not measure latency.
+
+`Load` and `Reset` now each enter Haskell once. Load clears an optional error,
+checks database presence and identity/schema, then decodes and validates the
+tip. Missing, malformed and inconsistent records retain distinct diagnostics;
+an identity mismatch never reads the tip. Reset validates the seed before
+releasing the database lock, reopening the derived index, staging its identity
+and tip, and committing once. The original preflight/rebuild exception
+boundaries remain native. Authentication of the seed remains the caller's
+responsibility; this refactor does not authorize a new checkpoint.
+
+The lifecycle pass removes 29 net production C++ lines and replaces six
+caller-side bridge sites with two; `txdb.cpp` drops from 40 to 36 such sites.
+Successful load uses one Haskell entry instead of five, and reset one instead
+of three. The global binding inventory above is unchanged. Nested parent-cache
+adapters and other fork workflows still remain; this is not whole-node completion.
+
+### Replay-cache advancement
+
+`ParentCache.CacheProgress` composes `CachePreflight`, `CacheAdvance` and
+`CachePublication` after payload equality. The generic `progressReplayCache`
+helper only requires those three capabilities. One checked byte-workflow entry
+now owns pinned-state selection, immutable cache-key comparison, stale-cache
+recovery, replay-budget subtraction, the bounded height loop, contiguity and
+required-proposal checks, and the final three active-chain boundary checks.
+The existing ABI registration is reused with process-local mode 9; no new
+export, disk encoding, network message or consensus rule is introduced.
+
+Native snapshots contain ordinary fixed-width fields with explicit presence
+flags. Haskell validates their exact framing. C++ retains the authenticated
+network check before entry, the outer mutex, block/state object ownership,
+native serialization and RPC/database effects. An expired budget cannot start
+a rebuild. Reorg/replay/write failures revoke the published epoch at the same
+points as before. A successful append is required before changing the memory
+tip; publication still rechecks checkpoint, target and cached tip, then the
+proposal and deadline. Incrementing stops at the target even at UINT32_MAX.
+
+The scoped progress/budget bridge sites fall from nine to one (six to one in
+the progress function), and the measured mainchainrpc bridge-family sites from
+114 to 106. The pass removes 61 net production C++ lines. The global binding
+inventory remains unchanged: those numbers measure different boundaries.
+Initialization, parent-block replay, persistent append, milestone validation
+and BMM extraction now compose directly in Haskell as described below.
+Outer deposit/BMM/withdrawal/exchange workflows still need consolidation;
+this is not the 15-site or whole-node endpoint.
+
+### Parent milestones
+
+`ParentReplay.Milestone` composes source, proposal, activation and checkpoint
+capabilities after payload equality. Haskell owns height/hash comparisons,
+message construction, output iteration, exact-message counting, pending/active
+proposal checks, treasury matching, short-circuit order and diagnostics. Native
+code retains block hashing, upstream `CScript::GetOp`, map access, serialization
+and object lifetimes. The accepted Script envelopes and consensus data remain
+unchanged, including nonminimal PUSHDATA1/2/4 pushes.
+
+Standalone callers enter the existing byte-workflow binding with mode 10.
+Cache advancement invokes `validateMilestones` directly, projecting its effects
+through the same originating callback and retained native block/state objects.
+It no longer reenters Haskell through the milestone, hash, exact-message or
+per-output Script wrappers. Native callbacks remain; this is not zero-cost I/O.
+The milestone region's explicit bridge sites fall from three to one and the
+mainchainrpc measured family from 106 to 104, removing another 32 net C++ lines.
+The global binding inventory is unchanged. Existing public adapters/selectors
+remain available for other callers and compatibility tests.
+
+Tests compare 10,240 real native cases against an independent imperative
+reference, including exact diagnostics with and without an error output, Script
+envelopes, overlapping milestones and treasury/proposal variants. Haskell tests
+cover generic capability sequencing, lazy dispatch mismatch, snapshot truncation,
+strict framing and every-callback faults. Cache tests also exercise direct
+milestone composition and preserve epoch revocation on domain rejection.
+
+### Canonical BMM scan
+
+`ParentReplay.BmmScan` composes `BmmScanAdmission`, `BmmCollection` and
+`BmmPublication` after payload equality. The generic `scanBmmCommitment` helper
+needs only these capabilities. Haskell validates the slot and coinbase snapshot,
+scans every output, recognizes exact M7 messages, counts duplicates, normalizes
+commitment bytes and checks the requested critical hash. The message decoder
+and hash normalization are shared with existing callers, not reimplemented.
+
+Public extraction and matching share one byte-workflow entry (mode 11).
+Cache advancement invokes the Haskell workflow directly on its retained block,
+without reentering the native extractor or its former per-output FFI helpers.
+The common native coinbase reader projects upstream `GetOp` for both BMM and
+milestone workflows. Native object ownership, hash/index assignment and error
+delivery remain explicit callbacks. Output reset happens before FFI entry;
+matching still publishes the selected index before a critical-hash mismatch.
+Missing/duplicate M7 yields a noncanonical cache edge, while malformed callback
+replies abort without treating the failure as a legitimate absent commitment.
+
+The scoped BMM bridge sites fall from nine to one. The expanded mainchainrpc
+family counted by this pass falls from 121 to 113 (it additionally includes
+`ParentReplayAll`, `CountMatches`, `ParseParentMessage` and
+`BmmCommitmentBytes`, so it is not the earlier narrower metric). Native adapter
+and shared-reader changes remove four net production C++ lines. Global binding
+inventory, registered operations and exported symbols remain unchanged.
+
+Tests compare 70,656 native scenarios against an independent Script-based
+reference, including all 256 slots, invalid slots/coinbases, zero hashes,
+duplicate messages, nonminimal pushes, malformed envelopes and optional
+outputs. Each scenario covers extraction and matching with both matching and
+different hashes. Haskell properties cover generated commitments, reusable
+capability stages, lazy mismatches, strict framing, every-callback failures and
+direct cache composition. This is caller consolidation, not whole-node
+migration completion or live-network qualification.
+
+### Deposit admission
+
+`ParentCache.DepositAdmission` carries the `DepositEligibility` and
+`DepositIdentity` capabilities. After payload equality, `AdmitDeposit` composes
+their methods through `admitDeposit`, which requires only those capabilities.
+The slot, value/address bounds, canonical checkpoint/CTIP, immutable replay
+identity, positive voting windows and withdrawal/version checks stay in Haskell.
+`checkCheckpoint` is shared with launch admission; it requests native hashing
+only after the prerequisite identity and treasury checks pass.
+
+One checked byte-workflow call replaces the scalar preflight and its nested
+native-to-Haskell validators. Effects 0/4 clear/report optional diagnostics;
+effect 1 reads eligibility facts, effect 2 reads the immutable configuration,
+and effect 3 hashes the active proposal description. Frames use canonical
+native serialization with strict decoding, including fixed hash slots following
+presence flags. Status 0 accepts, 1 rejects invalid deposit input, and 2 reports
+unavailable replay configuration. Native exceptions keep their original identity.
+This admission remains before the existing confirmed-lookup lock/error scope;
+the confirmed lookup now uses the indexed fold below inside that scope.
+
+The now test-only `ApplyDrivechainParentBlockState` wrapper lives with the pegin
+fixtures. Its `ReplayParentBlock` FFI adapter lives in `test/util/haskell_reference.h`,
+using the existing test callback bridge. Production cache/block replay remains
+direct Haskell composition; standalone replay tests and ABI coverage remain.
+
+### Deposit candidate fold
+
+`DepositCandidates a` uses the same indexed `FoldOperation`/`Continue` design as
+the confirmed-deposit fold below. Its `CandidateAdmission`, `CandidateDiscovery`
+and `CandidateSelection` methods first authenticate a copied cache identity and
+epoch, then compose `ReplayStore.ScanSession` directly, then select eligible
+deposits using the shared Haskell depth rules. Rejected stages short-circuit;
+payload/index mismatches do not inspect the DSL or run effects.
+
+```haskell
+continue @(DepositCandidates ()) CandidateReply $
+  execute (DepositCandidates native) $
+    FilterCandidates (ScanCandidates ReadCandidateSnapshot)
+```
+
+Process-local modes 18/19 add no C export or consensus/storage encoding. The
+native scope still owns the replay lock, iterator, page and output objects.
+The iterator closes before depth policy selection; scan exceptions retain the
+original recoverable boundary, while preflight/filter exceptions still escape.
+The scan publishes a complete unfiltered page and its cursor before selection.
+Filtering never changes that cursor, even when no eligible deposit remains.
+At most 64 records are inspected per page. C++ snapshots share serializers with
+confirmed deposits and cache advancement without changing field order.
+
+Five former nested native validation/scan/depth sites are replaced by one outer
+candidate workflow. Selected network-depth policy still uses a native adapter;
+native effect callbacks are not counted as eliminated runtime crossings. The
+now test-only minimum-depth and depth-predicate FFI adapters live in
+`test/util/haskell_reference.h`, not production code. Lower store validation,
+wire/disk formats, native crypto and confidential caches remain unchanged.
+
+QuickCheck compares boundary/random pages with an independent inclusive-depth
+model and checks exact errors, exclusive cursors, lazy mismatch and every
+callback's framing/exception stop. Native tests use actual database scan closures,
+lookahead pages, fault injection, recovery and lock/iterator lifetime checks.
+
+### Confirmed deposit fold
+
+`ParentCache.ConfirmedDeposit a` has three product-specific capabilities:
+`ConfirmationSnapshot`, `ConfirmationLookup`, and `ConfirmationFinality`.
+Its associated `DSL` is an indexed sum: reading produces `ConfirmationView`,
+matching consumes that child and produces `ConfirmationEvidence`, and final
+authentication consumes evidence and produces `()`. The phantom index is
+explicitly `Type`, including under the native build's `PolyKinds` settings.
+
+`interpret` proves payload equality before inspecting the DSL and supplies the
+capability methods to `ConfirmationAlgebra`. Recursion belongs to the
+`FoldOperation` class instance, not a separate concrete fold function. The
+algebra uses `ExceptT Int32 IO`, so a rejected child cannot run its parent stage.
+The same indexed DSL can use another algebra for structural tests. Finally,
+the `Continue` instance requires `output ~ Outcome (ConfirmedDeposit a)` and
+turns the interpreted result into the existing native status:
+
+```haskell
+continue @(ConfirmedDeposit ()) ConfirmationReply $
+  execute (ConfirmedDeposit maximumMoney native) $
+    AuthenticateConfirmation (MatchConfirmation ReadConfirmation)
+```
+
+This is process-local byte-workflow mode 16, not a new exported symbol or
+consensus encoding. Haskell owns cache/proposal/epoch comparison, direct
+`ReplayStore.LookupSession DepositRecord` composition, exact deposit matching,
+activation/depth decisions and diagnostic construction. Six former nested
+validation/lookup calls disappear from this native workflow. Finality also
+composes `ParentHeader.authenticateActiveHash` directly: effects 200..245 expose
+the native RPC/hash objects, without re-entering through the network-check,
+active-hash or canonical-hash wrappers. The selected network-depth policy and
+lower authenticated HTTP transport still nest; this is not a claim of one
+runtime crossing for the complete RPC path.
+
+C++ retains the original outer lock and exception boundary, copied snapshots,
+database object lifetimes, credential/network checks and final atomic deadline/
+epoch fence. Lookup effects 100..143 share the recoverable store closure used
+by standalone `ReadDeposit` (mode 17). Missing and corrupt records retain their
+distinct statuses; corruption revokes the published epoch, clears the cache and
+requests a rebuild in that order. The lookup closure closes before subsequent
+validation, including rejection. Explicit authenticated targets skip standalone
+parent RPC; malformed frames and native exceptions never become absence claims.
+
+QuickCheck compares status, exact diagnostics and effect traces with the retained
+scalar reference over boundary/random heights and depths. Native tests also use
+the real store closure, inject errors at every reached callback, and check lock
+and closure lifetimes, explicit-target status, invalidation order and final
+deadline/revocation failures. No live-node or network deployment is implied.
+
+### Replay-cache initialization
+
+`ParentCache.CacheStartup` composes `CacheAdmission`,
+`CacheConfiguration`, `CacheStorage` and `CacheBootstrap` after payload equality.
+`initializeReplayCache` requires only those capabilities, not `Operation`.
+It owns the preflight/configure/load/rebuild sequence, including the early
+successful return for an unconfigured pinned state and rejection before cache
+mutation. Launch admission decodes a strict `LaunchIdentity` snapshot and owns
+the pinned-state, proposal, checkpoint/CTIP, voting-window, withdrawal-policy,
+parent-genesis and authenticated checkpoint comparisons. It requests native
+hashing and RPC only after preceding checks pass. The scalar
+`CacheInitialization` remains the compatibility/reference implementation.
+
+Numeric comparisons, identity serialization traversal and bootstrap-preimage
+traversal stay inside Haskell instead of re-entering through native helpers.
+C++ retains database objects, hash writers, decoding, state publication and
+native I/O. Temporary loaded-tip/error state is released before either a cache
+hit returns or bootstrap begins. The identity writer is released before the
+load decision; bootstrap traversal releases its native scratch state before
+hash comparison. Exceptions still unwind the native owners.
+
+`CacheProgress` now invokes initialization directly in Haskell. Native effect 8
+opens its scratch owner; effects 300--305 project launch data/hash/RPC/diagnostic
+effects, effect 310 serves the retained storage/bootstrap native effects,
+effects 311--318 project loaded-tip/bootstrap data, and
+effect 26 closes the owner. Haskell `finally` closes it on rejection or malformed
+replies; native exceptions retain their original identity and unwind the outer
+C++ owner. The native callback bridge's failure latch prevents further native
+effects after a native exception. Loaded-tip cleanup still precedes bootstrap.
+
+This pass removes both the initializer's bridge entry and its now-unused pinned
+state helper: two scoped static bridge sites become zero. The broader counted
+`mainchainrpc.cpp` bridge family went from 113 to 111 in that stage; this is not
+a runtime crossing count. Initialization no longer re-enters the canonical
+checkpoint helper or the withdrawal parameter gate.
+All 291 registrations and 8 exports remain; the global binding/entry inventory
+was 216 at that stage. Legacy command mode 333 and all existing wire/disk formats remain.
+`CacheStorage CacheStartup` now decides whether a loaded tip agrees with the
+launch checkpoint from a typed `LoadedCache` snapshot. It preserves the
+pre-checkpoint exception, forced/rebuild-required short circuits, corruption
+and identity-mismatch logs, ordered tip publication, and cleanup before rebuild.
+`CacheBootstrap CacheStartup` owns commitment comparisons, bounded native slot
+traversal, own-slot/null-proposal/absent-CTIP/duplicate rejection, genesis
+predecessor checks, and failure cleanup. Native parsing and map insertion remain
+effects, with their original behavior: this migration does not tighten a present
+CTIP's amount policy before the existing persistent-store validation.
+
+The policy pass removes 38 native scalar cases (92 to 54), adds eight typed
+metadata projections, and removes 24 net production C++ lines. Static bridge
+sites remain 111 in the counted family; callback cases are a different metric.
+The preserved scalar implementation supplies differential tests for loaded-tip
+states and all bootstrap rejection paths. Nested RPC/block workflows are
+still remaining work; this does not claim whole-node completion.
+
+### Direct persistent-store composition
+
+Cache startup and advancement now compose `ReplayLoad`, `ReplayReset` and
+`ReplayAdmission`/`ReplayCommit` directly through `ReplayStore.runStoreSession`.
+The `RunSession` DSL retains payload equality before dispatch. Native
+`LoadEffects`, `ResetEffects` and `AppendEffects` retain database and batch
+ownership without starting another Haskell interpreter. The three nested
+store entry sites in cache replay are removed; the standalone public store
+methods still support other native callers. This is a reduction of runtime
+re-entry and caller orchestration, not a reduction of the global binding count.
+
+Session replies prefix an existing native payload with a success byte. A
+recoverable native exception instead returns a status; Haskell stops that
+subworkflow and completes its scope. Completion effect 43 maps malformed
+Haskell results through the original native recovery boundary. Load failures
+before reading and reset failures before reopening still propagate, while
+recoverable failures retain their original diagnostic and status. Failed
+write batches are destroyed before reporting failure. These private callback
+frames do not change any database, proof, transaction or network encoding.
+
+The enclosing cache retains input/output owners until the session closes,
+including on rejection. Append persistence and cleanup precede moving the
+next state into the cache. Native exception latching still prevents effects
+after an unrecoverable exception. Public sessions occupy private selectors
+12..14 of the existing replay-store operation; no FFI export is added.
+
+Tests cover the retained scalar policy differentials, composed native cache
+transcripts, strict framing, recoverable/malformed replies, every reached
+callback fault, and real LevelDB rollback/recovery. Native effect-body and
+upstream-line audits accompany the suite. This stage adds ownership adapters;
+it does not claim a net C++ line reduction or whole-node migration completion.
+
+### Credential-file workflow
+
+`Bmm.AuthFile` combines private-file metadata checks, bounded reads, newline
+trimming and optional static/rotating record validation. Its capabilities are
+`CredentialMetadata`, `CredentialContents`, `CredentialFileEffects` and
+`CredentialFormat`. After payload equality, the selected DSL constructor runs
+`loadAuthFile` or `loadAuthRecord`; the raw-file helper does not require the
+format capability or an `Operation` instance.
+
+The existing file transition table, metadata rules, 4097-byte read sentinel
+and configuration record parsers are reused inside Haskell. Native callbacks
+own the descriptor/stream, guarded buffer, system calls, error strings and
+output mutation. Native RAII still closes on exceptions; metadata rejection
+closes before returning, and successful POSIX reads close before publication.
+EINTR retries, short reads, oversize rejection, one LF then one CR trimming,
+error precedence and partial output are preserved. Static credential loading
+on Windows remains rejected by the existing native platform gate.
+
+The credential-file caller group has one bridge site instead of six:
+file routing, metadata admission, metadata conjunction, bounded reads, record
+routing and record parsing now form one workflow. A successful POSIX record
+load uses one Haskell entry instead of six, excluding outer credential-cache,
+cookie-path and host checks. Native effects still use callbacks; record bytes
+are returned in one bounded callback, not one callback per character.
+
+Three superseded fine-grained native adapters now live only in the test
+reference header. Their ABI selectors and Haskell implementations remain.
+One new whole-workflow selector is appended to the existing node domain:
+no exported symbol is added and every old selector/signature is preserved.
+The static production binding inventory changes from 218 to 216, with 206 in
+`tx_check.cpp`, eight in the interpreter and two gRPC/Utreexo entries.
+There are 290 registered operations, 201 production-used bindings and eight
+exports. This is scoped consolidation, not whole-node migration completion.
+
+### Parent RPC call lifecycle
+
+`ParentReplay.RpcCall` owns circuit admission, the initial request, one permitted
+authentication retry, failure backoff, and optional checked-reply admission.
+Its declared capabilities are `RpcCircuit`, `RpcAttempt`, `RpcAuthentication`,
+`RpcFailure` and `RpcReply`. After payload equality, `CallRpc` invokes the
+generic four-capability `performRpcCall`; `CallCheckedRpc` also invokes the
+reply capability. The helper does not require `Operation` or reply checking.
+
+The native attempt retains the existing HTTP implementation and captures its
+exception, reporting success, authentication failure or another failure.
+Haskell uses the existing circuit/authentication/reply rules without native
+re-entry. Cookie invalidation still precedes the validation-budget decision;
+there is no retry under that budget or after a second failure. The original
+native exception, including the second attempt's exception, is rethrown after
+backoff. Circuit, authentication-policy and reply-check failures do not acquire
+backoff that they did not have before. Successful transport clears backoff
+before a JSON-RPC error is examined.
+
+The circuit, retry and checked-reply group has two static native bridge sites
+instead of three: one whole-call entry and the separately reusable reply checker.
+A checked request uses one outer runtime entry instead of two normally or three
+on authentication retry. Raw requests use one instead of one or two. These
+counts exclude nested request preparation, private-file/host validation, HTTP
+deadlines and native callbacks. The global binding-site inventory is unchanged.
+Native callbacks increase by one per request attempt, plus two for final
+failure marking/rethrow: orchestration now resides in Haskell rather than C++.
+This is not a claim that total cross-language calls or elapsed time decreased.
+Appended command modes 331/332 reuse the existing ABI; old selectors and modes
+remain. Native differential tests compare exception types, effects, at-most-two
+attempts and publication, including failures at each callback. Isolated HTTP
+tests exercise persistent 401s, a retry returning malformed JSON, HTTP errors,
+empty responses and the earlier credential/timeout cases.
+
+### Parent RPC preparation
+
+`ParentReplay.RpcPreparation` composes credential selection, cache lookup and
+loading through their specific capability methods after payload equality.
+`prepareCredentials` requires only those three capabilities; it has no
+`Operation` constraint. A separate `RequestTimeout` capability composes the
+existing signed-positive and less-than rules within the timeout workflow.
+
+At the native caller, credential preparation has one bridge call instead of
+three. Timeout setup has one instead of three static bridge/helper sites
+(the runner, signed-positive helper and comparison). Together these scoped
+sites fall from six to two. Credentials take one runtime entry instead of
+one to three; timeout setup takes one instead of one to four. Private-file
+validation, host admission, outer circuit/retry/reply and HTTP deadline calls
+remain separate and are excluded from these counts.
+
+The existing parent replay command binding is reused with appended modes 329
+and 330. All old modes, transition tables and ABI signatures remain unchanged.
+The C++ callback accepts the signed 64-bit values the ABI already carries;
+legacy command flows still reject values outside their unsigned-32-bit range.
+Timeout observations now carry raw signed durations, not native calls back
+into Haskell predicates. Haskell chooses the same timeout effects, while
+native chrono/libevent code still owns conversion and timeout installation.
+
+Native RAII retains mutex ownership, including exception cleanup. The cache
+lock is released before filesystem loading; a locked validation budget cannot
+load credentials from disk. Native files, strings, exception types and the
+inherited HTTP implementation remain native. Tests compare credential and
+timeout traces, signed boundaries, all callback exceptions, lazy mismatches,
+and reuse of the capability helper with a payload that has no Operation instance.
+
+`Bmm.RpcSession` now composes circuit admission, the complete request
+attempt and optional checked-reply handling. Its `RpcAttempt` instance calls the
+existing deadline, timeout and credential methods directly in Haskell, between
+native HTTP phases. This removes three nested deadline call sites plus the
+timeout and credential entries from each transport attempt. The outer transport
+uses one byte-workflow entry (selectors 24/25); no export or ABI signature changes.
+The shared binding inventory is unchanged because other callers still use those
+bindings. Its `CredentialSource` and `CredentialCache` instances reuse
+`ParentReplay.RpcPreparation`; `CredentialLoader` composes `loadAuthRecord`
+directly, including ordered metadata checks, bounded reads and record validation.
+The session lives alongside `AuthFile` to avoid a dependency cycle through the
+exchange configuration parser. No new Haskell module or foreign export is needed.
+Private-file and cookie paths no longer re-enter Haskell through their C++ reader
+wrappers. Standalone readers still use their existing single entry.
+Host admission and default-cookie selection also run directly in the session.
+Native code supplies a tagged numeric-address snapshot (without DNS lookup) and
+the chain name; Haskell applies the existing address and network rules before
+native path resolution/file opening. The standalone host checker uses selector
+26 and the same `HostAdmission` capability, skipping address parsing entirely for
+non-native mode. The old fine-grained address binding is now test-only; no foreign
+export or ABI signature changed. Cookie overrides, inherited default-directory
+resolution, and filesystem effects remain native.
+
+`ParentHeader.HeaderTransport` also composes `RpcSession` directly for production
+network identity and active-hash reads, including the parent checks inside
+confirmed-deposit admission. Native `ParentRpcTransport` owns the same HTTP/JSON
+state; it performs effects without calling a Haskell entry. Request preparation
+returns either an already-completed injected hook or a native session to run.
+The latter is interpreted through the existing circuit, attempt and reply
+capabilities before its result is published. The standalone RPC API still has
+its ordinary single entry, and caller-supplied RPC hooks retain their behavior.
+No new foreign export or serialized consensus format is introduced.
+
+The outer network frame preserves the original exception scope around the
+complete RPC call, including retry exhaustion and malformed internal replies.
+Identity failures revoke the replay epoch; active-hash failures escape. Native
+transport ownership survives inner cleanup and is released before revocation
+or successful result publication. The confirmed-deposit callback routes these
+effects in its existing parent namespace.
+
+Authenticated header retrieval now uses the same transport capability for the
+genesis, verbose header, active hash, raw header, predecessor and ancestor reads.
+`ParentHeaderRpc` retains request arguments and publishes JSON into native-owned
+objects; it does not enter Haskell. `native_rpc` explicitly selects this path so
+an empty caller-supplied hook keeps its original failure behavior. Header
+components share the transport effect namespace while retaining separate scalar
+observation namespaces. Hook and local-header reads return ready/not-ready;
+native RPC reads return a prepared session, which `HeaderTransport` runs before
+resuming validation. The existing header FFI binding supports both scalar and
+byte callbacks without adding an export or binding. The production path removes
+one nested RPC entry per request, including each of up to eleven ancestors.
+Native codecs, PoW arithmetic, partial writes, diagnostics and object lifetimes
+remain native; the complete workflow still publishes only after authentication.
+Raw parent block authentication now composes decoding, transaction scans and
+optional Signet checks through `ParentHeader.AuthenticateBlock` (selectors16/17).
+`BlockTransactions` owns both scan indices and the existing periodic-deadline
+rule. Native code retains transaction objects, hash-vector storage, Merkle
+calculation, script construction and the Signet script engine. Standalone
+transaction/Signet APIs share these capability methods (selectors14/15).
+The production body path no longer uses an outer `ParentReplayAll` whose three
+callbacks re-enter Haskell, and neither scan calls the numeric FFI predicate.
+Native deadlines compose directly through the same deadline capability.
+The older transition-table modes remain available for ABI compatibility and
+regression comparisons. Outer header/body retrieval, BMM, withdrawal and exchange
+workflows retain separate crossings; this is not a whole-node single-crossing design.
+
+The fork-only Bitcoin parent Signet checker now composes `SignetSolution`,
+`SignetCommitment`, `SignetConstruction` and `SignetMerkle` methods after payload
+equality (header selector18). Haskell owns genesis/coinbase gating, last-witness
+selection, assembly order, decode/trailing-byte decisions, modified-Merkle
+traversal and validation order. Selectors19-22 reuse those methods for the
+standalone Merkle, synthetic-transaction, block-data and witness-selection APIs.
+The original BMM template/action/preimage rules and witness predicate are reused
+directly in Haskell, not through nested native FFI calls. Native adapters retain
+Bitcoin objects, codecs, Merkle hashing, the inherited commitment extractor and
+the script/signature engine. Only `std::exception` failures inside the original
+solution-reader scope become canonical-encoding errors; other native exceptions
+escape through the existing poisoned-callback mechanism.
+
+In these selected functions, workflow dispatch expressions fall from12 to5.
+A successful non-genesis parent check removes `5+n+nonempty_solution` runtime
+entries for `n` transactions, excluding unchanged signature-checker crossings.
+Standalone Merkle callback reduction is measured against the old transition
+table, including zero/one transactions and256-item boundaries. These are not
+global binding counts: the211 production binding sites and8 exports are unchanged.
+Native adapter glue grows in this step; the eliminated work is native orchestration
+and repeated crossings, not every C++ line. Qualification is recorded outside the
+repository in `qualify-parent-signet-20261025`; this is not live deployment.
+
+The block-body capability now composes the same Signet methods directly rather
+than calling the standalone checker from native step112. A prepared reply (2)
+routes Signet native effects through the2000-offset namespace; legacy hook replies
+0/1 retain their original meaning. `PrepareParentSignet` only owns native objects
+and exposes their existing effects. Haskell releases that state at step113 before
+the following deadline, including domain rejection and malformed replies; native
+exceptions clear it before the poisoned callback boundary rethrows. Decoder catch
+scope, diagnostics and script verification remain unchanged. This removes one
+nested workflow entry per nonempty-challenge body check, with one extra cleanup
+callback. It does not remove signature-engine crossings or change the global211
+bindings. The standalone checker and body path share the native adapter; no new
+export or selector is needed. Local qualification: `qualify-parent-signet-body-20261025`.
+
+After that composition, four standalone adapters had only test callers:
+`BmmSignetTemplate`, `BmmPreimage`, `CheckBitcoinSignetBlockSolution` and
+`ComputeBitcoinModifiedMerkleRoot`. Their production implementations and
+declarations are removed; test-only probes retain the existing ABI coverage.
+`signet.h` is restored byte-for-byte to the upstream baseline. This cleanup
+reduces production binding sites from211 to209 (used bindings197 to195), with
+291 registered operations and8 exports unchanged. It removes no additional
+runtime crossings: the preceding workflow composition already eliminated those
+calls. Native crypto, object ownership and inherited Signet behavior remain in
+C++. Local verification is recorded in `qualify-parent-adapter-retirement-20261025`.
+
+Pruned parent-body retrieval now enters through `RECOVERY_COMPOSED` once.
+`BodyRecovery` carries reply, active-header, peer and effect capabilities;
+after payload equality its interpreter composes the existing recovery rule
+tables directly. Haskell keeps the initial height and performs the final height
+comparison, reply checks, peer traversal and polling. Native code retains JSON
+objects, checked numeric getters, RPC calls, clocks, waits and original errors.
+Temporary response/header/peer objects are released after their consumers.
+This is availability recovery only: the caller still authenticates returned
+block bytes and enforces the existing lock/deadline restrictions.
+
+The recovery header's five indirect rule-entry expressions become one;
+the standalone pruned-reply probe is now test-only and nested calls disappear.
+An ordinary fetch removes one nested rule entry. A successful recovery with
+`r` pruned polling replies removes `11+r` entries, excluding unchanged RPC
+transport/deadline internals. Native callback counts are separate: the simple
+single-peer fixture uses `65+9*r` callbacks versus `59+10*r` before composition.
+That tradeoff replaces repeated native-to-Haskell entry with explicit native
+data preparation/release. Global binding sites remain209 and exports8; the
+new composed selector is process-local, not a consensus or wire change.
+Differential tests retain the pre-composition implementation in the test target
+and compare RPC/check/wait order, results and standard/nonstandard exceptions.
+Local qualification: `qualify-parent-recovery-20261025`.
+
+### Parent Network And Header Composition
+
+`ParentHeader.NetworkHeader` declares `ParentNetwork` and `VerifiedParentHeader`.
+After payload equality, `AuthenticateNetworkHeader` composes those capability
+methods without returning to C++ between the network check and header
+authentication. Parent-header selector 23 runs the composition. Existing rule,
+transport and deadline interpreters are reused, not duplicated.
+
+`ParentHeaderNative` preserves the original native member order and callback
+bodies. Its borrowed members cannot move. Scope actions create and release the
+network owner before creating the header owner; Haskell sequences those scopes
+and stops on rejection. C++ RAII still destroys owners when an escaping native
+exception poisons subsequent callbacks. Network failure revokes the replay epoch;
+later header failure does not. Publication retains its original position.
+
+The selected production path now has one workflow entry instead of two. This
+removes one runtime native-to-Haskell crossing, not a global binding: the
+standalone adapters still support other callers and differential fixtures. Native
+callbacks increase by five on success (two scope pairs and a deadline-mode read),
+or two on network rejection. The added ownership plumbing is not a C++ line-count
+reduction. This predecessor is qualified in `qualify-parent-network-header-20261025`.
+
+### Complete Parent Block Workflow
+
+`ParentHeader.ParentBlockReader` combines network/header authentication, recovery
+budget setup, pruned-body retrieval, byte authentication and final header binding.
+Parent-header selectors24/25 select body-only or complete verification. Body-only
+callers do not acquire new network or header gates. Native scopes3/4/5 own the
+budget, recovery state and decoder; restoration is armed only after the original
+budget constructor succeeds. RAII releases them in reverse order even when an
+escaping native exception poisons subsequent callbacks.
+
+Recovery consumes the unchecked RPC envelope so pruned-body errors retain their
+original meaning. Haskell composes existing recovery, transport, deadline and
+authentication capabilities without native reentry for those subrules. External
+RPC/error/effect order, partial header publication and native crypto are unchanged.
+The selected indirect sites fall59->57; full-block runtime entries5->1 and body-only
+3->1 exclude additional nested recovery RPC/deadline entries also removed. Native
+ownership callbacks increase; global bindings remain209. This step adds188 C++
+lines, removes111 header lines and adds73 Haskell lines net. It is not a net native
+line reduction. Qualification: `qualify-parent-complete-block-20261025`.
+
+### Local Bid Wallet Workflow
+
+`Bmm.LocalBidWallet` declares `BidPreparation`, `BidFunding` and `BidPublication`.
+After payload equality, `SubmitLocalBid` invokes their reusable composition.
+Preparation returns either an already-pending result or limits and a typed plan
+for exact retry, previous-input reuse or fresh funding. Haskell owns the branching,
+loops, amount/range checks, replacement arithmetic, change and signature binding,
+M8 script encoding, cancellation checks and save-before-broadcast ordering.
+
+Replay workflow selector27 reuses the checked native-bytes ABI and existing
+export; selectors0..26 are unchanged. The native adapter owns Bitcoin transaction
+codecs, object equality/hash primitives, checked JSON getters, wallet/RPC effects
+and durable journal callbacks. It contains no orchestration loop or nested rule
+dispatch. RPC transports supplied by the caller retain their existing separate
+workflow entries; this does not claim a single crossing for the entire RPC stack.
+The request snapshot is112 bytes: six little-endian64-bit fields followed by raw
+parent and critical hashes. M8 encodes the critical hash in display order and the
+parent hash in internal order, exactly as before.
+
+The previous C++ bidder is retained only in the native test target for exact
+comparisons of requests, effects, exceptions, saved bytes and broadcasts. Tests
+also cover capability reuse, lazy payload mismatch, malformed frames, callback
+failure prefixes and replacement arithmetic. No fee policy, consensus encoding,
+live configuration, bidding wallet or network has been changed.
+
+### Complete BMM Bid Submission
+
+`ParentHeader.BmmBidSubmission` composes `BidAdmission`, `ParentNetwork`, and
+`BidWalletSession` inside one `Operation`. After payload equality, its DSL calls
+the capability-constrained `submitBmmBid`. Admission checks the slot, fee,
+identity, named wallet, numeric-loopback host and parent genesis. Network
+authentication reuses the existing Haskell network capability, including its
+exception scope and replay-epoch revocation. The wallet capability checks the
+selected slot/checkpoint, then calls `Bmm.submitLocalBid` directly in Haskell.
+
+The existing replay-workflow ABI adds selector28; no new export or registered
+binding is introduced. Callback actions100-116 own admission observations,
+database locking and context lifetime;1000-1055 reuse the local bid effects;
+2000-3560 reuse the network effects. Native code retains the database, JSON,
+transaction objects and original exception types. The old local-bid entry still
+works for independent callers and tests; the outer submission does not re-enter
+it through C++.
+
+This replaces nine selected indirect entry sites with one. The global binding
+inventory remains209 because those shared bindings have other callers. RPC
+transport, reply and storage helpers are still independent: this is not a claim
+of one total runtime crossing, fewer callbacks, or completed native migration.
+Tests cover complete callback traces, every failure prefix, network rejection,
+strict frames, capability reuse, and the actual native entry with isolated
+loopback HTTP fixtures. The HTTP wallet returns synthetic signatures; those
+tests establish ordering, journal retry and guard behavior, not real signing,
+mining or chain inclusion.
+
+### Complete BMM Context
+
+`ParentCache.BmmContext` composes four capabilities: `BmmCacheAdmission`,
+`BmmCacheRouting`, `BmmEdgeAuthentication`, and `BmmContextPublication`.
+After payload equality, the DSL selects `authenticateBmmContext`; a cached
+success returns before fresh authentication. Replay-workflow selector29 reuses
+the checked scalar callback ABI without adding an export or registered binding.
+
+Haskell now owns positive/negative cache pruning and search, status routing,
+untrusted-edge admission, successor ordering and context publication. Pruning
+preserves first-hole compaction, including partial moves before an exception.
+Positive matches search newest-first; negative matches search oldest-first.
+Unknown untrusted edges cannot cause parent RPC. The replay-index lock releases
+before live authentication, including failures, and all14 identity checks remain
+lazy. Corruption still revokes the epoch, clears replay state and requests a
+rebuild. Cached success records the exact successor Q, not the warmer replay tip.
+Publication preserves partial output, epoch checks and rejection distinctions.
+
+C++ retains native objects, checked observations, cache moves, lock ownership,
+codecs, crypto and original exceptions. Existing coarse parent-probe, network,
+replay, snapshot and block-authentication workflows still have separate entries;
+this is not one total crossing for a BMM request or fewer native callbacks.
+The selected cache/context rule-entry sites fall from24 to1;12 coarser native
+calls remain and can still enter other Haskell workflows. The global inventory
+remains209 binding sites. Tests compare complete traces and
+mutations with a separate procedural model of the sealed prior implementation,
+including generated caches, callback faults, malformed frames, lazy dispatch and
+capability reuse. Native tests cover original exception types and lock lifetimes.
+These are isolated source tests, not live parent mining or chain qualification.
+
+### Persisted BMM State
+
+`StoredBmmState` owns persisted-state loading, effective-checkpoint selection and
+parent-context preparation through focused loading, selection, context and
+reporting capabilities. Selectors37..39 share the checked workflow ABI. An
+effective-state query composes loading directly in Haskell; it no longer invokes
+a native loader that re-enters Haskell for each decoding rule. Checkpoint bytes
+are prepared with the existing pure preset and published by the native adapter.
+
+The native adapter retains the coin reference, script cursor, DataStream and
+partially decoded native state. Its payload-decoding callbacks report caught
+exceptions with a failure envelope, preserving the old corruption diagnostic
+without poisoning subsequent error reporting. Coin lookup and script parsing
+exceptions still propagate; standalone context failures are not converted into
+decoding errors. The original pure codec, state, median and checkpoint rules are
+unchanged. Successful/missing loads retain the caller's diagnostic; rejected
+loads replace it. Context publication occurs only after validation and a nonzero
+median. Existing native byte-truncation, mutation and context tests remain intact.
+
+`PersistedOutput` composes state encoding and replacement in the same Haskell
+workflow for BMM and CTIP treasury state. After payload equality, `PersistOutput`
+uses `StateReplacement` and `Finalize`; its preparation method reuses
+`StateAssembly` through `OutputEncoding`. Selectors40/41 select ordinary storage
+or rollback. Native callbacks retain coin ownership, stream/script serialization,
+and the original exception boundary. The marker, payload, opcodes117/0, explicit
+zero output and normal/rollback height rules are unchanged. Metadata and effect
+acknowledgements require exact reply framing; a failed callback stops the workflow.
+
+The two native storage adapters replace six outer/nested workflow sites with two.
+Each storage path enters Haskell once rather than twice; successful native
+callbacks increase from8 to9 because the workflow also reads the input height.
+These storage-only counts exclude one-time identity initialization and enclosing
+connect/disconnect workflows. Global production binding sites fall from201 to198
+without changing the eight exports or291 registered operations. The retired
+planner adapters remain test-only differential references. Whole-node workflow
+consolidation remains incomplete.
+
+### BMM Proof Sessions
+
+`ProofSession` composes `ProofCoding`, `ProofEnvelopeAccess`, `ProofSequence`, and
+`ProofHeaderEvolution` after payload equality in `interpret`. Selectors42..47
+reuse the checked workflow ABI for serialization, decoding, attachment, entry
+verification, complete block-proof verification, and parent extraction. The
+complete proof path composes these capabilities in Haskell instead of returning
+to C++ to select each subordinate workflow.
+
+`ProofHeaderEvolution` has an associated `ProofHeaderState`. Its concrete session
+instance keeps the parent hash, height, difficulty-period state and eleven recent
+timestamps in Haskell across all proof entries. The reusable `evolveProofHeaders`
+composition needs only evolution and envelope capabilities, not `Operation` or
+the native wire representation. An independent test instance uses an `Int`
+state to exercise the same orchestration.
+
+Native adapters project immutable state/header fields, retain the existing
+compact-target representation and cryptographic operations, and publish the final
+state only after the complete sequence succeeds. Projection steps400..409 use
+checked fixed-width frames; the97-byte persisted state encoding is unchanged.
+Preflight still precedes previous-state validation, and header parent, difficulty,
+median, proof-of-work, signet, and final commitment checks retain their order.
+The original pure difficulty, retarget, uint256 scaling, median, and advancement
+rules are reused. Arithmetic failures preserve the original native diagnostics;
+native callback exceptions retain their identity.
+
+Header-state subrules previously re-entered Haskell twice per proof and five times
+per header. They now compose directly inside the outer session. This count does
+not include remaining signet/commitment callbacks, and native callback counts are
+not reduced. The enclosing lifecycle now composes these sessions directly as
+described below. The old advancement wrapper is test-only. Whole-node migration
+and the15-site endpoint remain incomplete.
+
+### BMM Chain Lifecycle
+
+`ChainSession` declares `ChainObservations`, `ChainStateAccess`, and
+`ChainProofAccess`. After the payload equality check, `ConnectChainState` and
+`DisconnectChainState` compose those capabilities in `runChainLifecycle`.
+Selectors48/49 use the existing checked ABI. Native connect and disconnect each
+enter Haskell once; they no longer select state loading, checkpoint publication,
+header admission, proof verification, or storage through nested wrapper calls.
+
+The reusable interpreter preserves the existing `StateWorkflow` rules and lazy
+observation order, including native-mode rejection, incomplete candidates,
+checkpoint initialization/removal, and reverse proof-state matching. State-load
+errors remain distinct from proof diagnostics; disconnect preserves a specific
+error instead of overwriting it with the generic mismatch message. Storage is
+selected only after successful admission, with the prior state and prior height
+selected for disconnect. The97-byte state encoding and native coin effects are
+unchanged. Exceptions do not add rollback guarantees to coin storage that it did
+not have before; the caller still owns the cache/transaction boundary.
+
+The C++ adapters own borrowed block, coin-view, proof, and serialization objects.
+Routes1000/2000/3000/4000 select header, state, proof, and storage projections,
+without reentering their Haskell wrappers. The commitment follow-on below removes
+those nested adapters; signet and lazy identity constants still have nested entries.
+This is not a claim of
+one total runtime crossing per block. Native callback counts are separate from
+entry counts. Global production binding sites decrease195->194, used bindings
+181->180; eight exports and291 registered operations are unchanged.
+
+Tests compare the complete lifecycle trace and errors against an independent
+procedural oracle, inject faults at every visited callback, check composed wire
+routes and successful forward/reverse proof-to-storage behavior, and preserve
+the real native checkpoint coin across malformed/unrelated proof rejection.
+These checks do not qualify live chain activation or another build platform.
+The large `test/Properties.hs` driver uses `-O0` to avoid repeatedly optimizing
+test registration/reference code; imported production modules keep the Cabal
+build's `-O1`, and native node/library optimization settings are unchanged.
+
+### BMM Commitment Sessions
+
+`CommitmentSession` declares `CommitmentScripts` and `CommitmentPublication`.
+After payload equality, `ExtractSelectedCommitment` composes script selection,
+exact rejection diagnostics, extraction, byte conversion and publication in
+Haskell. The selector reuses the existing traversal rules through a capability
+method instead of duplicating them. Legacy ABI probes remain test-only.
+
+`ProofSession` invokes this composition directly for M8 and sidechain-parent
+commitments. Routes500/600 (3500/3600 within the chain session) expose native
+script cursor operations; they do not reenter Haskell. Tagged-parent standalone
+callers use selector50 through the existing checked replay-store ABI. Native
+`GetOp`, transaction ownership and `uint256` assignment remain unchanged.
+
+M8 payloads drop the five-byte prefix and reverse their displayed hash bytes;
+sidechain-parent payloads retain their byte order. Conversion is forced before
+the publication callback. Noncanonical tagged parents still reject before
+publication, while a first canonical tagged parent remains published if a later
+duplicate or malformed tagged commitment rejects the scan. Success does not
+clear an existing diagnostic. These are preserved behavior, not new policies.
+
+The old extraction workflow, selection and byte-conversion C++ wrappers are no
+longer production paths. Successful M8/legacy-parent extraction removes three
+nested Haskell entries; tagged-parent extraction still has one standalone entry.
+This does not eliminate native parser callbacks. Global static production binding
+sites fall194->192 and used bindings180->178, with eight exports and291 registered
+operations unchanged. Whole-node migration and the15-site endpoint remain open.
+
+Tests compare generated selection/publication/error traces with an independent
+procedural oracle, inject callback failures, exercise malformed payloads before
+publication, and run the complete enclosing proof/lifecycle sessions. Native
+regressions retain nonminimal M8 pushes, duplicate rejection and tagged-parent
+partial publication and byte order. No live or cross-platform qualification is
+implied by these local checks.
+
+### BMM Signet Sessions
+
+`SignetSession` composes witness selection, script rewriting, transaction
+construction, solution decoding, Merkle authentication, signature verification
+and diagnostics inside the enclosing `ProofSession`. Its associated GADT first
+proves payload equality, then invokes the declared capability methods. The
+existing `ProofExecution` validation instance folds the unchanged signet state
+rules. `SignetConstruction` and `SignetCommitment` are also used by parent-header
+authentication, sharing the existing action plans and last-witness selection.
+
+Proof route700 (3700 within the chain session) supplies native object operations.
+The native signet state is allocated only when the signet branch is reached and
+released after each entry. Haskell controls first-solution capture, publication,
+decode ordering and early rejection. Native `GetOp`, serialization, transaction
+hashes, Merkle proof operations and `VerifyScript` remain unchanged. No inherited
+Elements/Bitcoin implementation is moved.
+
+BMM decoding retains its original catch-all boundary; parent-header decoding
+still catches only its original native `std::exception` scope. Native decoding
+failures are represented before crossing FFI, so the outer adapter's sticky
+exception does not incorrectly override a canonical decode rejection. Other
+native exceptions still escape unchanged, with native RAII retaining ownership
+if a failed callback prevents further cleanup callbacks. Malformed byte replies
+and Haskell failures outside decoding fail closed, not as a successful proof.
+
+Standalone construction, witness, extraction, action-plan and validation wrappers
+are no longer production paths. A successful signet proof removes five nested
+orchestration entries, or six when a nonempty solution must be decoded. The
+signature checker and lazy identity access can still enter Haskell; native
+callbacks and script signature checks are not counted as eliminated.
+Static production binding sites decrease192->189 and used bindings178->175;
+eight exports and291 registered operations remain. Production implementation
+loses114 net C++ lines and9 declaration/header lines; Haskell gains109 net lines.
+
+The existing native signet proofs and malformed/noncanonical script tests are
+retained. New properties independently compare ordered results and diagnostics,
+exhaust visited failure prefixes, validate decoder exception scope and lazy
+payload mismatches, and test composed proof routing. A native multi-entry test
+alternates empty/nonempty solutions and rejects a malformed solution at each
+position without publishing partial state. Whole-node migration remains open;
+these changes do not activate a network, deploy a node or qualify other targets.
+
+### BMM Header Policy
+
+`Bmm.HeaderPolicy` composes `ProofRequirement` and `HeaderObservation` after
+payload equality in `interpret`. `CheckHeaderPolicy` owns preflight, the lazy
+activation query, final admission and the original rejection messages.
+`ProofIsRequired` reuses the same capability method for standalone callers.
+Selectors35/36 share the existing checked workflow ABI; no export is added.
+
+Native callbacks read chain/configuration facts and assign the error string.
+They do not re-enter Haskell for subrules. Native Elements and genesis preflight
+still short-circuit before consulting activation settings; private and public
+activation retain their distinct checks. The pure `Header` and `Activation`
+rules are unchanged. The two native entry functions have two static workflow
+sites in place of six static subrule/flow sites; this is not a claim that all
+six old calls ran on every header. The old `BmmHeader`, `ParseParentMessage` and
+`ReplayDistance` adapters now live only in the test reference header. Production
+binding sites fall from206 to203 without changing the eight exports or the291
+registered operations. Tests compare complete procedural traces, activation
+boundaries, exact errors and every callback failure, including the native ABI.
+
+### Withdrawal Journal Workflows
+
+`WithdrawalJournal` carries `JournalValidation` and `JournalStorage` capabilities.
+After payload equality, `ValidateJournal` composes the existing admission,
+witness-marker normalization and identity rules; `ReadJournal` uses those
+methods directly during the read workflow. `WriteJournal` composes validation,
+temporary-file preparation, persistence, handle release and directory fsync;
+`ClearJournal` controls removal and directory fsync. The native read callback no longer
+calls a validation helper that re-enters Haskell. Selectors 31 through 34 share the
+existing checked workflow ABI, rather than adding exports.
+
+Native code retains journal serialization, file ownership, checksum hashing and
+error reporting. The byte format, error precedence and publication after full
+validation are unchanged. `JournalWorkflowTests` compares procedural traces,
+field mutations and every callback fault, and checks malformed frames and
+capability reuse. Existing native filesystem/corruption tests remain intact.
+The write adapter retains the original exception boundary: validation and
+random temporary-name creation propagate errors; serialization errors close
+the native handle before temporary-file cleanup; directory fsync errors
+propagate after the persistence scope ends. Haskell owns the sequence, while
+native code owns the resources and these exception semantics. Whole-node
+orchestration migration remains incomplete.
+
+### Complete Wallet Withdrawal
+
+`Withdrawal.WalletWithdrawal` composes `WalletAdmission`, `WalletPreparation`,
+and `WalletSubmission` after payload equality in `interpret`. The generic
+`withdrawFromWallet` method composition requires only those three capabilities.
+Replay-workflow selector30 reuses the checked callback ABI; no export or
+registered binding is added.
+
+The native withdrawal RPC enters Haskell once for network/activation admission,
+wallet availability, destination validation, payout and fee rules, relay policy,
+commit ordering, exact burn-output selection, and reply selection. The wallet
+lock is acquired after lookup and retained through the scoped workflow, including
+the post-commit checks. Native callbacks preserve wallet ownership, upstream
+`SendMoney`, serialization, address parsing, script classification and JSON
+construction. Optional arguments remain lazy, rejection precedence is unchanged,
+and a post-commit failure never retries the irreversible burn. A successful burn
+still awaits confirmation and separate BIP300 submission; it is not a payout.
+
+The previous standalone wallet subrule adapters and retired legacy bundle/event
+code now live only in the test reference implementation. They have no production
+callers. Existing wallet RPC tests still exercise the real encrypted, funded
+disposable wallet in both reply modes and check errors before and after commit.
+Haskell tests compare33 procedural routes and every callback fault,10,000
+generated cases, malformed frames, capability reuse and lazy dispatch mismatch.
+The native boundary test additionally checks exception identity, callback-prefix
+ordering, at-most-one commit, and lock release on every return and failure.
+Upstream internals of transaction creation, signing and confidential processing
+remain native; one orchestration entry does not imply one total nested FFI call.
+
+### Native RPC Ownership
+
+Native `ParentRpcAttempt` owns the inherited libevent resources, request body,
+response parsing and JSON objects. Successful scalar replies are framed apart
+from the original authentication versus catch-all exceptions; native exception
+objects are retained and rethrown unchanged if the retry policy rejects them.
+Attempt cleanup precedes cookie invalidation, retry and unavailable-backoff
+publication. A successful reply releases HTTP resources before marking the
+parent available. Credential-cache locks still release before disk loading,
+and cleanup handles exceptions before request creation as well as after send.
+Malformed frames fail closed rather than becoming authentication failures.
+`RpcAuthFileState` owns the native descriptor/stream and output references across
+the file capabilities. File cleanup precedes publication or error logging and
+also runs on exceptions; outer attempt cleanup remains independent. Static files
+still reject Windows rather than falling back to its cookie-compatible reader.
+The native file effects are shared with standalone readers, not copied into the
+transport. Tests exercise both call paths, retry/cache behavior, per-effect
+failures, malformed scalar framing, invalid/oversized records, symlinks, missing
+files and directories using isolated nodes with no peers or bidding.
+
+### Caller-side parent header authentication
+
+`mainchainrpc.cpp` now sends the complete authenticated-header workflow
+through `RunParentHeader`, rather than composing repeated bridge invocations.
+`ParentHeader.Header` carries `ProofTarget`, `RawHeader`, `AncestorTimes`,
+`HeaderDeadline`, `CanonicalHash`, `HeaderMetadata`, `HeaderPredecessor` and
+`HeaderAuthentication`, `ParentNetwork` and `ActiveParentHash`.
+Payload equality is proved before DSL matching; reusable compositions require
+only the capabilities they use:
+
+```haskell
+authenticateRaw :: (RawHeader op, ProofTarget op) => op -> HeaderCheck ()
+authenticateRaw value = decodeRaw value >> checkProof value
+
+authenticateChainwork :: ProofTarget op => op -> HeaderCheck ()
+authenticateChainwork value = calculateWork value >> checkWorkIncrement value
+
+authenticateHeader :: (HeaderAuthentication op, HeaderMetadata op, HeaderPredecessor op)
+                   => op -> HeaderCheck ()
+authenticateHeader value = do
+  prepareHeader value
+  height <- readMetadata value
+  readCurrentHeader value
+  checkPredecessor value
+  readHeaderMedian value height
+  publishHeader value
+```
+
+The RPC median workflow authenticates each of at most eleven raw ancestors
+inside the same Haskell invocation, then sorts and publishes the median only
+after the final deadline check. The trusted-reader variant remains available
+for existing callers and tests. C++ retains borrowed objects, upstream compact
+target arithmetic, decoding, hashes, RPC transport and exact diagnostics.
+Raw decoder exceptions retain their local translation and partial writes;
+RPC/deadline exceptions are rethrown unchanged by the native exception latch.
+
+The parent-network capabilities reuse `CanonicalHash` within Haskell, including
+its original mutation-before-canonical-case-check order. `CheckParentNetwork`
+selects the unchanged child identity, requests the pinned post-fork hash, and
+revokes the replay epoch before reporting a mismatch or recoverable RPC error.
+`AuthenticateActiveHash` composes that check with the active-height read. It is
+called inside the confirmed-deposit fold, after the lock and deposit checks.
+Standalone callers use byte-workflow selectors 20 and 21; no export is added.
+
+Peg-in confirmation selection copies the height and immutable chain identity
+through `PeginConfirmationSnapshot`. `Deposit.ConfirmationSelection` evaluates
+the same pinned Alpha/Beta facts in Haskell, using the existing confirmation
+policy. Both confirmed-deposit lookup and candidate filtering call
+`selectedConfirmationDepth` directly; their native callbacks no longer invoke
+`GetDrivechainPeginConfirmationDepth` and re-enter Haskell. Standalone callers
+use selectors 22/23 and the shared `Check`/`Validation` adapter. The obsolete
+production policy binding is removed; its registered ABI rule remains for
+compatibility and independent tests.
+
+The snapshot is a strict process-local encoding, not a new consensus or disk
+format. It carries the signed height, length-prefixed network, mode/parent/slot
+flags, optional slot byte, three raw hashes and configured depth. Noncanonical
+flags, absent slots with nonzero bytes, truncation and trailing bytes reject
+before publication. Native code still owns the chain parameters and serialization;
+Haskell owns the ten identity facts, exact six-confirmation Betanet selection,
+historical Alpha height boundary and unrecognized-identity fallback. Immutable
+reads are batched; effectful store/RPC ordering and lock lifetimes are unchanged.
+
+Native replies distinguish successful scalar effects from `std::exception`
+failures only inside the original network-check scope. `networkBytes` unwraps
+that framing; the capability method catches only `NetworkFailure`, permitting
+revocation/reporting without poisoning the native exception latch. Parameter
+preparation remains outside recovery; active-hash reads leave that scope before
+calling RPC. Non-standard native exceptions, malformed frames and faults in the
+recovery handler escape rather than being reported as a successful check.
+The network check alone never restores a revoked epoch. These are local workflow
+messages, not consensus, network or disk encodings.
+No raw decoding, PoW, sample-bound or median bridge is invoked from its native
+callbacks. Production now selects native clock observations instead of the
+standalone Haskell-backed deadline hook. `HeaderDeadline.checkDeadline` reuses
+`ParentReplay.runDeadline`, including its existing interruption and budget
+policy, without crossing the FFI again. Parent-block replay uses the same
+helper. C++ still owns clocks, interrupt state and the original exceptions.
+RPC transport's own budget/credential helpers remain separate work.
+
+Within this caller-side region, explicit Haskell bridge invocations fall from
+10 sites to 2. Five public helper wrappers still call the shared native adapter;
+those C++ calls are not eliminated or disguised as migration. Successful raw
+authentication uses 1 entry instead of 4; chainwork uses 1 instead of 2.
+For N ancestors, the RPC median computation uses 1 entry instead of 6N+3,
+excluding unchanged RPC-transport work. The old count includes its outer runner,
+N+1 sample-bound checks, N raw-request runners, 3N decoder stages, N PoW checks
+and the final median helper. These are structural entry counts, not timings.
+
+The initial shared binding increased the global binding-use inventory from 217
+to 218; the complete outer verifier reuses that binding. The 8 exports and all
+289 existing operation selectors remain unchanged. Modes 0-10 retain their
+meaning; modes 11-13 select raw, RPC median and complete RPC authentication
+with composed deadlines. The hooked variant preserves existing
+source adapters, but production selects RPC verification without nested raw
+or median helpers.
+
+Across canonical-hash parsing, metadata, predecessor and full verification,
+caller-side bridge/helper invocation sites fall from 16 to 4. Each public
+helper retains one entry. The two custom raw/median hook calls also remain
+for hook mode; they are not counted as removed and production does not use them.
+
+Composing deadlines removes three production hookups to the standalone
+Haskell-backed checker: raw-header decoding, raw-block decoding and complete
+header authentication. For N ancestors, full authentication checks the
+clock at 3N+4 points (two current-header checks, three per ancestor, the
+median publication and final header publication). These checks are preserved,
+not skipped. The combined authentication/deadline entry count falls from
+3N+5 to 1, or 38 to 1 for eleven ancestors. Standalone raw decoding goes
+from 3 to 1 entries and RPC median from 3N+2 to 1 (35 to 1 for eleven).
+This excludes network-identity and RPC transport helper entries, which
+still cross into Haskell. Native observations/effects still run and these
+counts are not performance measurements.
+
+Before composing deadlines, non-genesis authentication-rule entries fell
+from 14 to 1: the prior outer runner, two canonical hashes, three metadata
+entries, one raw entry, six predecessor entries and one median entry.
+This excludes the unchanged network guard, deadline/budget checks and RPC
+transport helpers.
+Standalone metadata falls from 3 to 1 entries and predecessor checking from
+6 to 1 (non-genesis), or 2 to 1 (genesis). Canonical hash remains one entry
+when called alone; composed canonical checks no longer cross the boundary.
+Native callbacks still execute: these counts are not callback counts or
+performance measurements. The predecessor adapter is constructed in place
+because its arithmetic state borrows its own previous-chainwork field.
+Replay cache lifecycle and other caller workflows remain migration work.
+
+### Native deposit workflows
+
+`NativeDeposit.Recipient` owns fee-envelope decoding/encoding and transaction
+assembly. Its DSL selects `RecipientDecoding`, `RecipientEncoding` or
+`NativeAssembly` methods after `withOperation` proves the payload type.
+The reusable `constructNative` composition requires only decoding and assembly:
+
+```haskell
+constructNative :: (RecipientDecoding op, NativeAssembly op) => op -> Check ()
+constructNative value = decodeRecipient value >>= assembleNative value
+```
+
+`NativeDeposit.Outputs` similarly composes `DepositInputs` and
+`DepositCredits`; its canonical fee-free constructor first applies
+`FeeFreeEligibility`. Witness recognition and the original credit/conservation
+rules run inside Haskell, not by calling native wrappers that re-enter it.
+The selected witness is decoded before its bounded destination/claim fields
+are read. Every input is scanned and every output projected in the original
+order before amount/rule rejection. Fee-free sponsored transactions and exact
+committed-fee transactions retain their different admission rules.
+
+The checked ABI borrows flattened witness pointers, lengths and offsets for
+one synchronous invocation. C++ owns transactions and exposes upstream address
+decoding, script projection, value serialization and ordered construction effects.
+It does not copy whole transactions into a new private transaction format.
+Callbacks return copied byte frames; native exceptions retain their original
+type and message through the shared exception latch. No callback re-enters
+Haskell. This view is not a network/storage/proof encoding.
+
+For one-input successful checks, runtime entries change from 3 to 1 for
+fee-free outputs, 4 to 1 for committed-fee outputs, and 5 to 1 for canonical
+fee-free eligibility. With N inputs, output checking previously used N+2 or
+N+3 entries. Construction remains one entry, but now that entry controls the
+whole workflow rather than only checking address length. Standalone address
+codec calls move from native-only logic to one Haskell workflow each.
+
+Two workflow bindings replace two fine-grained production bindings, so this
+pass leaves the static count at 217 (207 in tx_check.cpp). The old selectors
+and signatures remain reserved and are exercised by test-only references.
+This is runtime/orchestration consolidation, not a further static-site reduction.
+
+Apply the operation-capabilities design at workflow boundaries, not to each
+primitive callback. The checked ABI decodes a request, then executes an
+`Operation` whose declared capabilities own its rules and orchestration.
+`withOperation` proves payload equality before the interpreter inspects its
+DSL constructor. Concrete behavior belongs in capability instances; generic
+orchestration requires only the methods it uses. A capability dictionary does
+not prove that a request has passed validation.
+
+`RunBitcoinSignature` is one example. The native caller supplies mode,
+witness status, input/output counts, signature bytes and a synchronous native
+effect adapter. `Drivechain.elements_hs_bmm_signature_workflow` decodes this into
+`Bmm.SignatureWorkflow` and executes `RunSignature`, rather than calling a
+sequence of C++ rule wrappers. Its capabilities are `SignaturePreparation`,
+`SignatureHashing` and `SignatureVerification`:
+
+```haskell
+interpret operation request =
+  withOperation @SignatureWorkflow operation $ \value -> case request of
+    RunSignature -> Just (runSignature value)
+```
+
+`runSignature` prepares, hashes and verifies through those class methods. The
+preparation instance preserves the distinct BMM/parent gates, parent-only
+encoding check, key construction and signature splitting. The hashing instance
+composes `HashPlan`, `SignatureActions` and `Preimage` inside Haskell, then sends
+the complete ordered native hash plan in one callback. The verification
+instance invokes native secp256k1 verification only after earlier stages pass.
+The hash-only constructor reuses preparation/hashing without key verification.
+An invalid checker mode cannot select hash-only execution.
+
+C++ retains Bitcoin object ownership, serialization, hashing and crypto; it
+executes the selected native operations without calling Haskell again. The
+callback arguments are borrowed only during the call. Output bytes are copied
+before reuse, and the existing exception holder preserves the first native
+exception and stops all later effects. Domain rejection, invalid reply and
+dispatch mismatch remain separate outcomes.
+
+| Successful path | C++ to Haskell entries | Native callbacks |
+| --- | --- | --- |
+| BMM signature, SIGHASH_ALL | 7 -> 1 | 18 -> 4 |
+| Parent signature, SIGHASH_ALL | 7 -> 1 | 19 -> 5 |
+| Hash only, SIGHASH_ALL | 3 -> 1 | 13 -> 1 |
+
+These counts describe the named paths, not whole-node runtime measurements.
+Rejection stops earlier; other hash types select fewer hash components. The
+five obsolete production adapters now exist only as differential test
+references; one new workflow binding replaces them, reducing static sites by
+four. Existing ABI selectors remain reserved. This is genuine composition of
+one workflow, not a generic dispatcher hiding hundreds of unrelated requests.
+
+Use this pattern for further parent, peg, withdrawal and exchange consolidation.
+Batch only operations whose native order and failure behavior are preserved.
+Never use eager fact collection for effects, move inherited code, bypass native
+checks, or trade fewer exported names for more callback crossings. Keep simple
+pure rules on the existing `Check`/`Validation` adapter when a new class adds
+no useful structure.
+
+### Parent replay maintenance
+
+`MaintainParentReplay` applies the same design to proposal expiry, withdrawal
+expiry, empty-slot pruning and publication. One checked ABI request decodes to
+`ParentReplay.Maintenance`, whose declared capabilities are
+`ProposalMaintenance`, `WithdrawalMaintenance` and `ReplayPublication`.
+After payload equality is established, the DSL constructor supplies the context
+for a small capability-constrained composition:
+
+```haskell
+maintainBeforeTreasury :: (ProposalMaintenance op, WithdrawalMaintenance op)
+  => op -> ExceptT Int32 IO ()
+maintainBeforeTreasury value =
+  expireProposalSlots value >>= expireWithdrawalSlots value
+
+maintainAfterTreasury :: ReplayPublication op => op -> ExceptT Int32 IO ()
+maintainAfterTreasury value =
+  pruneReplaySlots value >> publishReplayBlock value
+```
+
+The two requests bracket treasury transaction replay. Haskell selects windows,
+traverses slots, evaluates expiry, orders removals, checks publication flags and
+stops on the first failure. C++ supplies snapshots through total native getters
+and applies ordered removals to its existing maps/vectors. Snapshot heights and
+proposal votes retain all 32 bits; invalid votes cannot truncate into valid ones.
+Snapshots are private, synchronous ABI data, not a new stored or network format.
+Native callbacks do not re-enter Haskell for these subrules.
+
+The configured slot is processed first for proposals; withdrawals use sorted
+active slots. An invalid later entry still publishes the earlier erase prefix
+before returning its original diagnostic. Gapped erase indices refer to the
+original snapshot, not positions in the shrinking container. Pruning precedes
+the active-proposal check; output publication precedes the final deadline check.
+Native exceptions stop subsequent callbacks and are rethrown unchanged.
+The final deadline sequence composes the existing deadline transition inside
+Haskell; both the standalone checker and this workflow share only the native
+clock/interrupt reads and exception effects. Publication does not re-enter
+Haskell through the standalone checker.
+
+Four former production bindings remain only in test references, replaced by one
+maintenance binding: three fewer static sites. `BLOCK_REPLAY_COMPOSED` skips the
+now-internal withdrawal-expiry and publication stages; the old `BLOCK_REPLAY`
+selector and all existing ABI indices remain reserved and tested. The later
+whole-block operation below now composes both maintenance stages internally;
+their standalone ABI bindings remain test references.
+
+### Parent block prelude
+
+The retained test reference `ReplayParentPrelude` is one checked ABI request for admission, ordered coinbase
+collection and M8 acceptance. `ParentBlock.Prelude` declares `ReplayAdmission`,
+`CoinbaseCollection` and `BmmRequests`. Its interpreter proves payload equality
+before matching `CheckPrelude`, then invokes:
+
+```haskell
+runPrelude :: (ReplayAdmission op, CoinbaseCollection op, BmmRequests op)
+  => op -> ExceptT Int32 IO ()
+runPrelude value =
+  admitParent value >> collectCoinbase value >>= checkBmmRequests value
+```
+
+Admission reuses existing balance/window and preflight rules. Native snapshots
+contain only total getters; an empty or null coinbase is guarded before calling
+the upstream transaction predicate. Later snapshots are requested only after
+earlier checks pass. Haskell owns the duplicate sets, current decoded message
+and accepted M7 map. It composes the original coinbase and M8 traversals and
+deadline transitions directly, with no callback re-entering Haskell.
+
+C++ retains `CScript::GetOp`, proposal hashing, borrowed object access and decoded
+message publication. Coinbase parsing still accepts alternate push encodings,
+rejects trailing opcodes and hashes only the M1 description. M2/M3 hashes retain
+consensus byte order; M7/M8 critical hashes reverse display order. M8 accepts only
+the exact 70-byte direct push; malformed lookalikes remain ordinary transactions.
+M7 mismatch precedes stale-parent rejection. No replay state is mutated until
+every recognized M8 has passed.
+
+The private callback groups are admission (0-3), coinbase (10-15), M8 (20-22),
+native deadline effects (30), and diagnostic publication (200). Scalars are
+eight-byte little-endian values. Admission parameters are four words followed
+by three age/threshold uint16 pairs. Other-slot rows are slot/flags/value64;
+prior-M4 rows are slot/flags. Published messages contain kind/slot/encoding,
+hash32 and optional uint16 votes. Replies are shape-checked; this is not a stored
+or network encoding.
+
+Two fine-grained production bindings become test-only references; one prelude
+binding replaces them. The total static reduction is one site, distinct from
+removing the nested runtime rule entries. New flow `BLOCK_REPLAY_PRELUDE` (328)
+folds stages 1-3 into stage 1; old flows and existing ABI selectors are unchanged.
+The whole-node migration remains incomplete.
+
+### Whole parent block
+
+Standalone `ApplyDrivechainParentBlockState` calls `ReplayParentBlock` once.
+The checked parent-family request constructs `ParentBlock.Block`. Its declared
+capabilities are preparation, messages, maintenance and treasury. As with the
+transaction workflows, `withOperation` proves payload `eqT`/`Refl` before matching
+the constraint-carrying DSL constructor; the interpreter invokes the generic helper:
+
+```haskell
+replayBlock :: (ReplayPreparation op, ReplayMessages op,
+  ReplayMaintenance op, ReplayTreasury op) => op -> Checked ()
+replayBlock value =
+  prepareBlock value >> replayMessages value >> beforeTreasury value >>
+  replayTreasury value >> afterTreasury value
+```
+
+The existing prelude, message, expiry, CTIP/M5/M6 and publication rules are composed
+inside Haskell. Treasury traversal also owns active-slot selection, treasury-script
+parsing, deposit-address parsing policy, deadlines and the block-scoped M6 flag.
+No native callback in this workflow re-enters Haskell for a subrule. Five former
+production bindings become test references; one whole-block binding replaces them,
+reducing static sites by four. This is separate from the runtime benefit of one
+native-to-Haskell entry per parent block, not a whole-node performance profile.
+
+Native callbacks retain borrowed transactions, iterator lifetimes, map/vector
+ownership, existing `CScript::GetOp`, M6 blinding/serialization/hash operations,
+diagnostic formatting and replay-state effects. Per-transaction objects are replaced
+only when the next transaction is selected. The initial deadline precedes clearing
+output vectors; all M8 checks precede replay-state changes. Later failures preserve
+the original prefix of effects, including successful earlier deposits or withdrawals.
+Final slot pruning precedes the active-proposal check and output publication;
+the final deadline follows publication. This is not an atomic rollback redesign.
+
+The private callback selector is `4096 * group + action`: group 0 is preparation
+and prelude, 1 messages, 2 expiry, 3 treasury, 4 publication. Within each group,
+1000+ actions supply snapshots, select native objects or publish diagnostics; lower
+actions retain existing effect identities. Treasury snapshot words are transaction
+count, proposal flags and money limit; selected-transaction rows contain input/output
+counts and slot/active pairs. These checked frames are neither network nor storage
+encodings. All 282 previous operation indices/signatures remain reserved unchanged.
+
+Tests exercise reusable capability stage ordering without an `Operation` constraint,
+lazy payload mismatch, malformed frames, exact callback exception prefixes, M5
+address parsing, and both sequential and single-configured-slot M6 policies. Native
+parent replay fixtures remain the end-to-end consensus regression backstop.
+
+### Direct parent-block sessions
+
+`ParentCache` sits above `ParentReplay`, `ParentBlock` and `ReplayStore`.
+This keeps the dependency graph acyclic: block rules can use lower-level
+replay rules while cache startup and advancement compose `replayBlock`
+directly. The cache no longer calls back into
+`ApplyDrivechainParentBlockState` for either genesis or a successor block.
+Those two nested interpreter-entry sites are removed; the standalone entry
+and its existing operation registration remain for independent callers.
+
+`MakeDrivechainParentBlockEffects` owns native replay temporaries in a stable
+scope. It borrows the existing block, mutable state and optional output
+vectors under the caller's lock; callers must keep them alive until the
+scope closes. The five native effect families are unchanged. Internal effect
+20480 projects the block's fixed-width replay parameters; 20481 maps completion
+to the retained success/rejection result and exact M2/M3/M4 interpreter errors.
+These are process-local messages, not storage or consensus formats.
+
+Startup opens/closes this scope with actions 23/24 and routes block effects
+at offset 1000. Cache advancement uses actions 16/28 and offset 30000.
+Startup remains nested under cache offset 300. Haskell closes the block
+scope on success, rejection and exceptions before milestone checks,
+database append or cache-tip publication. Native FFI exception latching
+still stops subsequent effects and preserves the original exception.
+
+The refactor removes nested orchestration crossings, not the native
+getters, codecs, crypto or ownership callbacks used by the interpreter.
+It adds lifetime-adapter code and does not by itself reduce the global
+binding inventory or finish the fork-only C++ migration.
+
+### Deposit evidence reconstruction
+
+`BuildDrivechainDepositEvidence` now calls `ConstructDepositEvidence` once.
+The checked peg-family request constructs `Deposit.Construction`, whose declared
+capabilities are `DepositSource`, `PriorTreasury` and `ConfirmationHeaders`.
+Payload equality precedes DSL matching, and the interpreter delegates to:
+
+```haskell
+constructEvidence :: (DepositSource op, PriorTreasury op,
+  ConfirmationHeaders op) => op -> ConstructionCheck ()
+constructEvidence value =
+  readDepositSource value >> readPriorTreasury value >> readConfirmationHeaders value
+```
+
+Haskell owns preflight, source-check order, prior-treasury search, predecessor
+sequence calculation, the bounded header window and traversal. It reuses the
+existing hex-schema, CTIP search, treasury-script and sequence rules internally.
+Four former production binding sites become one; the CTIP search binding remains
+in use by the unrelated unique-match adapter. All 283 preceding ABI selectors and
+signatures remain unchanged. The new private operation is appended, not a new
+exported symbol or a network/storage encoding change.
+
+Native callbacks retain RPC transport, borrowed transactions, native decoding and
+hashing, and evidence object publication. Their selectors are 0-4 for the source,
+10-12 for search size/publication/tip, 20-22 for headers, 101-105 for candidate
+snapshots/effects and 109 for rethrowing an original candidate exception. Only
+the prior-transaction scan tolerates native errors: its checked reply envelope
+distinguishes normal bytes, runtime-error text and other exceptions. Haskell
+applies the existing fatal-message rule before requesting the original exception
+be rethrown. Ordinary stages fail closed. This preserves partial publication,
+including previously appended headers when a later header fails.
+
+This retained ECX evidence path requires its historical NOP5 treasury encoding;
+it does not change the native Betanet NOP8 profile, automatic deposit importer,
+or retired wallet RPC guards. RPC helpers still invoke their independent Haskell
+transport/schema checks. The reduction is one deposit-reconstruction orchestration
+entry, not a claim that the complete RPC path has only one runtime crossing.
+Tests cover ordered traces, signed sequence/slot/height and header-window limits,
+callback fault prefixes, candidate recovery and fatal errors, malformed replies,
+lazy mismatches and generic capability composition.
+
+### Deterministic deposit parsing
+
+`ParseV2Deposit` now makes one `ParseDeterministicDeposit` request. The checked
+peg-family ABI constructs `Deposit.Parsing` with borrowed witness fields and
+synchronous native codec/effect callbacks. Its five declared capabilities own
+evidence parsing, inclusion verification, treasury verification, destination
+selection and publication. After payload equality and DSL matching, the interpreter
+uses the generic `parseDeposit` helper; the helper needs only those capabilities.
+
+This workflow calls the existing deterministic-evidence, witness and CTIP rules
+inside Haskell. Header traversal and destination scanning share their implementations
+with the preserved standalone APIs. The prior-input loop, match count, historical
+NOP5 treasury recognition, amount-delta checks and stage/error precedence are all
+in Haskell. Native callbacks do not re-enter Haskell. The external state-verification,
+connection and disconnection workflows remain separate callers of this parser.
+
+C++ owns borrowed transactions, evidence/header objects, native serializers,
+transaction hashes, Merkle extraction, upstream parent PoW, address decoding and
+`CScript::GetOp`. Only bounded witness prefixes cross as copied data; transaction
+bytes are borrowed for the existing native hash/decoder callbacks. Treasury scripts
+are projected to at most five bytes, enough to distinguish exact four-byte scripts
+from every invalid length. The evidence reconstruction adapter uses the same bound.
+No network, witness or storage encoding changes. All 284 earlier ABI bindings remain.
+
+Input and witness index admission precedes field reads. Invalid evidence never
+reaches transaction decoding. The anchor is published after header authentication,
+before later treasury/destination checks as before; the full parsed result is
+published only on success. Duplicate destinations still perform the original
+second local selection before rejection. Header and destination native adapters
+retain their old fault-to-status behavior; other native exceptions retain the
+first-exception latch and are rethrown unchanged. Callback scalar widths and
+private frame sizes are checked instead of truncating oversized values.
+
+The new request replaces three production bindings with one; old parsing/scan
+adapters are test references, while their shared generic flow binding remains used
+elsewhere. Static sites fall by two, independently of the nested runtime entries
+removed from the parser. Tests cover full ordered traces, domain rejection,
+malformed frames, lazy mismatches, generic capability composition, and exceptions
+at every native callback. Native persisted-evidence and proof/amount mutation
+fixtures remain the end-to-end backstop, extended with overlong treasury scripts.
+This does not reactivate retired ECX RPCs or migrate the entire node.
+
+### Deposit claim workflows
+
+`Deposit.Claim` carries a borrowed transaction view and three declared capabilities:
+`CheckpointDiscovery`, `LegacyAuthentication` and `TransactionVerification`.
+The checked peg ABI selects `DiscoverCheckpoint`, `AuthenticateLegacy` or
+`VerifyClaimTransaction`; after payload equality the interpreter calls the selected
+capability method directly. The interpreter contains no concrete claim rules.
+
+Checkpoint lookup now includes input admission, the legacy witness-shape check,
+immutable-record matching and publication. Legacy authentication includes witness
+decoding, destination acceptance, immutable amount checks and publication.
+Transaction verification includes shape-dependent input/witness inspection,
+bounded output projection and the existing exact credit/fee conservation rule.
+Each successful path has one Haskell orchestration entry, replacing three nested
+or sequential entries. The native callbacks do not call Haskell. External state
+verification/connect/disconnect workflows still call these operations separately.
+
+C++ retains borrowed object ownership, transaction identity projection, upstream
+address/script handling, exact record decoding and result publication. Output
+inspection still occurs after an invalid input shape, as in the original path;
+witness pointers are not read for rejected input shapes. Invalid legacy witness
+amounts still take precedence over invalid destinations. Missing checkpoints do
+not modify the caller's result or error. The standalone authenticated-output rule
+remains used by the native committed-fee deposit path, which is not migrated by
+this change.
+
+Static production sites fall by one (two unused rule bindings removed, one whole
+claim binding added). Shared generic flow/reader bindings remain used elsewhere;
+removing their claim-specific wrappers is not counted as another site reduction.
+All 285 previous selectors/signatures remain reserved and unchanged. Tests retain
+the old fine-grained adapters as references, compare native transaction mutations
+and error text, and cover bounded reads, callback failure prefixes, malformed
+replies, unknown modes, ordered effects and lazy payload mismatches. No network,
+witness format, confidential cache or activation rule changes.
+
+## Whole transaction admission
+
+`AdmitTransaction` projects a compact snapshot of total, side-effect-free native
+predicates. One Haskell entry handles ordinary inputs, explicit creations,
+deployment preflight, or public bond issuance. `Check TransactionAdmission` uses
+the shared `Operation`/`Validation` capability dispatch; its named constructors
+compose the same ordinary-input, explicit-creation and single-issuance rules
+inside Haskell, rather than returning to C++ for each condition.
+
+| Workflow | Native-to-Haskell entries | Native callbacks after batching |
+| --- | --- | --- |
+| Ordinary inputs, N passing inputs | N+1 -> 1 | 0 (previously 5N+1) |
+| Explicit creations | 1 -> 1 | 0, replacing input/output/witness traversal callbacks |
+| Deployment preflight | 3 -> 1 | 0 |
+| Public bond issuance | 4 -> 1 | At most 1, native asset/token derivation |
+
+These are invocation counts for the stated paths, not whole-node throughput
+measurements. Views take O(transaction size) time and space even when a later
+decision rejects early; only pure, guarded native getters are collected eagerly.
+They do not copy rangeproofs, scripts or witness bodies, unblind values, or touch
+confidential-transaction caches. The ordinary-input view includes inputs only.
+Public bond derivation remains lazy after index, explicitness, issuance-count
+and supply checks. Its callback runs synchronously with a zero-initialized
+64-byte output; native exceptions are captured and rethrown only after returning
+from Haskell. Bad framing, modes, counts and callback results fail closed.
+
+The snapshot is a private ABI view, not a transaction, database, header, proof,
+or network encoding. Existing native serialization, hashing, secp256k1 routines,
+locks, parent authentication and commit boundaries are unchanged. Inherited
+Elements/Bitcoin code is not migrated.
+
+Eleven former fine-grained wrappers now needed only by differential tests live
+in `test/ecx_exchange_state_tests.cpp`, with their shared profile helper. Their
+removal from production accounts for eight fewer static binding-use sites; the
+new transaction entry adds one. This cleanup is distinct from the runtime
+batching gains. The further workflow consolidation below removes twelve more
+test-only adapters from production, retaining them in existing test translation
+units. The whole 280-site inventory has not been collapsed into a few dozen calls.
+
+## Composed workflows
+
+The added entry points compose existing `Validation` instances inside Haskell.
+They do not replace native cryptography or serialization, and they do not combine
+state publication with an earlier admission boundary.
+
+| Path | Consolidation |
+| --- | --- |
+| Parent M4 voting | One entry selects the mode, orders active slots, applies votes and publishes each effective action. Explicit abstentions skip pending-state reads. Missing votes stop before later slots; earlier publications retain their original ordering. |
+| Exchange M6 envelope | One entry scans coinbase payloads, validates lengths, chooses the envelope requirement, checks the checkpoint, parses M6 and prepares the existing state-anchor bytes. Native `GetOp`, hash, ancestor lookup and tagged hashing remain native. |
+| BMM candidate work | One entry measures all N candidate transactions instead of N+1 entries. Native callbacks supply small witness metadata and serialize only qualifying stacks; Haskell reuses `WorkBudget` and its saturation/overflow behavior. Single-transaction RPC reporting also updates the running total inside that entry. |
+| Deposit state lifecycle | Verification, anchor, connect and disconnect workflows apply their state rules internally. Each state decision loses a nested entry. Existing proof parsing, CTIP access, cache writes and undo boundaries remain distinct. |
+| Parent treasury transaction | One entry composes CTIP ownership, input/output scans, replacement checks, then M5 deposits or M6 withdrawal admission and blinded-ID preparation. The previous successful M5 path used N+7 entries for N deposits; the M6 path used 8. Active-slot selection and block traversal are outside these counts. Native script parsing, transaction hashing, maps and ordered mutations stay native. |
+| BMM state lifecycle | Connect, disconnect and effective-state selection compose `Lifecycle` and `StateSource` inside their existing state traversal. Native-mode state inspection keeps its lazy persisted-state lookup. Historical proof verification, state decoding and parent authentication remain distinct calls. |
+| BMM proof admission | `ProofWorkflow` composes envelope, canonical entry decoding, bounds, Merkle binding, extension, PoW facts and final parent/critical checks inside `Traversal`. Native parsing and crypto remain native. State validation, retargeting, signet and commitment extraction still have nested domain calls; this is not a fully flattened BMM verifier. |
+| BMM retarget | One entry composes `Retarget` and `TargetScale`, replacing three entries at a retarget boundary and two off boundary. Difficulty-interval calculation remains a separate call outside these counts. Compact-target decoding/encoding stays native; target reads remain lazy. Existing unsigned-32-bit factor truncation and unsigned-256-bit multiplication wrap are preserved. Malformed callback replies reject before publication, and the first native exception is rethrown unchanged. |
+| Exchange singleton | `StateWorkflow` composes the input scans, transition shape and authority rules before successor publication. With N transactions and R transactions after the selected transition, a successful derivation goes from N+R+2 entries to one. A carry-forward path goes from N+1 to one; tracked-coin validation goes from two to one. Hashes and UTXO access stay native. |
+| Persisted CTIP | One entry composes script packing and persisted-state validation, replacing two entries. All three opcode reads still precede metadata checks. Payload decoding stays native; the caller publishes the decoded state only on success. |
+
+The treasury adapter returns a group-tagged error without changing user-facing
+diagnostics. A failed M6 ID retains its specific failure instead of becoming a
+generic withdrawal rejection. Multiple deposits retain their original ordered
+publication, including partial state on later failure. The BMM workflow retains
+the first native verification error during disconnect and does not overwrite it
+with a generic state-mismatch error. Eight additional fine-grained adapters now
+live only in existing native test files; their ABI selectors remain reserved.
+The scalar callback bridge suppresses further native callbacks after an exception
+and rethrows that first exception after returning from Haskell.
+
+The October24 pass retires another 20 adapters that now have only test callers.
+Their original implementations live in `test/util/haskell_reference.h`, included
+only by tests; production declarations are removed. Twelve production binding
+sites disappear and three composed workflow sites are added, for a net reduction
+of nine. This is separate from the per-transaction runtime reductions above.
+Existing selector numbers and wire/storage formats remain unchanged.
+
+The exchange workflow deliberately retains successor publication before the
+later-transaction scan: a later rejection leaves the same partial result as
+before. BMM entry decode retains its short-circuit prefix and final coinbase
+shape read on ordinary decode rejection, but no further native effects follow a
+captured exception. Domain rejections preserve diagnostic precedence. Differential
+properties compare results, callback order and publication against nested rule
+execution; native tests inject exceptions at each workflow callback.
+
+`NativeWorkflow` is a synchronous, scoped byte-view callback shared by voting,
+envelope, work measurement and retargeting, not a new generic operation
+dispatcher. Native reply storage stays
+alive until the next callback; Haskell copies it before proceeding. Input spans
+are borrowed only for that callback. The ABI checks lengths, null replies and
+status, initializes output descriptors, and captures native exceptions for
+rethrow after Haskell returns. No callbacks run after a captured exception.
+The safe FFI supports same-thread execution and nested native-to-Haskell calls.
+Each domain checks its own private framing. These views are not persisted or
+placed on the network, and do not copy or verify confidential proof bodies.
+
+The native tests retain the former fine-grained adapters as references, including
+5000 randomized witness-work comparisons, vote saturation/abstention cases,
+partial-publication and exception checks, and authenticated M6 envelope mutations.
+QuickCheck checks composed decisions and effect prefixes. Runtime improvements
+above are per named path; they are not whole-node performance measurements.
+
+Remaining fine-grained paths include parent header/cache authentication,
+deposit evidence and CTIP lifecycle access, BMM state/signet/codec
+authentication (and nesting the now-composed retarget workflow within proof
+admission), wallet withdrawal construction/journaling, and exchange inbox,
+deployment and USDD admission/codecs. File ownership
+consolidation is complete; workflow-boundary consolidation is still partial.
+
+`LiveEvidence` now runs through the deposit-state domain with scoped, safe
+callbacks and exception capture. It no longer exposes begin/resume/free stable
+handles. For N successful fact reads, native-to-Haskell entry invocations fall
+from N+3 to one, with N Haskell-to-native callbacks still required; this is not
+a claim that all boundary crossings disappear. Every callback receives four
+zero-initialized fields, and later reads remain lazy after rejection.
+
+`BmmSyncTick` receives the parent and child heights after the same ordered native
+reads and child lock. Its Haskell workflow performs the comparison and only asks
+for production stages 4 and 5 when behind. The nested `ChildBehind` FFI call and
+three callback stages are gone. Preflight, wallet authorization, fee caps,
+confirmed-input requirements, and mempool-only bidding are unchanged.
+
 ## Direct enforcer client
 
 `GrpcClient.hs` performs unary mTLS gRPC through the linked C core. It does not
@@ -8,7 +1697,7 @@ request/response pairs generated from the pinned CUSF schemas and explicitly
 converts proto field names to the node's existing lowerCamelCase JSON interface.
 Unknown request fields and conflicting aliases fail closed.
 
-`grpc_bridge.cpp` is the narrow native ABI: exceptions do not cross callbacks,
+The `GrpcRequest` adapter in `mainchainrpc.cpp` is the narrow native ABI: exceptions do not cross callbacks,
 output is bounded, and cancellation callbacks stay on the calling thread.
 The network worker is joined before call/channel destruction. Retries are
 disabled at the transport layer. The existing native credential/endpoint
@@ -726,17 +2415,15 @@ confirmation loss, active-hash changes and native exception propagation.
 and composes the original peer selector without changing its protocol. Tests
 exercise both entries through direct execution and the native ABI.
 
-The current ABI has **16 Haskell foreign exports**: 13 domain entrypoints
-(`configuration`, `usdd`, `exchange_codec`, `exchange_state`,
-`exchange_admission`, `parent_replay`, `bmm_codec`, `bmm_state`, `bmm_proof`,
-`deposit_state`, `deposit_evidence`, `withdrawal`) and the three existing
-`live_begin/resume/free` lifecycle functions. The C runtime initializer is a
-separate sixteenth C symbol. Older per-rule names mentioned below are now
-internal typed C++ bindings, **not** exported C functions.
+The current ABI has **8 Haskell foreign exports**: the six v2 families above,
+plus gRPC and Utreexo. The C runtime initializer is separate. The former
+`live_begin/resume/free` lifecycle functions are gone. Older per-rule names
+mentioned below are internal typed C++ bindings, **not** exported C functions.
 
-`abi.def` groups handlers; its per-domain row order defines the operation IDs.
-Append within a domain; never reorder/delete a row or change its signature in
-the same ABI version. `generate_abi.py` derives both `DomainABI.hs` and the small
+`abi.def` groups handlers; its per-section row order defines local operation IDs.
+`FAMILIES` in `generate_abi.py` fixes section tags. Append within a section or
+append new sections; never reorder/delete an existing row/section or change its
+signature in the same ABI version. The generator derives `DomainABI.hs` and the small
 `domain_abi.h` binding declarations from the ordinary `Drivechain.hs` type
 signatures. Run it after changing those inputs. The native build runs `--check`
 and rejects stale generated bindings. `abi.h` implements native packing once;
@@ -4404,13 +6091,16 @@ short-circuits after the first failed stage without rolling back earlier effects
 matching replay's existing prefix-mutation contract. The selected M5/M6 flow is
 the existing interpreter; no withdrawal or deposit policy is duplicated here.
 
-`BLOCK_REPLAY` sequences admission, coinbase collection, M8 acceptance, message
+The retained `BLOCK_REPLAY` sequences admission, coinbase collection, M8 acceptance, message
 dispatch, proposal expiry, withdrawal expiry, transaction replay, slot pruning,
 and final publication. Each stage reuses existing flows. Initial deadline/output
 clearing stays before the workflow; final deadline checking stays after output
 publication. An M8 rejection leaves state untouched, while later failures retain
 earlier replay effects. Only parsed messages, the accepted M7 map and derived
 output vectors span stages; per-stage iterators remain native and local.
+The intermediate `BLOCK_REPLAY_PRELUDE` is now a retained test reference.
+Production uses `ParentBlock.Block` with the same ordering and internal Haskell
+composition, including treasury traversal, as described above.
 
 `USDD_GENESIS` (selector 129) is retired and rejects all calls. Inherited genesis
 dry-run gating, output traversal and best-block publication stay native. Only
@@ -5243,6 +6933,134 @@ the leaf-only unsafe availability reader. Tests cover every stopping point,
 original exceptions, nested interpretation, null tips, missing version flags,
 cursor mismatches, persisted corruption and snapshot reset behavior.
 
+### Forced Output Admission
+
+`ForcedOutputSession` in `Exchange.hs` owns the complete canonical/admitted
+ECXFv3 output check. Its associated GADT distinguishes `CheckForcedOutput` from
+`AdmitForcedOutput`; payload equality is proved before the constructor is
+examined. `ForcedOutputFacts`, `ForcedAuthentication` and `ForcedOutputEffects`
+provide the specific methods. The reusable `checkForcedOutput` helper returns
+the authenticated payload and metadata without publishing them, so an enclosing
+Haskell source-append workflow can compose it without a native round trip.
+
+The order remains backend availability, output index, six lazy output-profile
+facts, exact marker framing, linked Rust canonical/signature verification,
+optional parent-height admission, then publication. It reuses `OutputProfile`,
+`ForcedV3Frame` and `ForcedV3Admission`; no consensus rule or verifier is replaced.
+Canonical checking deliberately does not impose the optional parent lifetime.
+The native callback retains transaction ownership, explicit-field access and
+the unchanged Rust verifier. Nonexplicit fields must fail before the native
+explicit-value accessors are called. Oversized scripts are represented by a
+bounded invalid-length prefix, never accepted by truncation.
+
+One exchange-session ABI handler replaces the retired native admission adapter;
+existing operation indices and signatures are unchanged. Successful admitted
+output checks now enter Haskell once instead of three times, while canonical
+checks enter once instead of twice. This intermediate admission stage retained
+189 static production sites and added four net C++ implementation lines for
+native framing. The enclosing block workflow now composes it directly as below.
+
+Tests cover all availability/index/profile combinations, signature rejection,
+height boundaries, precise diagnostics and publication order, every visited
+callback exception, malformed frames, capability reuse and lazy mismatches.
+Native fixtures exercise the actual linked signature verifier, nonexplicit
+asset/value rejection, malformed scripts and witness data, and canonical versus
+admitted behavior. No source-header authentication or settlement receipt is
+manufactured by this workflow.
+
+### Forced Block Source Append
+
+`ForcedBlockSession` in `ExchangeForcedV3Block.hs` owns both ordered block scans,
+header/economic preconditions, optional authenticated consumption, duplicate
+locators, persistent admission budgets, state transitions and final publication.
+Its `CheckBlockCursor` and `AppendBlockSource` GADT constructors select the
+workflow after payload equality. `BlockOutputs.foldBlockOutputs` is a default
+class method; both scans reuse it and other instances can provide the same
+ordered traversal without depending on `Operation` or the native ABI.
+
+The cursor scan still finishes before action admission starts, and checks the
+profile of every cursor marker, even after detecting multiple markers. The
+second scan calls `Exchange.checkForcedOutput` directly in Haskell, reusing the
+linked Rust signature verifier through leaf callbacks. Entry/state codecs,
+custody-kind rules and uint128 counters are shared, not reimplemented. Only
+the final successful state is published; rejection preserves the caller's
+result and original first-error diagnostic.
+
+C++ retains borrowed block/transaction lifetimes, typed-field observations,
+tagged hashing, Rust verification and the existing private
+`VerifiedCustodySource` provenance. Candidate preparation can inspect a proposed
+consumption but cannot manufacture an acceptance receipt. No activation,
+serialization, confidential proof/cache behavior or consensus rules change.
+
+The existing exchange-session registration gains cursor/source modes, without
+adding exports or changing older operation IDs. The block region's eight
+explicit bridge-call sites become two workflow entries. Each complete append
+enters Haskell once instead of repeatedly crossing for profiles, markers,
+admission, budgets and state updates. Callbacks remain separate native effects.
+The whole-node static production binding count decreases189->188 because the
+now-test-only state adapter is removed; this is not the15-site endpoint.
+
+Tests compare real native blocks against the preserved pre-migration C++ flow,
+including signed-script mutations, all prior-state/configuration bytes,
+duplicate locators, ordering, admission-budget boundaries and proposed custody
+consumption. QuickCheck covers generated ordered scans, exact effect traces,
+every visited exception prefix, malformed projections, late cursor errors,
+reusable capability folds and lazy existential mismatches.
+
+### Custody Reserved-Input Policy
+
+`ExchangeCustody.CustodyPolicySession` carries the input, policy-fact and effect
+capabilities. After payload equality, `CheckReservedPolicy` selects the
+predecessor or activation genesis, scans reserved inputs, checks the coupled
+vault output and traverses actual unconfirmed parents. `foldCustodyInputs` and
+`anyCustodyInput` are default class methods reusable without `Operation`.
+
+The workflow checks every input for the reserved count, even after finding the
+pair. Confidential asset/value fields are opened only after their explicit-form
+guards. Parent lookup still runs after a failed vault check, and stops at the
+first actual descendant. C++ owns the lookup result while its fields are read;
+it does not decide admission or call back into Haskell for a subrule.
+
+`PrepareSourceBudget` validates the complete prior inbox state and parent clock,
+then derives the maximum quota directly from the shared bounds. It publishes
+only on success. This replaces a zero-budget check plus up to seven native-to-
+Haskell search entries with one complete workflow entry. The old predicate
+remains available for callers validating a proposed conservative budget.
+
+Both requests use the existing exchange-session ABI, without changing earlier
+mode numbers, consensus serialization, activation or confidential caches.
+Tests retain the previous C++ flow as an independent orchestration reference;
+they compare diagnostics, lookup order and unchanged rejection outputs.
+QuickCheck also covers generated scans, malformed frames, exception prefixes,
+budget-search equivalence, capability-method reuse and lazy payload mismatch.
+
+### Custody Identity Workflows
+
+`CustodyIdentitySession` carries separate fact and effect capabilities. Its four
+associated GADT requests qualify deployment pins, check a projection, validate
+genesis or decode an annex. Payload equality precedes GADT inspection. Generic
+capability methods compose these operations directly in Haskell, without native
+subrule reentry. An internal qualified profile is reused within the workflow;
+it is not evidence of proof verification or an authenticated custody receipt.
+
+Native callbacks observe typed fields, preserve the existing projection layout,
+compute the existing tagged hashes and call the canonical Simplicity annex
+parser. Haskell constructs the complete decoded projection and publishes it
+only after identity checks pass. Invalid version/flag fields are observed
+without the native disk serializer rejecting them prematurely. Failure retains
+the original result and diagnostic ordering.
+
+The exchange-session modes extend the existing registry; prior ABI IDs remain
+unchanged. These are four complete entry workflows, not four new exports.
+Removing the two old subrule sites does not imply a net reduction in whole-node
+entry sites: newly migrated callers must now enter Haskell. Higher-level
+template and accepted-successor composition remains separate unfinished work.
+
+The preserved C++ reference covers profile, genesis, projection and annex
+mutation/truncation comparisons. QuickCheck covers full-width counters/scalars,
+strict native frames, exception prefixes, publication, lazy mismatches and
+reuse through another capability instance.
+
 ### Withdrawal envelope scan
 
 `EnvelopeScan` owns activation and coinbase guards, candidate filtering,
@@ -5714,8 +7532,12 @@ outside the probe. Tests cover direct/ABI traces, callback faults and nested
 execution inside BmmWait without making live RPC calls.
 
 `Bmm.TemplateCreationFlow` (244, bound 4) admits the wallet reward destination
-before constructing assembler options or a block template. Failure reporting
-is selected in Haskell. Native options remain alive through reporting, while
+before constructing assembler options or a block template. Template status is
+0 (unavailable), 1 (coinbase-only/idle), or 2 (selected mempool transactions).
+Only status 2 proceeds to either native or ECX bid submission; a nonempty mempool
+whose transactions are excluded by the assembler is still idle. This production
+policy does not reject consensus-valid empty blocks or interrupt already-paid bids.
+Failure reporting is selected in Haskell. Native options remain alive through reporting, while
 their construction is deferred until reward admission succeeds. Shared property
 and native trace/fault fixtures cover this flow and funded submission together.
 
@@ -6415,3 +8237,33 @@ refresh executes after releasing that lock and before the existing chain/mempool
 lock scope. The native mempool fee floor still precedes the relay-fee exemption;
 inherited fee arithmetic and subsidy accumulation are unchanged. No additional
 Haskell rule or ABI selector is needed for these compositions.
+
+### Candidate swap successor projection
+
+The separate annex-V7/PublicValuesV24 relation uses 1,693 public bytes. It
+preserves V23's field offsets through byte 1,626, with version 24, then appends
+the previous and next bridge roots and two canonical insolvency booleans.
+`Groth16Envelope` checks the full statement digest before the pairing callback;
+the V6 verifier continues to accept only V23. `SwapSuccessorBinding` additionally
+binds the predecessor bridge root and flag to the existing verified block-index
+snapshot. It also binds the statement's next forced-inbox head to the preceding
+header's source head: current-block markers are appended after this check.
+Capital, transaction, singleton and authenticated parent bindings remain
+required. Structural decoding alone does not authenticate a projection.
+
+After successful input scripts, native code records profile 2/version 5 under
+the existing capital block-index key. The 914-byte version-4 encoding remains
+unchanged; version 5 adds 33 bytes. Carry-forward, disconnect/reconnect and index
+selection use the same per-block record. The wallet's bridge fields are exposed
+only when this record matches the active header and separate trusted program,
+configuration, CMR and state-node pins. Bridge hashes use raw consensus-byte hex.
+
+The candidate pins default to unavailable. No V23-to-V24 migration, swap source
+admission or production activation is inferred from this transport support.
+Those require the new economic proof relation and an explicitly qualified
+deployment. The runtime fingerprint has its own v10 swap-profile domain and
+binds all four candidate pins and their availability flag. The script cache and
+ruleset revisions are 14 and 8 respectively. `test/SwapProjectionTests.hs`
+exercises the codec, independent public-value vector, ABI boundaries, predecessor
+bindings (including the actual source head), verifier short-circuiting and fingerprint pins; its recording verifier
+is explicitly not a genuine cryptographic proof.

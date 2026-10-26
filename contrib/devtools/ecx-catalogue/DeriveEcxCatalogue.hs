@@ -46,6 +46,8 @@ namedJets =
   , ("incremental_successor_transition_cmr_required", SomeArrow (E.ElementsJet (E.EcxJet Ecx.IncrementalSuccessorTransitionCmrRequired)))
   , ("verify_sp1_groth16_v5_incremental_activation_sha256", SomeArrow (E.ElementsJet (E.EcxJet Ecx.VerifySp1Groth16V5IncrementalActivationSha256)))
   , ("verify_sp1_groth16_v6_incremental_successor_sha256", SomeArrow (E.ElementsJet (E.EcxJet Ecx.VerifySp1Groth16V6IncrementalSuccessorSha256)))
+  , ("verify_sp1_groth16_v7_swap_successor_sha256", SomeArrow (E.ElementsJet (E.EcxJet Ecx.VerifySp1Groth16V7SwapSuccessorSha256)))
+  , ("verify_sp1_groth16_v8_custody_successor_sha256", SomeArrow (E.ElementsJet (E.EcxJet Ecx.VerifySp1Groth16V8CustodySuccessorSha256)))
   ]
 
 -- Full Haskell jet encodings: the first bit selects a jet rather than a
@@ -58,7 +60,7 @@ expectedBits =
   , "111100011101100", "111100011101101", "111100011101110", "111100011101111"
   , "1111000111100000000", "1111000111100000001", "1111000111100000010"
   , "1111000111100000011", "1111000111100000100", "1111000111100000101"
-  , "1111000111100000110", "1111000111100000111", "1111000111100001000"
+  , "1111000111100000110", "1111000111100000111", "1111000111100001000", "1111000111100001001", "1111000111100001010"
   ]
 
 expect :: String -> Bool -> IO ()
@@ -118,15 +120,15 @@ renderJet (index, (name, SomeArrow jet)) = intercalate "\t"
 
 main :: IO ()
 main = do
-  expect "exactly 24 ECX interfaces required" (length namedJets == 24)
-  expect "jet names must be unique" (length (nub (map fst namedJets)) == 24)
-  expect "jet CMRs must be unique" (length (nub (map jetCmr namedJets)) == 24)
+  expect "exactly 26 ECX interfaces required" (length namedJets == 26)
+  expect "jet names must be unique" (length (nub (map fst namedJets)) == 26)
+  expect "jet CMRs must be unique" (length (nub (map jetCmr namedJets)) == 26)
   let encodings = map encoded namedJets
-  expect "jet encodings must be unique" (length (nub encodings) == 24)
+  expect "jet encodings must be unique" (length (nub encodings) == 26)
   expect "jet encodings must be prefix-free" $
     and [not (a `isPrefixOf` b) | a <- encodings, b <- encodings, a /= b]
   mapM_ checkJet (zip [1..] namedJets)
-  forM_ [(5, 25), (5, 31), (5, 2147483647), (6, 1)] $ \(shelf, index) -> do
+  forM_ [(5, 27), (5, 31), (5, 2147483647), (6, 1)] $ \(shelf, index) -> do
     let bits = [True, True] ++ putPositive shelf (putPositive index [])
     expect ("unassigned decoder path accepted: " ++ show (shelf, index))
       (isLeft (evalStreamWithError E.getJetBit bits :: Either Error (SomeArrow E.JetType)))
@@ -135,4 +137,4 @@ main = do
     , "cmr", "imr", "amr", "source_tmr", "target_tmr", "specification_cmr", "specification_imr"
     ]
   mapM_ (putStrLn . renderJet) (zip [1..] namedJets)
-  hPutStrLn stderr "PASS: 24 actual jet identities, typed decoder round trips, all truncated encodings, unassigned paths, unique/prefix-free encodings, and cost-sensitive identities."
+  hPutStrLn stderr "PASS: 26 actual jet identities, typed decoder round trips, all truncated encodings, unassigned paths, unique/prefix-free encodings, and cost-sensitive identities."

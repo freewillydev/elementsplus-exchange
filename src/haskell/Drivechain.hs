@@ -1,36 +1,296 @@
 {-# LANGUAGE ForeignFunctionInterface, TypeFamilies, RankNTypes, FlexibleContexts, TypeOperators #-}
+{-# LANGUAGE TypeApplications #-}
 -- Copyright (c) 2026 The Elements Core developers
 -- Distributed under the MIT software license.
 module Drivechain where
 
 import Control.Exception (SomeException, catch, evaluate, mask_)
+import Control.Monad (when, unless)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
-import Data.Bits ((.&.), shiftR, testBit)
+import Data.Bits (testBit)
 import Data.Int (Int32, Int64)
-import Data.IORef (newIORef)
 import Data.Typeable (Typeable)
 import Data.Word (Word8, Word16, Word32, Word64)
 import Foreign.Marshal.Utils (copyBytes)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.C.Types (CSize(..), CBool(..), CInt(..))
-import Foreign.Marshal.Array (peekArray, pokeArray, withArray, withArrayLen, allocaArray)
+import Foreign.Marshal.Array (peekArray, pokeArray, withArray, withArrayLen, allocaArray, advancePtr)
 import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr)
 import Foreign.Storable (poke, peek, peekElemOff)
-import Foreign.StablePtr (newStablePtr, deRefStablePtr, freeStablePtr, castStablePtrToPtr, castPtrToStablePtr)
 import Withdrawal (withdrawal, wordLE, wordBE, PreflightFlow(..), DestinationFlow(..), EventFlow(..), SubmissionFlow(..), OutputFlow(..), JournalReadFlow(..), JournalPersistFlow(..), RpcBurnFlow(..), RpcClaimFlow(..), RpcVerifyFlow(..))
 import qualified Withdrawal
 import qualified Deposit
+import qualified NativeDeposit
 import qualified Bmm
 import qualified ParentReplay
+import qualified ParentCache
+import qualified ReplayStore
+import qualified ParentBlock
+import qualified ParentHeader
 import qualified Exchange
+import qualified ExchangeCustody as Custody
+import qualified ExchangeForcedV3 as ForcedV3
+import qualified ExchangeForcedV3Block as ForcedV3Block
 import qualified Usdd
 import qualified ScriptPolicy
 import Control.Operation
 import Control.Operation.Validation
-import Workflow (CommandFlow(..), PredicateFlow(..), countMatches)
+import Workflow (CommandFlow(..), PredicateFlow(..), NativeBytes, countMatches, Continue(..))
+
+type NativeBytesEffect = Ptr () -> Word32 -> Word64 -> Word64 -> Ptr Word8 -> Ptr Word64 -> Ptr (Ptr Word8) -> IO Int32
+foreign import ccall safe "dynamic" invokeNativeBytes :: FunPtr NativeBytesEffect -> NativeBytesEffect
+
+nativeBytes :: FunPtr NativeBytesEffect -> Ptr () -> NativeBytes
+nativeBytes effect context step index input
+  | effect == nullFunPtr = ioError (userError "missing native workflow callback")
+  | otherwise = B.useAsCStringLen input $ \(bytes,size) -> alloca $ \lengthOut -> alloca $ \dataOut -> do
+      poke lengthOut 0
+      poke dataOut nullPtr
+      status <- invokeNativeBytes effect context step index (fromIntegral size) (castPtr bytes) lengthOut dataOut
+      count <- peek lengthOut
+      result <- peek dataOut
+      if status /= 1 || count > fromIntegral (maxBound :: Int) || (count /= 0 && result == nullPtr)
+        then ioError (userError "invalid native workflow reply")
+        else if count == 0 then pure B.empty else B.packCStringLen (castPtr result,fromIntegral count)
+
+elements_hs_parent_block :: Word32 -> Word64 -> Word32 -> Word32 -> Word32 -> Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_parent_block height settings maxAge threshold opcode single effect context =
+  execute (ParentBlock.Block height settings maxAge threshold opcode single (nativeBytes effect context)) ParentBlock.ReplayBlock
+    `catch` handleFailure (-1)
+
+elements_hs_auth_file :: Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_auth_file mode effect context = run `catch` handleFailure (-1)
+  where
+    value = Bmm.AuthFile (nativeBytes effect context)
+    run = case mode of
+      0 -> execute value Bmm.ReadRawAuthFile
+      1 -> execute value Bmm.ReadStaticAuthRecord
+      2 -> execute value Bmm.ReadCookieAuthRecord
+      _ -> pure (-1)
+
+elements_hs_replay_store :: Word32 -> Word64 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_replay_store mode maximumMoney callback context = run `catch` handleFailure (-1)
+  where
+    value = ReplayStore.Store maximumMoney (nativeBytes callback context)
+    run = case mode of
+      0 -> execute value ReplayStore.CheckTip
+      1 -> execute value ReplayStore.AppendBlock
+      2 -> execute value (ReplayStore.LookupRecord ReplayStore.DepositRecord)
+      3 -> execute value (ReplayStore.LookupRecord ReplayStore.EdgeRecord)
+      4 -> execute value (ReplayStore.LookupRecord ReplayStore.WithdrawalRecord)
+      5 -> execute value (ReplayStore.LookupRecord ReplayStore.OccurrenceRecord)
+      6 -> execute value ReplayStore.ListDeposits
+      7 -> execute value ReplayStore.LoadStore
+      8 -> execute value ReplayStore.ResetStore
+      9 -> execute (ParentCache.CacheProgress (nativeBytes callback context)) ParentCache.ProgressReplayCache
+      10 -> execute (ParentReplay.Milestone (nativeBytes callback context)) ParentReplay.ValidateMilestones
+      11 -> execute (ParentReplay.BmmScan (nativeBytes callback context)) ParentReplay.ScanBmmCommitment
+      12 -> execute value (ReplayStore.RunSession ReplayStore.LoadSession)
+      13 -> execute value (ReplayStore.RunSession ReplayStore.ResetSession)
+      14 -> execute value (ReplayStore.RunSession ReplayStore.AppendSession)
+      15 -> execute (ParentCache.DepositAdmission maximumMoney (nativeBytes callback context)) ParentCache.AdmitDeposit
+      16 -> continue @(ParentCache.ConfirmedDeposit ()) ParentCache.ConfirmationReply $
+        execute (ParentCache.ConfirmedDeposit maximumMoney (nativeBytes callback context))
+          (ParentCache.AuthenticateConfirmation (ParentCache.MatchConfirmation ParentCache.ReadConfirmation))
+      17 -> execute value (ReplayStore.RunSession (ReplayStore.LookupSession ReplayStore.DepositRecord))
+      18 -> execute value (ReplayStore.RunSession ReplayStore.ScanSession)
+      19 -> continue @(ParentCache.DepositCandidates ()) ParentCache.CandidateReply $
+        execute (ParentCache.DepositCandidates (nativeBytes callback context))
+          (ParentCache.FilterCandidates (ParentCache.ScanCandidates ParentCache.ReadCandidateSnapshot))
+      20 -> execute (ParentHeader.networkHeader (nativeBytes callback context)) ParentHeader.CheckParentNetwork
+      21 -> execute (ParentHeader.networkHeader (nativeBytes callback context)) ParentHeader.ReadActiveHash
+      22 -> execute (Check (Deposit.ConfirmationWorkflow False (nativeBytes callback context))) Validate
+      23 -> execute (Check (Deposit.ConfirmationWorkflow True (nativeBytes callback context))) Validate
+      24 -> execute (Bmm.RpcSession (nativeBytes callback context)) Bmm.CallTransport
+      25 -> execute (Bmm.RpcSession (nativeBytes callback context)) Bmm.CallCheckedTransport
+      26 -> execute (Bmm.RpcHost (nativeBytes callback context)) Bmm.CheckRpcHost
+      27 -> execute (Bmm.LocalBidWallet maximumMoney (nativeBytes callback context)) Bmm.SubmitLocalBid
+      28 -> execute (ParentHeader.BmmBidSubmission maximumMoney (nativeBytes callback context)) ParentHeader.SubmitBmmBid
+      29 -> execute (ParentCache.BmmContext (nativeBytes callback context)) ParentCache.AuthenticateBmmContext
+      30 -> execute (Withdrawal.WalletWithdrawal (fromIntegral maximumMoney) (nativeBytes callback context)) Withdrawal.WithdrawFromWallet
+      31 -> execute (Withdrawal.WithdrawalJournal (fromIntegral maximumMoney) (nativeBytes callback context)) Withdrawal.ValidateJournal
+      32 -> execute (Withdrawal.WithdrawalJournal (fromIntegral maximumMoney) (nativeBytes callback context)) Withdrawal.ReadJournal
+      33 -> execute (Withdrawal.WithdrawalJournal (fromIntegral maximumMoney) (nativeBytes callback context)) Withdrawal.WriteJournal
+      34 -> execute (Withdrawal.WithdrawalJournal (fromIntegral maximumMoney) (nativeBytes callback context)) Withdrawal.ClearJournal
+      35 -> execute (Bmm.HeaderPolicy (nativeBytes callback context)) Bmm.ProofIsRequired
+      36 -> execute (Bmm.HeaderPolicy (nativeBytes callback context)) Bmm.CheckHeaderPolicy
+      37 -> execute (Bmm.StoredBmmState (nativeBytes callback context)) Bmm.ReadParentState
+      38 -> execute (Bmm.StoredBmmState (nativeBytes callback context)) Bmm.EffectiveParentState
+      39 -> execute (Bmm.StoredBmmState (nativeBytes callback context)) Bmm.PrepareParentContext
+      40 -> execute (Bmm.PersistedOutput False (nativeBytes callback context)) Bmm.PersistOutput
+      41 -> execute (Bmm.PersistedOutput True (nativeBytes callback context)) Bmm.PersistOutput
+      42 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.EncodeProof
+      43 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.DecodeProof
+      44 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.AttachProof
+      45 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.VerifyProofEntries
+      46 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.VerifyProofBlock
+      47 -> execute (Bmm.ProofSession (nativeBytes callback context)) Bmm.VerifyProofParent
+      48 -> execute (Bmm.ChainSession (nativeBytes callback context)) Bmm.ConnectChainState
+      49 -> execute (Bmm.ChainSession (nativeBytes callback context)) Bmm.DisconnectChainState
+      50 -> execute (Bmm.CommitmentSession (nativeBytes callback context)) Bmm.ExtractSelectedCommitment
+      _ -> pure (-1)
+
+elements_hs_parent_prelude :: FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_parent_prelude effect context =
+  execute (ParentBlock.Prelude (nativeBytes effect context)) ParentBlock.CheckPrelude
+    `catch` handleFailure (-1)
+
+elements_hs_parent_header :: Word32 -> Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_parent_header mode height effect context = run `catch` handleFailure (-1)
+  where
+    value = ParentHeader.Header height (mode `elem` [5,10,12,13])
+      (if mode `elem` [11,12,13,17] then ParentHeader.NativeDeadline else ParentHeader.HookDeadline)
+      (nativeBytes effect context)
+    run = case mode of
+      0 -> execute value ParentHeader.CheckProof
+      1 -> execute value ParentHeader.CalculateWork
+      2 -> execute value ParentHeader.CheckChainwork
+      3 -> execute value ParentHeader.AuthenticateRaw
+      4 -> execute value ParentHeader.AncestorMedian
+      5 -> execute value ParentHeader.AncestorMedian
+      6 -> execute value ParentHeader.CanonicalHash
+      7 -> execute value ParentHeader.ReadMetadata
+      8 -> execute value ParentHeader.CheckPredecessor
+      9 -> execute value ParentHeader.AuthenticateHeader
+      10 -> execute value ParentHeader.AuthenticateHeader
+      11 -> execute value ParentHeader.AuthenticateRaw
+      12 -> execute value ParentHeader.AncestorMedian
+      13 -> execute value ParentHeader.AuthenticateHeader
+      14 -> execute value ParentHeader.CheckBlockTransactions
+      15 -> execute value ParentHeader.CheckBlockSignet
+      16 -> execute value ParentHeader.AuthenticateBlock
+      17 -> execute value ParentHeader.AuthenticateBlock
+      18 -> execute value ParentHeader.AuthenticateSignet
+      19 -> execute value ParentHeader.ModifiedSignetMerkle
+      20 -> execute value ParentHeader.BuildSignetTransactions
+      21 -> execute value ParentHeader.WriteSignetBlockData
+      22 -> execute value ParentHeader.SelectSignetCommitment
+      23 -> execute (ParentHeader.NetworkHeader (nativeBytes effect context)) ParentHeader.AuthenticateNetworkHeader
+      24 -> execute (ParentHeader.ParentBlockReader (nativeBytes effect context)) ParentHeader.ReadAuthenticatedBody
+      25 -> execute (ParentHeader.ParentBlockReader (nativeBytes effect context)) ParentHeader.AuthenticateParentBlock
+      _ -> pure (-1)
+
+elements_hs_replay_maintenance :: Word32 -> Word32 -> Word64 -> Word32 -> Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_replay_maintenance mode height settings maxAge flags effect context =
+  run `catch` handleFailure (-1)
+  where
+    value = ParentReplay.Maintenance height settings maxAge flags (nativeBytes effect context)
+    run = case mode of
+      0 -> execute value ParentReplay.BeforeTreasury
+      1 -> execute value ParentReplay.AfterTreasury
+      _ -> pure (-1)
+
+elements_hs_replay_messages :: Word64 -> Word32 -> Word64 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_replay_messages count height settings effect context =
+  execute (Check (ParentReplay.MessageWorkflow count height settings (nativeBytes effect context))) Validate
+    `catch` handleFailure (-1)
+
+elements_hs_replay_m4_workflow :: Word32 -> Word64 -> Ptr Word16 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_replay_m4_workflow flags count votes effect context = run `catch` handleFailure (-1)
+  where
+    run | count > fromIntegral (maxBound :: Int) || (count /= 0 && votes == nullPtr) = pure (-1)
+        | otherwise = do
+            values <- if count == 0 then pure [] else peekArray (fromIntegral count) votes
+            execute (Check (ParentReplay.M4Workflow flags values (nativeBytes effect context))) Validate
+
+elements_hs_exchange_session :: Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_exchange_session mode effect context = run `catch` handleFailure (-1)
+  where
+    value = Exchange.ForcedOutputSession (nativeBytes effect context)
+    run = case mode of
+      0 -> fromIntegral . fromEnum <$> execute value Exchange.CheckForcedOutput
+      1 -> fromIntegral . fromEnum <$> execute value Exchange.AdmitForcedOutput
+      2 -> fromIntegral . fromEnum <$> execute block ForcedV3Block.CheckBlockCursor
+      3 -> fromIntegral . fromEnum <$> execute block ForcedV3Block.AppendBlockSource
+      4 -> fromIntegral . fromEnum <$> execute custody Custody.CheckReservedPolicy
+      5 -> fromIntegral . fromEnum <$> execute custody Custody.PrepareSourceBudget
+      6 -> fromIntegral . fromEnum <$> execute identity Custody.CheckCustodyAvailability
+      7 -> fromIntegral . fromEnum <$> execute identity Custody.CheckProjectionIdentity
+      8 -> fromIntegral . fromEnum <$> execute identity Custody.CheckGenesisIdentity
+      9 -> fromIntegral . fromEnum <$> execute identity Custody.DecodeProjectionIdentity
+      _ -> pure (-1)
+    block = ForcedV3Block.ForcedBlockSession (nativeBytes effect context)
+    custody = Custody.CustodyPolicySession (nativeBytes effect context)
+    identity = Custody.CustodyIdentitySession (nativeBytes effect context)
+
+elements_hs_exchange_envelope_workflow :: Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_exchange_envelope_workflow inactive effect context
+  | inactive > 1 = pure (-1)
+  | otherwise = execute (Check (Exchange.EnvelopeWorkflow (inactive == 1) (nativeBytes effect context))) Validate
+      `catch` handleFailure (-1)
+
+elements_hs_bmm_work_measurement :: Word32 -> Word64 -> Word64 -> Ptr Word64 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_bmm_work_measurement mode count initial output effect context = run `catch` handleFailure (-1)
+  where
+    run | output == nullPtr = pure (-1)
+        | otherwise = do
+            (status,total,lastWork) <- execute (Check (Bmm.WorkMeasurement mode count initial (nativeBytes effect context))) Validate
+            if status < 0 then pure status else pokeArray output [total,lastWork] >> pure status
 
 foreign import ccall unsafe "memcmp" compareAnnexBytes :: Ptr Word8 -> Ptr Word8 -> CSize -> IO CInt
+
+-- Fresh candidate byte codecs; never used by frozen ECXF/ECXC profiles.
+elements_hs_exchange_forced_v3_bytes :: Word32 -> Word64 -> Ptr Word8 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
+elements_hs_exchange_forced_v3_bytes mode size input expected capacity output = run `catch` handleFailure (-1)
+  where
+    shape=case mode of
+      0 -> size>=2 && size<=4108 && expected/=nullPtr && capacity==4104 && output/=nullPtr
+      1 -> size==145 && expected/=nullPtr && capacity==0
+      2 -> size==31 && capacity==24 && output/=nullPtr
+      3 -> size==24 && capacity==31 && output/=nullPtr
+      _ -> False
+    run | not shape || input==nullPtr = pure (-1)
+        | otherwise = do
+            bytes<-B.packCStringLen (castPtr input,fromIntegral size)
+            pin<-if mode<=1 then B.packCStringLen (castPtr expected,32) else pure B.empty
+            let encoded=case mode of
+                  0 -> execute (Check (ForcedV3.ForcedV3Frame pin bytes)) Validate
+                  1 -> if execute (Check (ForcedV3.ForcedV3State pin bytes)) Validate then Just B.empty else Nothing
+                  2 -> case execute (Check (ForcedV3.ForcedV3Cursor bytes)) Validate of
+                    Just _ -> Just (B.drop 7 bytes)
+                    Nothing -> Nothing
+                  3 -> Just (B.pack [106,29,69,67,88,67,3]<>bytes)
+                  _ -> Nothing
+            case encoded of
+              Nothing -> pure 0
+              Just result | mode==1 -> pure 1
+                          | otherwise -> B.useAsCString result (\p -> copyBytes output (castPtr p) (B.length result)) >> pure (fromIntegral (B.length result))
+
+elements_hs_exchange_forced_v3_admission :: Word32 -> Word64 -> Ptr Word8 -> IO Int32
+elements_hs_exchange_forced_v3_admission kind parent metadata = run `catch` handleFailure (-1)
+  where
+    run | kind>4 || metadata==nullPtr = pure (-1)
+        | otherwise = do
+            bytes<-B.packCStringLen (castPtr metadata,50)
+            pure (if execute (Check (ForcedV3.ForcedV3Admission parent (fromIntegral kind) bytes)) Validate then 1 else 0)
+
+elements_hs_exchange_forced_v3_append :: Ptr Word64 -> Ptr Word64 -> IO Int32
+elements_hs_exchange_forced_v3_append input output = run `catch` handleFailure (-1)
+  where
+    run | input==nullPtr || output==nullPtr = pure (-1)
+        | otherwise = do
+            fields<-peekArray 9 input
+            case execute (Check (ForcedV3.ForcedV3Append fields)) Validate of
+              Nothing -> pure 0
+              Just result -> pokeArray output result >> pure 1
+
+elements_hs_exchange_forced_v3_block_bytes :: Word32 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
+elements_hs_exchange_forced_v3_block_bytes mode size input capacity output = run `catch` handleFailure (-1)
+  where
+    shape=case mode of
+      0 -> size>=237 && size<=4301 && capacity==4199
+      1 -> size==186 && capacity==145
+      2 -> size<=14 && capacity==1
+      3 -> size>=96 && size<=4204 && capacity==1
+      4 -> size==1 && capacity==1
+      _ -> False
+    run | not shape || input==nullPtr || output==nullPtr = pure (-1)
+        | otherwise = do
+            bytes<-B.packCStringLen (castPtr input,fromIntegral size)
+            case execute (Check (ForcedV3Block.ForcedV3BlockBytes (fromIntegral mode,bytes))) Validate of
+              Nothing -> pure 0
+              Just result -> B.useAsCString result (\p -> copyBytes output (castPtr p) (B.length result)) >> pure (fromIntegral (B.length result))
 
 elements_hs_script_cache_encode :: Word32 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
 elements_hs_script_cache_encode mode size input capacity output = run `catch` handleFailure (-1)
@@ -115,7 +375,7 @@ elements_hs_groth16_header version size input
 
 elements_hs_canonical_values :: Word32 -> Word32 -> Ptr Word8 -> IO Int32
 elements_hs_canonical_values version size input
-  | lookup version [(4,609),(5,850),(23,1627)]/=Just size || input==nullPtr = pure (-1)
+  | lookup version [(4,609),(5,850),(23,1627),(24,1693)]/=Just size || input==nullPtr = pure (-1)
   | otherwise = (do
       bytes <- B.packCStringLen (castPtr input,fromIntegral size)
       evaluate (if execute (Check (Exchange.CanonicalPublicValues version bytes)) Validate then 1 else 0))
@@ -190,6 +450,77 @@ elements_hs_deposit_headers first tip = proofCall (\action -> execute (Check (De
 elements_hs_deposit_previous_sequence :: Int64 -> IO Int64
 elements_hs_deposit_previous_sequence current = guardResult (-1) $
   execute (Check (Deposit.PreviousSequence current)) Validate
+
+elements_hs_deposit_construction :: Int64 -> Int64 -> Word32 -> Int32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_deposit_construction sequenceNumber height flags slot effect context =
+  execute (Deposit.Construction sequenceNumber height flags slot (nativeBytes effect context)) Deposit.ReconstructEvidence
+    `catch` handleFailure (-1)
+
+elements_hs_deposit_parsing :: Word64 -> Word64 -> Word64 -> Int64 -> Word32 -> Word32
+  -> Ptr Word32 -> Ptr (Ptr Word8) -> Ptr Word8 -> Ptr Word8 -> Ptr Word8
+  -> FunPtr Deposit.HashTransaction -> FunPtr Deposit.DecodeEvidence -> Ptr ()
+  -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_deposit_parsing inputs index witnesses maximumMoney maximumTx count sizes fields asset genesis prevout hasher decoder decoded effect context =
+  execute (Deposit.Parsing inputs index witnesses
+    (Deposit.DeterministicEvidence maximumTx count sizes fields prevout hasher decoder decoded)
+    (Deposit.DepositWitness maximumMoney maximumTx 1 count sizes fields asset genesis prevout hasher)
+    (nativeBytes effect context)) Deposit.ParseDeposit `catch` handleFailure (-1)
+
+elements_hs_deposit_claim :: Word32 -> Word64 -> Word64 -> Word64 -> Word64 -> Int64 -> Word32 -> Word32
+  -> Ptr Word32 -> Ptr (Ptr Word8) -> Ptr Word8 -> Ptr Word8 -> Ptr Word8
+  -> FunPtr Deposit.HashTransaction -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_deposit_claim mode inputs index witnesses outputs maximumMoney maximumTx count sizes fields asset genesis prevout hasher effect context =
+  let value = Deposit.Claim inputs index witnesses outputs
+        (\kind -> Deposit.DepositWitness maximumMoney maximumTx kind count sizes fields asset genesis prevout hasher)
+        (nativeBytes effect context)
+      run = case mode of
+        0 -> execute value Deposit.DiscoverCheckpoint
+        1 -> execute value Deposit.AuthenticateLegacy
+        2 -> execute value Deposit.VerifyClaimTransaction
+        _ -> pure (-1)
+  in run `catch` handleFailure (-1)
+
+elements_hs_native_recipient :: Word32 -> Int64 -> Int64 -> Word64 -> Ptr Word8
+  -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_native_recipient mode maximumMoney amount size bytes effect context =
+  let source = if size > 128 then ioError (userError "unbounded native recipient read")
+        else Deposit.copyBytes bytes (fromIntegral size)
+      value = NativeDeposit.Recipient maximumMoney amount size source (nativeBytes effect context)
+      run = case mode of
+        0 -> execute value NativeDeposit.DecodeRecipient
+        1 -> execute value NativeDeposit.EncodeRecipient
+        2 -> execute value NativeDeposit.ConstructNative
+        _ -> pure (-1)
+  in run `catch` handleFailure (-1)
+
+elements_hs_native_outputs :: Word32 -> Word64 -> Word64 -> Word64 -> Word64 -> Int64 -> Word32
+  -> Ptr Word64 -> Ptr Word32 -> Ptr (Ptr Word8) -> Ptr (Ptr Word8) -> Ptr Word8 -> Ptr Word8
+  -> FunPtr Deposit.HashTransaction -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_native_outputs mode inputs index witnesses outputs maximumMoney maximumTx offsets sizes fields prevouts asset genesis hasher effect context =
+  let stack i = do
+        start <- peekElemOff offsets (fromIntegral i)
+        end <- peekElemOff offsets (fromIntegral i+1)
+        when (end < start || end-start > fromIntegral (maxBound :: Word32) ||
+          end > fromIntegral (maxBound :: Int) `div` 8) (ioError (userError "invalid borrowed witness offsets"))
+        pure (fromIntegral start,fromIntegral (end-start))
+      witness i kind amount = do
+        (start,count) <- stack i
+        previous <- peekElemOff prevouts (fromIntegral i)
+        pure (Deposit.DepositWitness maximumMoney maximumTx kind count (advancePtr sizes start)
+          (advancePtr fields start) asset genesis previous hasher amount)
+      field i item = do
+        (start,count) <- stack i
+        unless (count == 8 && item `elem` [3,7]) (ioError (userError "invalid native witness field"))
+        lengthBytes <- peekElemOff sizes (start+item)
+        unless (lengthBytes <= if item == 3 then 100 else 128) (ioError (userError "unbounded native witness field"))
+        pointer <- peekElemOff fields (start+item)
+        Deposit.copyBytes pointer lengthBytes
+      value = NativeDeposit.Outputs inputs index witnesses outputs maximumMoney witness field (nativeBytes effect context)
+      run = case mode of
+        0 -> execute value NativeDeposit.CheckOutputs
+        1 -> execute value NativeDeposit.CanonicalFeeFree
+        _ -> pure (-1)
+  in run `catch` handleFailure (-1)
 
 elements_hs_deposit_build :: Int64 -> Int64 -> Word32 -> FunPtr PolicyEffect -> Ptr () -> IO Int32
 elements_hs_deposit_build sequenceNumber height flags = policyCall (\action ->
@@ -423,6 +754,10 @@ elements_hs_exchange_transition :: Word64 -> FunPtr StateTransitionEffect -> Ptr
 elements_hs_exchange_transition count = callbackCall callStateTransitionEffect (\action ->
   execute (Check (Exchange.StateTransition count action)) Validate)
 
+elements_hs_exchange_state_workflow :: Word32 -> Word64 -> FunPtr CursorEffect -> Ptr () -> IO Int32
+elements_hs_exchange_state_workflow kind count = cursorCall (\action ->
+  execute (Check (Exchange.StateWorkflow kind count action)) Validate)
+
 elements_hs_ctip_outputs :: Word64 -> Word64 -> FunPtr IndexedFact -> Ptr () -> IO Int32
 elements_hs_ctip_outputs count maximumValue = callbackCall callIndexedFact (\action ->
   execute (Check (ParentReplay.CtipOutputs count maximumValue action)) Validate)
@@ -430,6 +765,10 @@ elements_hs_ctip_outputs count maximumValue = callbackCall callIndexedFact (\act
 elements_hs_m5_deposit :: Int64 -> Int64 -> Word64 -> Word64 -> Word64 -> Word32 -> FunPtr IndexedFact -> Ptr () -> IO Int32
 elements_hs_m5_deposit old new maximumValue output outputs flags = callbackCall callIndexedFact (\action ->
   execute (Check (ParentReplay.M5Deposit old new maximumValue output outputs flags action)) Validate)
+
+elements_hs_transaction_replay :: Word64 -> Word64 -> Word64 -> Word64 -> Word32 -> Word32 -> FunPtr IndexedFact -> Ptr () -> IO Int32
+elements_hs_transaction_replay slots inputs outputs maximumValue threshold single = callbackCall callIndexedFact (\action ->
+  execute (Check (ParentReplay.TransactionReplay slots inputs outputs maximumValue threshold single action)) Validate)
 
 elements_hs_ctip_spends :: Word64 -> FunPtr ProofBuildEffect -> Ptr () -> IO Int32
 elements_hs_ctip_spends count = proofCall (\action ->
@@ -483,6 +822,10 @@ elements_hs_bmm_ecx_production = policyCall (\action -> execute (Check (Bmm.EcxP
 
 elements_hs_bmm_sync_tick :: FunPtr PolicyEffect -> Ptr () -> IO Int32
 elements_hs_bmm_sync_tick = policyCall (\action -> execute (Check (Bmm.SyncTick action)) Validate)
+
+elements_hs_bmm_sync_heights :: Int64 -> Int64 -> FunPtr PolicyEffect -> Ptr () -> IO Int32
+elements_hs_bmm_sync_heights parent child = policyCall (\action ->
+  execute (Check (Bmm.SyncHeights parent child action)) Validate)
 
 elements_hs_parent_rpc_address :: Word32 -> Word32 -> Word32 -> Ptr Word8 -> IO Int32
 elements_hs_parent_rpc_address family ipv4 size input = run `catch` handleFailure (-1)
@@ -936,6 +1279,34 @@ type ReadSpendCount = Ptr () -> Word64 -> IO Word64
 elements_hs_exchange_source_admission :: FunPtr ReadSpendCount -> Ptr () -> IO Int32
 elements_hs_exchange_source_admission = callbackCall callReadSpendCount (\action -> fromIntegral <$> execute (Check (Exchange.SourceAdmission action)) Validate)
 
+type DeriveTransactionAssets = Ptr () -> Ptr Word8 -> IO Int32
+foreign import ccall safe "dynamic" deriveTransactionAssets :: FunPtr DeriveTransactionAssets -> DeriveTransactionAssets
+
+elements_hs_exchange_transaction_admission :: Word32 -> Word64 -> Ptr Word8 -> Word64 -> Word64 -> Word64 -> Word64 -> FunPtr DeriveTransactionAssets -> Ptr () -> IO Int32
+elements_hs_exchange_transaction_admission mode size input issuance inventory burn authority derive context
+  | mode > 3 || size < 32 || size > fromIntegral (maxBound :: Int) || input == nullPtr = pure (-1)
+  | otherwise = run `catch` handleFailure (-1)
+  where
+    run = do
+      bytes <- B.packCStringLen (castPtr input, fromIntegral size)
+      case Exchange.transactionView mode bytes of
+        Nothing -> pure (-1)
+        Just view -> do
+          let operation = case mode of
+                0 -> Exchange.OrdinaryInputs view
+                1 -> Exchange.ExplicitCreations view
+                2 -> Exchange.PublicBond view issuance inventory burn assets
+                _ -> Exchange.DeploymentInputs view issuance inventory burn authority
+          accepted <- execute (Check operation) Validate
+          evaluate (if accepted then 1 else 0)
+    assets
+      | derive == nullFunPtr = ioError (userError "missing transaction asset derivation")
+      | otherwise = allocaArray 64 $ \output -> do
+          pokeArray output (replicate 64 0)
+          status <- deriveTransactionAssets derive context output
+          if status /= 1 then ioError (userError "transaction asset derivation failed")
+            else B.packCStringLen (castPtr output,64)
+
 elements_hs_exchange_genesis_state :: Word32 -> Word64 -> Word64 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
 elements_hs_exchange_genesis_state mode height price size input capacity output = run `catch` handleFailure (-1)
   where
@@ -1074,7 +1445,7 @@ hashGroth16Bytes hash bytes = B.useAsCStringLen bytes $ \(pointer,len) -> alloca
 
 elements_hs_parse_groth16 :: Word32 -> Ptr Word8 -> Word64 -> Ptr Word8 -> Ptr Word8 -> Ptr Word8 -> Word32 -> FunPtr Groth16Hash -> IO Int32
 elements_hs_parse_groth16 kind input size program digest values capacity hash
-  | kind<1 || kind>4 || size>2062 || Exchange.groth16Layout kind (fromIntegral size)==Nothing ||
+  | kind<1 || kind>6 || size>2128 || Exchange.groth16Layout kind (fromIntegral size)==Nothing ||
     fromIntegral capacity+435/=size || input==nullPtr || program==nullPtr || digest==nullPtr ||
     values==nullPtr || hash==nullFunPtr = pure 0
   | otherwise = (do
@@ -1089,7 +1460,7 @@ elements_hs_parse_groth16 kind input size program digest values capacity hash
 
 elements_hs_groth16_proof :: Word32 -> Ptr Word8 -> Word64 -> Ptr Word8 -> Ptr Word8 -> FunPtr Groth16Hash -> FunPtr RustGroth16 -> Ptr () -> IO Int32
 elements_hs_groth16_proof kind input size expectedProgram expectedDigest hash verify context
-  | size>2062 || Exchange.groth16Layout kind (fromIntegral size)==Nothing ||
+  | size>2128 || Exchange.groth16Layout kind (fromIntegral size)==Nothing ||
     input==nullPtr || expectedProgram==nullPtr || expectedDigest==nullPtr ||
     hash==nullFunPtr || verify==nullFunPtr = pure 0
   | otherwise = (do
@@ -1457,8 +1828,8 @@ elements_hs_exchange_capital_identity profile program size values count expected
 elements_hs_exchange_capital :: Word32 -> Ptr Word8 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
 elements_hs_exchange_capital profile program size values count expected capacity output = run `catch` handleFailure (-1)
   where
-    identitySize=case profile of 0 -> 160; 1 -> 224; _ -> 240
-    run | profile > 2 || size /= (case profile of 0 -> 850; 1 -> 1627; _ -> 364) ||
+    identitySize=case profile of 0 -> 160; 2 -> 240; _ -> 224
+    run | profile > 3 || size /= (case profile of 0 -> 850; 1 -> 1627; 2 -> 364; _ -> 1693) ||
           capacity `notElem` [0,914] || (capacity/=0 && (profile==2 || output==nullPtr)) ||
           count /= identitySize+(if capacity==0 then 0 else 96) || any (== nullPtr) [program,values,expected] = pure (-1)
         | otherwise = do
@@ -1476,13 +1847,15 @@ elements_hs_exchange_capital profile program size values count expected capacity
 elements_hs_exchange_successor_binding :: Word32 -> Word64 -> Ptr Word8 -> Ptr Word8 -> Ptr Word64 -> IO Int32
 elements_hs_exchange_successor_binding profile size values hashes context = run `catch` handleFailure (-1)
   where
-    run | profile>1 || size/=(if profile==1 then 1627 else 850) ||
+    run | profile>2 || size/=(case profile of 0 -> 850; 1 -> 1627; _ -> 1693) ||
           values==nullPtr || hashes==nullPtr || context==nullPtr = pure (-1)
         | otherwise = do
             v <- B.packCStringLen (castPtr values,fromIntegral size)
-            h <- B.packCStringLen (castPtr hashes,128)
-            c <- peekArray 3 context
-            guardResult (-1) . fromIntegral $ execute (Check (Exchange.SuccessorBinding (profile==1) v h c)) Validate
+            h <- B.packCStringLen (castPtr hashes,if profile==2 then 192 else 128)
+            c <- peekArray (if profile==2 then 4 else 3) context
+            let binding=if profile==2 then Exchange.SwapSuccessorBinding v h c
+                        else Exchange.SuccessorBinding (profile==1) v h c
+            guardResult (-1) . fromIntegral $ execute (Check binding) Validate
 
 elements_hs_exchange_envelope_payload :: Word32 -> Ptr Word8 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
 elements_hs_exchange_envelope_payload height checkpoint size input capacity output = run `catch` handleFailure (-1)
@@ -1710,8 +2083,14 @@ elements_hs_parent_replay_store kind phase result = guardResult (-1) $
   replayStoreRule (\rule -> execute (Check rule) Validate) kind phase result
 
 elements_hs_parent_replay_run :: Word32 -> FunPtr MatchFact -> Ptr () -> IO Int32
-elements_hs_parent_replay_run kind = callbackCall callMatchFact (\action ->
-  execute (Check (CommandFlow (ParentReplay.storeMaximum kind) (replayStoreRule validate kind) action)) Validate)
+elements_hs_parent_replay_run kind = callbackCall callMatchFact (\action -> case kind of
+  329 -> execute (ParentReplay.RpcPreparation action) ParentReplay.PrepareCredentials
+  330 -> execute (ParentReplay.RpcPreparation action) ParentReplay.ConfigureTimeout
+  331 -> execute (ParentReplay.RpcCall action) ParentReplay.CallRpc
+  332 -> execute (ParentReplay.RpcCall action) ParentReplay.CallCheckedRpc
+  333 -> execute (ParentCache.CacheInitialization action) ParentCache.InitializeReplayCache
+  334 -> execute (Bmm.BodyRecovery action) Bmm.RecoverBody
+  _ -> execute (Check (CommandFlow (ParentReplay.storeMaximum kind) (replayStoreRule validate kind) action)) Validate)
 
 elements_hs_private_file_admission :: FunPtr MatchFact -> Ptr () -> IO Int32
 elements_hs_private_file_admission = callbackCall callMatchFact (\action ->
@@ -1726,13 +2105,14 @@ elements_hs_parent_replay_tip_run = predicateCall True 0 51 (\phase result -> fr
 
 elements_hs_deposit_run :: Word32 -> Word32 -> FunPtr MatchFact -> Ptr () -> IO Int32
 elements_hs_deposit_run kind start callback context
-  | kind /= 0 && start /= 0 = pure (-1)
+  | kind /= 0 && kind /= 5 && start /= 0 = pure (-1)
   | otherwise = case kind of
       0 -> run True 82 (\phase result -> fromIntegral (validate (Deposit.DepositVerification phase result)))
       1 -> run False 17 (\phase result -> validate (Deposit.WithdrawalStatusFlow phase result))
       2 -> run False 34 (\phase result -> validate (Deposit.L1Normalization phase result))
       3 -> run False 27 (\phase result -> validate (Deposit.SidechainEvents phase result))
       4 -> run False 6 (\phase result -> validate (Deposit.L1Location phase result))
+      5 -> callbackCall callMatchFact (\action -> execute (Check (Deposit.DepositStateWorkflow start action)) Validate) callback context
       _ -> pure (-1)
   where run acceptZero maximumStep transition = predicateCall acceptZero start maximumStep transition callback context
 
@@ -2070,7 +2450,7 @@ data DepositDepth = DepositDepth Word32 Word32 Word32
 instance Validation DepositDepth where
   type ValidationResult DepositDepth = Int32
   validate (DepositDepth deposit tip required) =
-    if required > 0 && deposit <= tip && tip - deposit >= required - 1 then 1 else 0
+    if Deposit.hasDepositDepth deposit tip required then 1 else 0
 
 data TreasuryMatch = TreasuryMatch Int32 (IO Int32)
 instance Validation TreasuryMatch where
@@ -2094,12 +2474,7 @@ data TreasuryScript = TreasuryScript Word32 Word32
 instance Validation TreasuryScript where
   type ValidationResult TreasuryScript = Int32
   validate (TreasuryScript script opcode) =
-    if (opcode == 0xb4 || opcode == 0xb7)
-       && script .&. 0xff == opcode
-       && (script `shiftR` 8) .&. 0xff == 1
-       && script `shiftR` 24 == 0x51
-    then fromIntegral ((script `shiftR` 16) .&. 0xff)
-    else -1
+    ParentReplay.treasurySlot script opcode
 
 -- Negative fault sentinels are distinct from every consensus rejection.
 -- Never allow a Haskell exception to unwind through a C++ stack frame.
@@ -2121,6 +2496,22 @@ elements_hs_bmm_proof_run :: Word32 -> Word32 -> FunPtr ProofFacts -> Ptr () -> 
 elements_hs_bmm_proof_run kind start = factsCall (peekArray 4) (\action ->
   execute (Check (Bmm.ProofExecution kind start action)) Validate)
 
+elements_hs_bmm_proof_workflow :: Word32 -> FunPtr ProofFacts -> Ptr () -> IO Int32
+elements_hs_bmm_proof_workflow start = factsCall (peekArray 4) (\action ->
+  execute (Check (Bmm.ProofWorkflow start action)) Validate)
+
+elements_hs_bmm_signature_workflow :: Word32 -> Int32 -> Word32 -> Word32 -> Word64 -> Word64 -> Word64 -> Ptr Word8 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_bmm_signature_workflow mode hashType witness index inputs outputs size bytes effect context =
+  run `catch` handleFailure (-1)
+  where
+    native = nativeBytes effect context
+    run
+      | mode == 2 = execute (Bmm.SignatureHashWorkflow hashType index outputs native) Bmm.RunSignature
+      | mode > 1 || size > fromIntegral (maxBound :: Int) || (size /= 0 && bytes == nullPtr) = pure (-1)
+      | otherwise = do
+          signature <- if size == 0 then pure B.empty else B.packCStringLen (castPtr bytes,fromIntegral size)
+          execute (Bmm.SignatureVerifyWorkflow mode witness index inputs outputs signature native) Bmm.RunSignature
+
 factsCall :: (Ptr Word64 -> IO reply) -> ((Word32 -> IO reply) -> IO Int32) -> FunPtr ProofFacts -> Ptr () -> IO Int32
 factsCall decode run callback context
   | callback == nullFunPtr = pure minBound
@@ -2141,6 +2532,10 @@ elements_hs_bmm_state_flow phase reply = guardResult (-2) $
 elements_hs_bmm_state_run :: Word32 -> FunPtr MatchFact -> Ptr () -> IO Int32
 elements_hs_bmm_state_run start = callbackCall callMatchFact (\action ->
   execute (Check (Bmm.StateExecution start action)) Validate)
+
+elements_hs_bmm_state_workflow :: Word32 -> FunPtr MatchFact -> Ptr () -> IO Int32
+elements_hs_bmm_state_workflow start = callbackCall callMatchFact (\action ->
+  execute (Check (Bmm.StateWorkflow start action)) Validate)
 
 elements_hs_bmm_lifecycle :: Word32 -> Word32 -> IO Int32
 elements_hs_bmm_lifecycle phase facts = guardResult (-8) $
@@ -2178,6 +2573,11 @@ elements_hs_bmm_signature_gate witness size index inputs = guardResult (-1) $
 elements_hs_signet_extract :: FunPtr Deposit.ReadPegFields -> Ptr () -> IO Int32
 elements_hs_signet_extract reader context =
   execute (Bmm.SignetRequest reader context) Bmm.extractSignetRequest `catch` handleFailure (-1)
+
+elements_hs_bmm_retarget_workflow :: Word32 -> Int64 -> Int64 -> Word32 -> Word32 -> FunPtr NativeBytesEffect -> Ptr () -> IO Int32
+elements_hs_bmm_retarget_workflow height interval target time start effect context =
+  execute (Check (Bmm.RetargetWorkflow height interval target time start (nativeBytes effect context))) Validate
+    `catch` handleFailure (-1)
 
 elements_hs_bmm_retarget :: Word32 -> Int64 -> Int64 -> Word32 -> Word32 -> IO Int64
 elements_hs_bmm_retarget height interval target time start = guardResult (-2) $
@@ -2222,29 +2622,11 @@ elements_hs_withdrawal_status state input size = run `catch` handleFailure (-6)
           status <- B.packCStringLen (castPtr input, fromIntegral size)
           guardResult (-6) $ execute (Check (Deposit.WithdrawalStatus state status)) Validate
 
-foreign export ccall "elements_hs_live_begin_v2" elements_hs_live_begin :: Word32 -> IO (Ptr ())
-elements_hs_live_begin :: Word32 -> IO (Ptr ())
-elements_hs_live_begin phase =
-  (evaluate (Deposit.liveEvidencePlan phase) >>= newIORef >>= newStablePtr >>= pure . castStablePtrToPtr)
-    `catch` handleFailure nullPtr
-
-foreign export ccall "elements_hs_live_resume_v2" elements_hs_live_resume :: Ptr () -> Ptr Int64 -> IO Int32
-elements_hs_live_resume :: Ptr () -> Ptr Int64 -> IO Int32
-elements_hs_live_resume handle fields = run `catch` handleFailure (-2)
-  where run
-          | handle == nullPtr = pure (-2)
-          | otherwise = do
-              ref <- deRefStablePtr (castPtrToStablePtr handle)
-              snapshot <- if fields == nullPtr then pure Nothing else Just <$>
-                ((,,,) <$> peekElemOff fields 0 <*> peekElemOff fields 1 <*>
-                  peekElemOff fields 2 <*> peekElemOff fields 3)
-              execute (Check (Deposit.ResumeEvidence ref snapshot)) Validate
-
-foreign export ccall "elements_hs_live_free_v2" elements_hs_live_free :: Ptr () -> IO ()
-elements_hs_live_free :: Ptr () -> IO ()
-elements_hs_live_free handle =
-  (if handle == nullPtr then pure () else freeStablePtr (castPtrToStablePtr handle))
-    `catch` handleFailure ()
+elements_hs_live_evidence :: Word32 -> FunPtr Deposit.ReadPegFields -> Ptr () -> IO Int32
+elements_hs_live_evidence phase reader context
+  | reader == nullFunPtr = pure (-2)
+  | otherwise = execute (Check (Deposit.LiveEvidence phase reader context)) Validate
+      `catch` handleFailure (-2)
 
 writeReply :: B.ByteString -> Ptr Word8 -> Word32 -> IO Int32
 writeReply reply output capacity
@@ -2346,6 +2728,11 @@ elements_hs_persisted_ctip facts amount script decoder context =
   execute (Check (Deposit.PersistedCtip facts amount script decoder context)) Validate
     `catch` handleFailure (-1)
 
+elements_hs_persisted_ctip_workflow :: Word32 -> Int64 -> FunPtr Deposit.ReadCtipOpcode -> Ptr () -> FunPtr Deposit.DecodeCtip -> Ptr () -> IO Int32
+elements_hs_persisted_ctip_workflow facts amount reader context decoder payload =
+  callbackCall Deposit.readCtipOpcode (\readOpcode ->
+    execute (Check (Deposit.PersistedCtipWorkflow facts amount readOpcode decoder payload)) Validate) reader context
+
 elements_hs_deposit_inclusion :: Word32 -> Word64 -> Word32 -> FunPtr Deposit.CheckParentHeader -> Ptr () -> IO Int32
 elements_hs_deposit_inclusion facts matches count checker context =
   execute (Check (Deposit.DepositInclusion facts matches count checker context)) Validate
@@ -2401,3 +2788,25 @@ elements_hs_withdrawal_bytes op maximumMoney input size output capacity = run `c
           bytes <- B.packCStringLen (castPtr input, fromIntegral size)
           let reply = either ((B.singleton 1 <>) . C.pack) (B.singleton 0 <>) (withdrawal op maximumMoney bytes)
           writeReply reply output capacity
+
+-- Exact funded-custody policy only; this function never authenticates a proof.
+elements_hs_exchange_custody_check :: Word32 -> Word64 -> Ptr Word8 -> Word64 -> Ptr Word8 -> IO Int32
+elements_hs_exchange_custody_check mode size values count context = run `catch` handleFailure (-1)
+  where
+    shape = case mode of
+      0 -> (791,0); 1 -> (791,288); 2 -> (791,418); 3 -> (0,266); 4 -> (0,1); 5 -> (0,323); 6 -> (0,161); 7 -> (0,4); _ -> (0,0)
+    run | mode>7 || (size,count)/=shape || (size/=0 && values==nullPtr) ||
+          (count/=0 && context==nullPtr) = pure (-1)
+        | otherwise = do
+            v <- if size==0 then pure B.empty else B.packCStringLen (castPtr values,fromIntegral size)
+            c <- if count==0 then pure B.empty else B.packCStringLen (castPtr context,fromIntegral count)
+            let accepted = case mode of
+                  0 -> execute (Check (Custody.CustodyValues v)) Validate
+                  1 -> execute (Check (Custody.CustodyIdentity v c)) Validate
+                  2 -> execute (Check (Custody.CustodyTransition v (B.take 121 c) (B.take 145 (B.drop 121 c)) (B.drop 266 c))) Validate
+                  3 -> execute (Check (Custody.CustodyCarry (B.take 121 c) (B.drop 121 c))) Validate
+                  4 -> B.length c==1 && Custody.forcedKindAllowed (B.head c)
+                  5 -> execute (Check (Custody.CustodyBacklog c)) Validate
+                  6 -> execute (Check (Custody.CustodyBudget c)) Validate
+                  _ -> execute (Check (Custody.CustodyReservedSpend c)) Validate
+            pure (if accepted then 1 else 0)

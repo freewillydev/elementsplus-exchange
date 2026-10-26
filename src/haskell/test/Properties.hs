@@ -1,11 +1,13 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
+-- Keep the large test driver cheap to rebuild; production modules retain -O1.
+{-# OPTIONS_GHC -O0 #-}
 module Main where
 
 import Control.Monad (unless, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Control.Monad.Trans.State.Strict (State, modify', runState)
-import Control.Exception (bracket, try, SomeException)
+import Control.Exception (bracket, catch, try, SomeException)
 import Data.Bits ((.|.), clearBit, shiftL, shiftR, testBit, xor)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
@@ -34,6 +36,30 @@ import Workflow (runRequiredEffects, countMatches)
 import qualified Workflow
 import qualified Bmm
 import qualified ParentReplay
+import qualified ParentBlockTests
+import qualified DepositConstructionTests
+import qualified DepositParsingTests
+import qualified DepositClaimTests
+import qualified NativeDepositTests
+import qualified ParentHeaderTests
+import qualified ParentRpcTests
+import qualified LocalBidTests
+import qualified BmmContextTests
+import qualified WalletWithdrawalTests
+import qualified JournalWorkflowTests
+import qualified BmmHeaderPolicyTests
+import qualified BmmStateAccessTests
+import qualified StateStorageTests
+import qualified ProofSessionTests
+import qualified BmmChainTests
+import qualified CommitmentTests
+import qualified SignetSessionTests
+import qualified ForcedOutputTests
+import qualified ForcedBlockTests
+import qualified CustodyPolicyTests
+import qualified CustodyIdentityTests
+import qualified ReplayStoreTests
+import qualified ConfirmationDepthTests
 import qualified Usdd
 import qualified BmmConstants as Constants
 import OperationTests
@@ -63,7 +89,7 @@ scriptCacheParity = forAll gen $ \(authenticated,hashes,numbers,endpoint) -> ioP
       hp = isJust . (hashes !!)
       up = isJust . (numbers !!)
       tag bs = B.singleton (if and bs then 1 else if or bs then 2 else 0)
-      expected = B.pack [if authenticated then 1 else 0,0,12] <>
+      expected = B.pack [if authenticated then 1 else 0,0,14] <>
         tag [hp 0] <> h 0 <> tag [hp 1,up 2] <> h 1 <>
         tag [hp 2,up 3] <> h 2 <> tag [hp 3,up 0,up 1] <> h 3 <>
         B.concat (map u [0..3]) <> tag (map hp [4..11]) <> B.concat (map h [4..11]) <>
@@ -127,8 +153,8 @@ resourceScheduleGolden = once $ conjoin
   , Constants.configFilename === "elements.conf"
   , Constants.exchangeInterfaceConstants ===
       [("uint8_t","EXCHANGE_STATE_INTERFACE_VERSION",1),
-       ("uint16_t","EXCHANGE_SCRIPT_CACHE_REVISION",12),
-       ("uint32_t","ECX_CONSENSUS_RULESET_REVISION",6),
+       ("uint16_t","EXCHANGE_SCRIPT_CACHE_REVISION",14),
+       ("uint32_t","ECX_CONSENSUS_RULESET_REVISION",8),
        ("uint32_t","DEFAULT_BOND_DEPLOYMENT_VERSION",2),
        ("int","DISABLED_EXCHANGE_ACTIVATION_HEIGHT",2147483647),
        ("bool","BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN",1)]
@@ -151,7 +177,7 @@ resourceScheduleGolden = once $ conjoin
   , Constants.peginIdentityDepth === 100
   , length (List.nub (map fst Constants.peginIdentityPins)) === 5
   , property (all (\(_,pin) -> length pin == 64 && all (`elem` "0123456789abcdef") pin) Constants.peginIdentityPins)
-  , map snd Constants.simplicityLengths === [356,609,850,364,1627]
+  , map snd Constants.simplicityLengths === [356,609,850,364,1627,1693,791]
   , Constants.ownedAnnexLimit === 1310720
   , Constants.grpcCredentialDefaults ===
       [("GRPC_CA_FILE","enforcer-tls/ca.pem"),
@@ -1950,7 +1976,7 @@ foreign import ccall "wrapper" wrapProofFacts :: ProofFacts -> IO (FunPtr ProofF
 predicateFlowFaults :: Property
 predicateFlowFaults = once $ ioProperty $ do
   calls <- newIORef ([] :: [Word32])
-  let entries = elements_hs_parent_replay_tip_run : [elements_hs_deposit_run kind 0 | kind <- [0..4]]
+  let entries = elements_hs_parent_replay_tip_run : [elements_hs_deposit_run kind 0 | kind <- [0..5]]
   checks <- sequence [do
     writeIORef calls []
     result <- bracket (wrapMatchFact (\_ step -> modifyIORef' calls (++[step]) >> pure reply)) freeHaskellFunPtr $ \callback ->
@@ -1961,14 +1987,14 @@ predicateFlowFaults = once $ ioProperty $ do
   writeIORef calls []
   invalid <- bracket (wrapMatchFact (\_ step -> modifyIORef' calls (++[step]) >> pure 1)) freeHaskellFunPtr $ \callback ->
     sequence [elements_hs_deposit_run kind start callback nullPtr |
-      (kind,start) <- [(5,0),(maxBound,0),(1,1),(2,1),(3,1),(4,1)]]
+      (kind,start) <- [(6,0),(maxBound,0),(1,1),(2,1),(3,1),(4,1),(5,1)]]
   untouched <- readIORef calls
   count <- newIORef (0 :: Int)
   let action _ = modifyIORef' count (+1) >> readIORef count >>= \n -> pure (if n < 100000 then 1 else 0)
       transition phase result = if phase == 0 || result == 1 then 1 else 0
   long <- validate (Workflow.PredicateFlow True 0 1 transition action)
   iterations <- readIORef count
-  pure (conjoin [property (and checks),nulls === replicate 6 (-1),invalid === replicate 6 (-1),
+  pure (conjoin [property (and checks),nulls === replicate 7 (-1),invalid === replicate 7 (-1),
     untouched === [],long === 0,iterations === 100000])
 
 headerAdmissionBounds :: Property
@@ -2391,7 +2417,7 @@ capitalReportOrder = forAll ((,,,,) <$> arbitrary <*> elements [0,3,4,5,maxBound
   <*> vectorOf 3 arbitrary <*> choose (-1,11 :: Int)) $ \((enabled,present),version,modes,flags,fault) -> ioProperty $
     let flag value = if value then 1 else 0
         replies = [version,flag (flags !! 0),flag (flags !! 1)] ++ modes ++ [flag (flags !! 2)]
-        valid = [version==4,flags !! 0,flags !! 1] ++ zipWith (<=) modes [2,3,1] ++ [flags !! 2]
+        valid = [version `elem` [4,5],flags !! 0,flags !! 1] ++ zipWith (<=) modes [2,3,1] ++ [flags !! 2]
         passed = length (takeWhile id valid)
         script = [(1,flag enabled)] ++ if not enabled then [] else [(2,flag present)] ++
           if not present then [(3,1)] else
@@ -2723,13 +2749,15 @@ waitProbeOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> cho
   in commandTrace kind 2 (\phase reply -> validate (next phase reply)) script fault expected
 
 fundedSubmissionOrder :: Property
-fundedSubmissionOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> choose (-1,3 :: Int)) $ \(template,current,submitted,fault) -> ioProperty $
+fundedSubmissionOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> choose (0,2 :: Int64) <*> choose (-1,3 :: Int)) $ \(template,current,status,fault) -> ioProperty $
   let flag value = if value then 1 else 0
+      submitted = status == 2
       script = [(1,flag current)] ++ if template then
-        if current then [(3,flag submitted)] ++ [(4,1) | not submitted] else [(2,1)]
+        if current then [(3,status)] ++ [(4,1) | status == 0] else [(2,1)]
         else [(2,flag submitted) | current] ++ [(if submitted then 4 else 3,1) | current]
       (kind,next) = if template then (244,Bmm.TemplateCreationFlow) else (241,Bmm.FundedSubmissionFlow)
-  in commandTrace kind 4 (\phase reply -> validate (next phase reply))
+      invalid phase = if template && phase == 3 then [3,maxBound] else [2,maxBound]
+  in commandTraceWith invalid kind 4 (\phase reply -> validate (next phase reply))
        script fault (if current && submitted then 1 else 0)
 
 bidInputOrder :: Property
@@ -2981,7 +3009,7 @@ parentReplayBounds :: Property
 parentReplayBounds = once $ ioProperty $ do
   let expected = [9,9,9,9,9,9,9,9,9,9,9,66,38,14,14,26,24,18,49,28,16,33,9,9,9,9,9,9,44,15,9,9,9,9,9,9,9,9,9,9,9,9,9,14,18,26,33,28,9,9,9,9,17,9,9,9,14,9,12,9,18,15,9,9,9,9,11,19,22,9,9,12,9,16,10,9,9,9,9,9,10,9,13,15,25,9,9,27,9,9,9,9,9,43,23,31,18,18,9,9,9,9,19,9,9,9,9,9,9,9,9,9,9,9,23,9,12,11,9,24,9,17,11,23,9,9] :: [Int32]
   actual <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [0..209]
-  invalid <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [327,328,maxBound]
+  invalid <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [329,330,maxBound]
   retired <- sequence [elements_hs_parent_replay_store_checked kind phase reply |
     kind <- [198..200], phase <- [0..16] ++ [maxBound], reply <- [0,1,2,maxBound]]
   let activeBounds = take 129 actual ++ [11] ++ take 53 (drop 130 actual) ++ [46] ++
@@ -2992,6 +3020,55 @@ parentReplayBounds = once $ ioProperty $ do
     new <- elements_hs_parent_replay_store_checked kind phase result
     pure (old==new) | kind <- [0..166], phase <- [0..85], result <- [0..3]]
   pure $ conjoin [retired===replicate 216 (-1), take 3 (drop 198 actual)===replicate 3 (-1), activeBounds===(expected++[22,9,9,11,8,7,14,-1,16,18,13,5,7,11,10,6,5,12,21,10,7,10,14,12,11,8,17,29,19,10,17,17,11,8,6,12,74,45,15,64,10,15,15,13,9,12,12,10,12,7,5,10,8,4,26,11,18,46,10,6,4,4,13,22,11,21,5,2,11,14,26,12,15,5,11,4,8,14,8,19,7,13,12,12]), invalid===replicate 3 (-1), malformed===replicate 210 (-1), property (and unchangedTransitions)]
+
+recoveryComposedOrder :: Property
+recoveryComposedOrder = forAll ((,,) <$> choose (0,6 :: Int) <*> choose (0,4 :: Int) <*> choose (-1,180 :: Int)) $
+  \(scenario,retries,fault) -> ioProperty $ do
+    let yes steps = [(step,1) | step <- steps]
+        pruned = yes [101..105]
+        checked = yes [301,302]
+        header height = yes [200] ++ checked ++ yes (212:[201..207]) ++ checked ++
+          yes [214,208,209] ++ [(213,height)]
+        peers = yes [400] ++ checked ++ yes [415,412,414] ++
+          if scenario == 5 then [(401,0),(410,-1)] else
+            yes [401,402,403,404,405,406,407,411] ++ checked ++ yes [417]
+        poll index = yes [11] ++ [(12,if scenario == 3 then 1 else 0)] ++
+          if scenario == 3 then [(13,-1)] else yes [14] ++
+            if index < retries then pruned ++ yes [16] ++ poll (index+1) else
+              [(101,0)] ++ yes [17,18] ++ header (if scenario == 4 then 13 else 12) ++
+                [(21,-1) | scenario == 4]
+        script :: [(Word32,Int64)]
+        script = yes [1] ++ if scenario == 0 then [(101,0)] ++ yes [3,4] else
+          pruned ++ [(6,if scenario == 2 then 0 else 1)] ++
+            if scenario == 2 then [(7,-1)] else yes [8] ++
+              if scenario == 6 then [(200,1),(301,1),(302,0),(303,-1)] else
+                header 12 ++ peers ++ if scenario == 5 then [] else poll 0
+        run invoke = do
+          seen <- newIORef []
+          code <- invoke $ \step -> do
+            prior <- readIORef seen
+            modifyIORef' seen (++[step])
+            let index = length prior
+            pure $ if index == fault || index >= length script || fst (script !! index) /= step
+              then -1 else snd (script !! index)
+          observed <- readIORef seen
+          pure (code,observed)
+        failed = fault >= 0 && fault < length script
+        prefix = map fst (if failed then take (fault+1) script else script)
+        expected = (if failed || scenario >= 2 then -1 else 0,prefix)
+    direct <- run (\action -> execute (Bmm.BodyRecovery action) Bmm.RecoverBody)
+    abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
+      elements_hs_parent_replay_run 334 callback nullPtr)
+    pure $ conjoin [direct === expected,abi === expected]
+
+recoveryComposedBoundary :: Property
+recoveryComposedBoundary = once $ ioProperty $ do
+  missing <- elements_hs_parent_replay_run 334 nullFunPtr nullPtr
+  seen <- newIORef (0 :: Int)
+  invalid <- bracket (wrapMatchFact (\_ _ -> modifyIORef' seen (+1) >> pure 1)) freeHaskellFunPtr $ \callback ->
+    elements_hs_parent_replay_run 335 callback nullPtr
+  calls <- readIORef seen
+  pure $ conjoin [missing === -1,invalid === -1,calls === 0]
 
 recoveryValidationOrder :: Property
 recoveryValidationOrder = forAll ((,,) <$> elements [192,193,194] <*> vectorOf 9 arbitrary <*> choose (-1,12 :: Int)) $ \(kind,flags,fault) -> ioProperty $ do
@@ -5656,9 +5733,9 @@ activationFingerprintEncoding = forAll ((,,,) <$> vectorOf 8 arbitrary <*> vecto
     pure (conjoin [B.pack actual === expected,property (isLeft badHash && all isLeft badNumbers)])
 
 exchangeFingerprintEncoding :: Property
-exchangeFingerprintEncoding = forAll ((,,) <$> vectorOf 39 arbitrary <*>
-  vectorOf 63 (resize 40 arbitrary) <*> elements [0,1]) $ \(numbers,blobs,mode) -> ioProperty $ do
-    let fields = take 37 numbers ++ [mode, numbers !! 38]
+exchangeFingerprintEncoding = forAll ((,,) <$> vectorOf 40 arbitrary <*>
+  vectorOf 67 (resize 40 arbitrary) <*> elements [0,1]) $ \(numbers,blobs,mode) -> ioProperty $ do
+    let fields = take 37 numbers ++ [mode, numbers !! 38,numbers !! 39 `mod` 2]
         n width index = wordBE width (fields !! index)
         raw index = B.pack (blobs !! index)
         sizedBlob width index = wordBE width (fromIntegral (B.length (raw index))) <> raw index
@@ -5669,7 +5746,7 @@ exchangeFingerprintEncoding = forAll ((,,) <$> vectorOf 39 arbitrary <*>
           [raw 9,sizedBlob 4 10,raw 11,raw 12,raw 13,n 4 27,raw 14,n 4 28] ++
           map raw [15..18] ++ [sizedBlob 4 19,raw 20,n 1 29,n 1 30,n 4 31,sizedBlob 8 21,sizedBlob 8 22] ++
           map (n 4) [32..35] ++ [sizedBlob 8 23] ++ map raw [24..62] ++
-          [n 8 36,n 1 37,wordBE 4 (if mode == 1 then fields !! 38 else 0)]
+          [n 8 36,n 1 37,wordBE 4 (if mode == 1 then fields !! 38 else 0),n 1 39] ++ map raw [63..66]
     actual <- Bmm.encodeFingerprint Bmm.ExchangeFormat (ExchangeFingerprintFixture fields blobs)
     rejected <- try (Bmm.encodeFingerprint Bmm.ExchangeFormat
       (ExchangeFingerprintFixture (take 37 fields ++ [2,0]) blobs)) :: IO (Either SomeException [Word8])
@@ -5700,6 +5777,7 @@ foreign import ccall unsafe reference_bmm_proof :: Word32 -> Word32 -> Word64 ->
 foreign import ccall unsafe reference_peg_event :: Word32 -> Int64 -> Int64 -> Int64 -> IO Int64
 foreign import ccall unsafe reference_deposit_state :: Word32 -> Word32 -> IO Int32
 foreign import ccall "&reference_live_fields" referenceLive :: FunPtr Deposit.ReadPegFields
+foreign import ccall "wrapper" wrapPegFields :: Deposit.ReadPegFields -> IO (FunPtr Deposit.ReadPegFields)
 foreign import ccall "&reference_scripted_fields" referenceScripted :: FunPtr Deposit.ReadPegFields
 foreign import ccall unsafe reference_live_evidence :: Word32 -> FunPtr Deposit.ReadPegFields -> Ptr () -> IO Int32
 foreign import ccall unsafe reference_legacy_claim :: Word32 -> Int64 -> Int64 -> IO Int32
@@ -6490,6 +6568,81 @@ stateTransitionWorkflow = forAll generator $ \(rows,fault) -> ioProperty $ do
       elements [0,1,3,7 :: Word32] <*> arbitrary)) <*> elements [0,0,0,2,3,4,5,6,7]
 
 foreign import ccall "wrapper" makeCursorEffect :: CursorEffect -> IO (FunPtr CursorEffect)
+
+stateWorkflowParity :: Property
+stateWorkflowParity = forAll generator $ \(kind,rows,tracked) -> ioProperty $ do
+  let count = fromIntegral (length rows)
+      run interpreter = do
+        seen <- newIORef []
+        published <- newIORef (0 :: Int)
+        let action step index item = do
+              modifyIORef' seen (++[(step,index,item)])
+              when (kind == 2 && step == 1) (writeIORef published 1)
+              when (kind == 3 && step == 2) (writeIORef published 1)
+              when (kind == 3 && step == 7) (writeIORef published 2)
+              let (before,after,shape,authority) = rows !! fromIntegral index
+                  yes value = if value then 1 else 0
+              pure $ if step >= 64 then yes (authority !! fromIntegral (step-64))
+                else if kind == 2 then yes (tracked !! fromIntegral step)
+                else case step of
+                  1 -> fromIntegral (length before)
+                  8 -> fromIntegral (length after)
+                  17 -> yes (before !! fromIntegral item)
+                  24 -> yes (after !! fromIntegral item)
+                  3 -> yes (not (null before))
+                  4 -> yes (head before)
+                  5 -> yes shape
+                  2 -> 1
+                  7 -> 1
+                  _ -> error "unexpected state workflow action"
+        code <- interpreter action
+        trace <- readIORef seen
+        output <- readIORef published
+        pure (code,trace,output)
+      reference native = do
+        failure <- newIORef (0 :: Int)
+        let authority successor index = validate (Exchange.Authority successor (\field ->
+              (==1) <$> native (64+fromIntegral field) index 0))
+            check successor index = do
+              code <- authority successor index
+              writeIORef failure code
+              pure (code == 0)
+            action step index
+              | step == 1 || step == 8 = do
+                  inputs <- native step index 0
+                  fromIntegral <$> Workflow.countMatches inputs (\i -> fromIntegral <$> native (16+step) index i)
+              | step == 6 = (\accepted -> if accepted then 1 else 0) <$> check True index
+              | otherwise = native step index 0
+            coin 1 = native 1 0 0 >> check False 0
+            coin step = (==1) <$> native (fromIntegral step) 0 0
+        code <- if kind < 2 then do
+                  result <- authority (kind==1) 0
+                  pure (if result==0 then 0 else fromIntegral result+100)
+                else if kind == 2 then do
+                  result <- validate (Exchange.TransactionShape 24 coin)
+                  pure (if result==0 then 0 else fromIntegral result+200)
+                else validate (Exchange.StateTransition count action)
+        rejection <- readIORef failure
+        pure (if rejection/=0 then 100+fromIntegral rejection else code)
+  expected <- run reference
+  direct <- run (validate . Exchange.StateWorkflow kind count)
+  actual <- run $ \action -> bracket (makeCursorEffect (\_ step index item out ->
+    action step index item >>= poke out >> pure 1)) freeHaskellFunPtr $ \callback ->
+      elements_hs_exchange_state_workflow kind count callback nullPtr
+  missing <- elements_hs_exchange_state_workflow kind count nullFunPtr nullPtr
+  invalid <- elements_hs_exchange_state_workflow 4 count nullFunPtr nullPtr
+  pure (conjoin [direct === expected,actual === expected,missing === -1,invalid === -1])
+  where
+    generator = do
+      kind <- elements [0,1,2,3,3,3]
+      n <- choose (1,6)
+      let matches = frequency [(4,pure False),(1,pure True)]
+      rows <- vectorOf n ((,,,) <$> resize 4 (listOf matches) <*> resize 4 (listOf matches) <*>
+        arbitrary <*> vectorOf 8 (frequency [(8,pure True),(1,pure False)]))
+      available <- arbitrary
+      root <- arbitrary
+      pure (kind,rows,[available,True,root])
+
 cursorTransportAbi :: Property
 cursorTransportAbi = forAll gen $ \(status,code,payload) -> ioProperty $ do
   calls <- newIORef (0::Int)
@@ -6951,6 +7104,110 @@ pruneSlotsWorkflowParity = forAll (listOf ((,) <$> elements [-1,0,1,2,4,8,16,32,
     actual <- validate (ParentReplay.PruneSlots (fromIntegral (length entries)) action)
     observed <- readIORef seen
     pure ((actual,observed) === model entries)
+
+bmmStateWorkflowParity :: Property
+bmmStateWorkflowParity = forAll ((,) <$> elements [0,12,68] <*> vectorOf 115 arbitrary) $ \(start,values) ->
+  ioProperty $ do
+    let normal step = (values !! fromIntegral step :: Word32) `mod` case step of
+          5 -> 4; 7 -> 4; 8 -> 16; 14 -> 8; 18 -> 4; 70 -> 4; 23 -> 1; _ -> 2
+        life = [(1,0),(4,2),(5,3),(7,4),(8,5),(13,6),(14,7),(15,8),(16,9),(18,10),(22,11),(23,11)]
+        source = [(69,0),(70,1),(71,2),(73,3)]
+        run program = do
+          seen <- newIORef []
+          let action step = modifyIORef' seen (++[step]) >> pure (fromIntegral (normal step))
+          result <- program action
+          trace <- readIORef seen
+          pure (result,trace)
+        reference action = do
+          failure <- newIORef 0
+          let decision base code = do
+                when (code < 0) (writeIORef failure (base-code))
+                pure (fromIntegral code)
+              callback 3 = do
+                present <- action 108
+                stored <- if present == 1 then pure 1 else action 109
+                decision 100 (validate (Bmm.Lifecycle 1 (fromIntegral stored)))
+              callback step = do
+                value <- action step
+                case (lookup step life,lookup step source) of
+                  (Just phase,_) -> decision 100 (validate (Bmm.Lifecycle phase (fromIntegral value)))
+                  (_,Just phase) -> decision 200 (validate (Bmm.StateSource phase (fromIntegral value)))
+                  _ -> pure value
+          result <- validate (Bmm.StateExecution start callback)
+          code <- readIORef failure
+          pure (if code == 0 then result else code)
+    actual <- run (validate . Bmm.StateWorkflow start)
+    expected <- run reference
+    pure (actual === expected)
+
+treasuryTransactionParity :: Property
+treasuryTransactionParity = forAll ((,,,,,) <$> choose (0,3) <*> arbitrary <*> choose (0,7)
+  <*> choose (0,1) <*> choose (0,130 :: Int) <*> elements [-1,0,1,2,1001,4294967296 :: Int64]) $
+  \(rows,isWithdrawal,flags,single,fault,bad) -> ioProperty $ do
+    let inputs = if rows == 0 then 0 else 1
+        outputs = rows*2
+        decreases = if isWithdrawal then rows else 0
+        new = if isWithdrawal then 80 else 120
+        normal step index = case step of
+          0 -> case index of
+            0 -> fromIntegral rows; 1 -> fromIntegral rows; 2 -> fromIntegral rows
+            3 -> fromIntegral decreases; 4 -> 100; 5 -> new; 6 -> 0; 7 -> fromIntegral flags
+            _ -> error "unknown transaction field"
+          102 -> 100; 302 -> if even index then 1 else 0; 304 -> new
+          503 -> 100; 505 -> new; 601 -> 0; 605 -> 101; 607 -> 0
+          704 -> 32; 903 -> 80; 904 -> 0; _ -> 1
+        run program = do
+          calls <- newIORef []
+          let action step index = do
+                if step == 0 || step == 800 then pure (normal step index) else do
+                  modifyIORef' calls (++[(step,index)])
+                  n <- length <$> readIORef calls
+                  pure (if n == fault then bad else normal step index)
+          result <- program action
+          trace <- readIORef calls
+          pure (result,trace)
+        -- The pre-consolidation caller ran each rule separately and stopped
+        -- on its first error. Its native effects are compared byte-for-byte.
+        reference action = either id (const 0) <$> runExceptT (do
+          let grouped group step index = action (group*100+step) index
+              one group step = grouped group step 0
+              narrow n | n < fromIntegral (minBound :: Int32) || n > fromIntegral (maxBound :: Int32) = -1
+                       | otherwise = fromIntegral n
+              checked group runRule = do
+                code <- lift runRule
+                when (code /= 0) (throwE (if code < 0 then -1 else group*256+code))
+          checked 1 (validate (ParentReplay.CtipOwners rows 1000 (one 1)))
+          checked 2 (validate (ParentReplay.CtipSpends inputs (\s i -> narrow <$> grouped 2 s i)))
+          checked 3 (validate (ParentReplay.CtipOutputs outputs 1000 (grouped 3)))
+          checked 4 (validate (ParentReplay.CtipReplacements rows (fmap narrow . one 4)))
+          checked 5 (validate (ParentReplay.CtipChanges rows (one 5)))
+          when (rows /= 0) $ if decreases /= 0 then do
+            idError <- lift (newIORef 0)
+            result <- lift (validate (ParentReplay.M6Withdrawal decreases rows inputs 100 single $ \s ->
+              if s /= 2 then one 6 s else do
+                code <- validate (ParentReplay.M6Id outputs inputs 100 1000 1 (grouped 9))
+                writeIORef idError code
+                pure (if code == 0 then 1 else 0)))
+            checked 9 (readIORef idError)
+            checked 6 (pure result)
+          else mapM_ (\_ -> checked 7 (validate (ParentReplay.M5Deposit 100 new 1000 0 outputs flags (grouped 7)))) [1..rows])
+    actual <- run (validate . ParentReplay.TransactionReplay rows inputs outputs 1000 100 single)
+    expected <- run reference
+    pure (actual === expected)
+
+treasuryTransactionBoundary :: Property
+treasuryTransactionBoundary = once $ ioProperty $ do
+  let never _ _ = error "invalid treasury arguments evaluated callback"
+  oversized <- validate (ParentReplay.TransactionReplay 0 0 0 maxBound 0 0 never)
+  invalidMode <- validate (ParentReplay.TransactionReplay 0 0 0 1000 0 2 never)
+  missing <- elements_hs_transaction_replay 0 0 0 1000 0 0 nullFunPtr nullPtr
+  -- A negative native count must never wrap into an unbounded traversal.
+  trace <- newIORef []
+  negative <- validate (ParentReplay.TransactionReplay 0 0 0 1000 0 0 $ \s i ->
+    modifyIORef' trace (++[(s,i)]) >> pure (-1))
+  calls <- readIORef trace
+  pure (conjoin [oversized === -1, invalidMode === -1, missing === -1,
+    negative === -1, calls === [(0,0)]])
 
 m6WithdrawalWorkflowParity :: Property
 m6WithdrawalWorkflowParity = forAll ((,,,,,) <$> mostlyOne <*> mostlyOne
@@ -7622,6 +7879,31 @@ productionStages = forAllBlind (elements
   missing <- entry nullFunPtr nullPtr
   pure (conjoin [direct === (expected,trace),foreignResult === direct,missing === -1])
 
+bmmSyncHeights :: Property
+bmmSyncHeights = forAll height $ \parent -> forAll height $ \child ->
+  forAll (elements [0,4,5]) $ \failure -> forAll (elements [-1,0,2]) $ \reply -> ioProperty $ do
+  let behind = child < parent
+      expected | not behind = 3
+               | failure == 0 = 0
+               | reply == 0 = failure
+               | otherwise = -1
+      trace | not behind = []
+            | failure == 4 = [4]
+            | otherwise = [4,5]
+      run invoke = do
+        calls <- newIORef []
+        result <- invoke (\stage -> do
+          modifyIORef' calls (++[stage])
+          pure (if fromIntegral stage == failure then reply else 1))
+        observed <- readIORef calls
+        pure (result,observed)
+  direct <- run (validate . Bmm.SyncHeights parent child)
+  foreignResult <- run $ \action -> bracket (wrapPolicyEffect (\_ -> action)) freeHaskellFunPtr $ \callback ->
+    elements_hs_bmm_sync_heights parent child callback nullPtr
+  missing <- elements_hs_bmm_sync_heights parent child nullFunPtr nullPtr
+  pure (conjoin [direct === (expected,trace),foreignResult === direct,missing === -1])
+  where height = oneof [arbitrary,elements [minBound,-1,0,1,maxBound]]
+
 bmmWaitWorkflow :: Property
 bmmWaitWorkflow = forAll (vectorOf 12 ((,,) <$> arbitrary <*> choose (-1,4) <*> arbitrary)) $ \observations -> ioProperty $ do
   let events = observations ++ [(False,0,False)]
@@ -7759,6 +8041,176 @@ exchangeEnvelopeScan = forAll generator $ \(inactive,exists,coinbase,rows,flags,
     good = frequency [(3,pure True),(1,pure False)]
     generator = (,,,,,,) <$> arbitrary <*> good <*> good <*> resize 6 (listOf (vectorOf 7 good))
       <*> choose (0,7) <*> vectorOf 3 good <*> choose (-1,60 :: Int)
+
+depositStateWorkflowParity :: Property
+depositStateWorkflowParity = forAll ((,,) <$> elements [0,11,19,27 :: Word32] <*>
+    vectorOf 83 (choose (0,7 :: Int64)) <*> choose (-1,30 :: Int)) $ \(start,facts,fault) -> ioProperty $ do
+  let states = [(2,0),(9,1),(25,2),(28,3),(30,4),(33,5),(13,6),(17,7)]
+      run combined = do
+        seen <- newIORef []
+        let raw step = do
+              trace <- readIORef seen
+              modifyIORef' seen (++[step])
+              if length trace == fault then ioError (userError "state callback failure")
+              else pure (if step > 82 then 1 else case lookup step states of
+                    Nothing -> facts !! fromIntegral step `mod` 2
+                    Just _ -> facts !! fromIntegral step)
+            legacy step = do
+              value <- raw step
+              case lookup step states of
+                Nothing -> pure value
+                Just phase -> case validate (Deposit.DepositStateRule phase (fromIntegral value)) of
+                  0 -> pure 1
+                  code -> raw (82+fromIntegral code) >> pure 0
+        result <- try (if combined then validate (Deposit.DepositStateWorkflow start raw)
+          else validate (Workflow.PredicateFlow True start 82
+            (\phase value -> fromIntegral (validate (Deposit.DepositVerification phase value))) legacy))
+          :: IO (Either SomeException Int32)
+        trace <- readIORef seen
+        pure (either (const (-99)) id result,trace)
+  old <- run False
+  new <- run True
+  pure (new === old)
+
+wholeReplayMessages :: Property
+wholeReplayMessages = forAll generator $ \(kinds,proposed,votes,used,activation,flags,fault) -> ioProperty $ do
+  let run combined = do
+        seen <- newIORef []
+        let native step index input = do
+              trace <- readIORef seen
+              modifyIORef' seen (++[(step,index,input)])
+              if length trace == fault then ioError (userError "message callback failure")
+              else pure $ case step of
+                0 -> B.pack [kinds !! fromIntegral index,flags,0,0]
+                11 -> wordLE 8 (fromIntegral proposed)
+                12 -> wordLE 8 (fromIntegral votes)
+                13 -> wordLE 8 (if used then 1 else 0)
+                15 -> wordLE 8 activation
+                21 -> wordLE 8 (if used then 1 else 0)
+                22 -> wordLE 8 0
+                30 -> B.pack [24,if used then 1 else 0]
+                31 -> B.empty
+                32 -> B.singleton (if used then 1 else 0)
+                _ | step >= 10 && step < 30 -> wordLE 8 1
+                  | otherwise -> B.empty
+            scalar base step value = do
+              response <- native (base+step) value B.empty
+              pure (fromIntegral (B.foldr (\byte rest -> fromIntegral byte+256*rest) (0 :: Word64) response))
+            translate group failure result
+              | result < 0 = failure
+              | result == 0 = 0
+              | otherwise = group+result
+            legacy index
+              | index == length kinds = native 40 0 B.empty >> pure 0
+              | otherwise = do
+                  _ <- native 0 (fromIntegral index) B.empty
+                  result <- case validate (ParentReplay.StoreFlow 91 2 (fromIntegral (kinds !! index))) of
+                    3 -> native 2 0 B.empty >> pure 0
+                    4 -> do
+                      _ <- native 3 0 B.empty
+                      translate 0x100 (-2) <$> validate (ParentReplay.M2Proposal 100 4 1 2 2 (scalar 10))
+                    5 -> translate 0x200 (-3) <$> validate (ParentReplay.M3Proposal (scalar 20))
+                    -11 -> pure 0
+                    _ -> translate 0x300 (-4) <$> validate (ParentReplay.M4Workflow (fromIntegral flags) [0]
+                           (\step slot input -> native (30+step) slot input))
+                  if result == 0 then legacy (index+1) else pure result
+        result <- try (if combined then validate (ParentReplay.MessageWorkflow
+            (fromIntegral (length kinds)) 100 0x0002000200010004 native)
+          else legacy 0) :: IO (Either SomeException Int32)
+        trace <- readIORef seen
+        pure (either (const (-99)) id result,trace)
+  old <- run False
+  new <- run True
+  pure (new === old)
+  where
+    generator = (,,,,,,) <$> resize 12 (listOf (elements [0,1,2,3,4,5,6,255 :: Word8]))
+      <*> elements [-2,0,95,96,98,99,100,101 :: Int64]
+      <*> elements [0,1,2,65535,0xffffffff :: Int64] <*> arbitrary <*> choose (0,7)
+      <*> elements [0,1,3,5,9,13,16 :: Word8] <*> choose (-1,60 :: Int)
+
+replayMessageFraming :: Property
+replayMessageFraming = forAll ((,) <$> elements [0,1,3,5,7] <*> arbitrary) $ \(size,badEffect) -> ioProperty $ do
+  seen <- newIORef []
+  let native step _ _ = do
+        modifyIORef' seen (++[step])
+        pure $ if step == 0 then if badEffect then B.pack [1,0] else B.replicate size 0 else B.singleton 1
+  result <- validate (ParentReplay.MessageWorkflow 1 100 0 native)
+  trace <- readIORef seen
+  pure $ conjoin [result === -1,trace === if badEffect then [0,2] else [0]]
+
+wholeM4Voting :: Property
+wholeM4Voting = forAll generator $ \(flags,votes,vote,active,upvote,missing) -> ioProperty $ do
+  seen <- newIORef []
+  writes <- newIORef []
+  let key i = B.replicate 32 (fromIntegral (i+1 :: Int))
+      target = key (if missing then length votes else 0)
+      native step slot frame = do
+        modifyIORef' seen (++[step])
+        case step of
+          0 -> pure (B.pack [24,if active then 1 else 0])
+          1 -> pure (B.pack [24,if upvote then 1 else 0] <> if upvote then target else B.replicate 32 0)
+          2 | slot == 24 -> pure (B.singleton (if active then 1 else 0) <>
+                if active then B.concat [key i <> wordLE 2 (fromIntegral v) | (i,v) <- zip [0..] votes] else B.empty)
+          3 | slot == 24 -> modifyIORef' writes (++[frame]) >> pure B.empty
+          _ -> ioError (userError "unexpected voting callback")
+      down v = if v == 0 then 0 else v-1
+      publish kind digest updated = B.cons kind digest <> B.concat (map (wordLE 2 . fromIntegral) updated)
+      alarm = if any (>0) votes then [publish 0 (B.replicate 32 0) (map down votes)] else []
+      promote i = if votes !! i == maxBound then [] else [publish 1 (key i)
+        [if j == i then v+1 else down v | (j,v) <- zip [0..] votes]]
+      leaders = List.sortOn (negate . fromIntegral . snd :: (Int,Word16) -> Int) (zip [0..] votes)
+      leading = case leaders of
+        (i,best):rest | best /= maxBound && fromIntegral best - (case rest of [] -> 0; (_,second):_ -> fromIntegral second) >= (50 :: Int) -> promote i
+        _ -> []
+      (wanted,prefix,updates)
+        | flags > 15 = (-1,[],[])
+        | not (testBit flags 0) = (1,[],[])
+        | testBit flags 1 = (2,[],[])
+        | testBit flags 2 && not active = (3,[0],[])
+        | testBit flags 2 && vote == 65535 = (0,[0],[])
+        | testBit flags 2 && vote /= 65534 && fromIntegral vote >= length votes = (4,[0,2],[])
+        | testBit flags 2 = (0,[0,2],if vote == 65534 then alarm else promote (fromIntegral vote))
+        | testBit flags 3 = (0,if active then [0,2] else [0],if active then leading else [])
+        | not active = (5,[0,1,2],[])
+        | upvote && (missing || null votes) = (6,[0,1,2],[])
+        | otherwise = (0,[0,1,2],if upvote then promote 0 else alarm)
+  result <- validate (ParentReplay.M4Workflow flags [vote] native)
+  trace <- readIORef seen
+  changes <- readIORef writes
+  pure $ conjoin [result === wanted, trace === prefix ++ [3 | not (null updates)], changes === updates]
+  where
+    generator = (,,,,,) <$> elements [0,1,3,5,9,13,16] <*> resize 8 (listOf (elements [0,1,49,50,51,65534,65535 :: Word16]))
+      <*> elements [0,1,7,65534,65535 :: Word16] <*> arbitrary <*> arbitrary <*> arbitrary
+
+wholeEnvelopeValidation :: Property
+wholeEnvelopeValidation = forAll ((,,) <$> choose (0,18 :: Int) <*> arbitrary <*> arbitrary) $ \(failure,duplicate,inactive) -> ioProperty $ do
+  seen <- newIORef []
+  let commitment = B.replicate 32 8
+      anchor = B.replicate 32 9
+      out locking = wordLE 8 0 <> B.singleton (fromIntegral (B.length locking)) <> locking
+      body = wordLE 4 2 <> B.pack [0,4] <> B.concat (map out [B.empty,B.pack [106,32] <> commitment,B.empty,B.pack [106,37,80,88,83,84,1] <> anchor]) <> wordLE 4 0
+      payload = C.pack "ECXM" <> B.singleton 1 <> wordLE 4 42 <> B.replicate 32 7 <> wordLE 4 (fromIntegral (B.length body)) <> body
+      context = B.replicate 32 1 <> B.replicate 32 2 <> B.replicate 32 3
+      expectedAnchor = anchor <> B.pack [1,24] <> B.take 32 context <> wordBE 4 42 <> B.take 32 (B.drop 32 context) <> commitment <> B.drop 64 context
+      script = if inactive then [] else [0,1,2] ++ if duplicate then [1] else [3..13]
+      callback step index frame = do
+        modifyIORef' seen (++[step])
+        if fromIntegral step == failure then ioError (userError "injected native failure") else case step of
+          0 -> pure (wordLE 8 (if duplicate then 2 else 1))
+          1 -> pure (if index == 0 then payload else B.take 5 payload)
+          2 -> if frame == payload then pure (B.singleton 1) else ioError (userError "canonical payload changed")
+          3 -> pure (B.singleton 3)
+          12 -> pure context
+          13 -> if frame == expectedAnchor then pure (B.singleton 1) else ioError (userError "anchor changed")
+          _ | step >= 4 && step <= 11 && frame == payload -> pure (B.singleton 1)
+          _ -> ioError (userError "unexpected envelope stage")
+      failed = fromIntegral failure `elem` script
+      expectedTrace = if failed then takeWhile (/= fromIntegral failure) script ++ [fromIntegral failure] else script
+  result <- try (validate (Exchange.EnvelopeWorkflow inactive callback)) :: IO (Either SomeException Int32)
+  trace <- readIORef seen
+  pure $ conjoin [trace === expectedTrace, case result of
+    Left _ -> property failed
+    Right code -> conjoin [property (not failed),code === if duplicate && not inactive then 2 else 0]]
 
 exchangeSnapshotOrder :: Property
 exchangeSnapshotOrder = forAll ((,) <$> choose (0,14 :: Int) <*> arbitrary) $ \(passed,throws) -> ioProperty $ do
@@ -9916,6 +10368,39 @@ persistedCtipParity = forAllShrink gen (filter (\(_,_,_,state) -> length state =
       sequenceNumber <- edge [-1,0,1]
       pure (facts,amount,script,[status,value,sequenceNumber])
 
+persistedCtipWorkflow :: Property
+persistedCtipWorkflow = forAll gen $ \(facts,amount,opcodes,ended,values) -> ioProperty $
+  withArray (values ++ [0]) $ \context -> do
+    seen <- newIORef []
+    let script = fromIntegral (foldr (.|.) 0 (zipWith shiftL opcodes [0,9,18]))
+    expected <- reference_persisted_ctip (facts .|. (fromIntegral ended `shiftL` 4)) amount script referenceCtipDecoder (castPtr context)
+    expectedCalls <- peekByteOff context 24 :: IO Int64
+    pokeByteOff context 24 (0 :: Int64)
+    direct <- validate (Deposit.PersistedCtipWorkflow facts amount (\index -> do
+        modifyIORef' seen (++[index])
+        pure (if index == 3 then ended else opcodes !! fromIntegral index)) referenceCtipDecoder (castPtr context))
+        `catch` handleFailure (-1)
+    directCalls <- peekByteOff context 24 :: IO Int64
+    pokeByteOff context 24 (0 :: Int64)
+    -- The production opcode callback is native-only; do not re-enter Haskell through it.
+    (actual,opcodeCalls) <- withArray (0 : map fromIntegral (opcodes ++ [ended]) :: [Int64]) $ \opcodeContext -> do
+      result <- elements_hs_persisted_ctip_workflow facts amount referenceHeader (castPtr opcodeContext) referenceCtipDecoder (castPtr context)
+      count <- peek opcodeContext
+      pure (result,count)
+    calls <- peekByteOff context 24 :: IO Int64
+    trace <- readIORef seen
+    missing <- elements_hs_persisted_ctip_workflow facts amount nullFunPtr nullPtr referenceCtipDecoder (castPtr context)
+    pure (conjoin [(actual,calls) === (expected,expectedCalls),
+      (direct,directCalls) === (expected,expectedCalls),trace === [0,1,2,3],opcodeCalls === 4,missing === -1])
+  where
+    gen :: Gen (Word32,Int64,[Int32],Int32,[Int64])
+    gen = (,,,,) <$> frequency [(4,pure 15),(1,choose (0,15))] <*>
+      frequency [(4,pure 0),(1,edge [-1,0,1])] <*>
+      frequency [(4,pure [71,117,0]),(1,vectorOf 3 (choose (0,256 :: Int32)))] <*>
+      elements [0,1,1,1] <*>
+      ((\status value sequenceNumber -> [status,value,sequenceNumber]) <$>
+        elements [0,8,15,15,-1,16] <*> edge [0,1,100] <*> edge [-1,0,1])
+
 stateRuleParity :: Property
 stateRuleParity = forAll ((,) <$> frequency [(4,choose (0,7)), (1,edge [8,9])] <*> arbitrary) $
   \(phase,facts) -> same (elements_hs_deposit_state phase facts) (reference_deposit_state phase facts)
@@ -9967,44 +10452,34 @@ checkpointAbi = forAll gen $ \((txid,previous,record),mode,capacity) -> ioProper
   where
     gen = (,,) <$> elements Deposit.legacyCheckpoints <*> chooseInt (0,7) <*> elements [0,1,135,136,137,maxBound]
 
-resumableEvidence :: Word32 -> FunPtr Deposit.ReadPegFields -> Ptr () -> IO Int32
-resumableEvidence phase reader context = bracket (elements_hs_live_begin phase) elements_hs_live_free $ \handle ->
-  allocaBytes 32 $ \fields -> do
-    initial <- elements_hs_live_resume handle nullPtr
-    let run command
-          | command >= 256 && command <= 266 = do
-              status <- Deposit.readPegFields reader context (fromIntegral (command - 256)) fields
-              if status /= 1 then pure (if status == 0 then -1 else -2)
-              else elements_hs_live_resume handle fields >>= run
-          | otherwise = pure command
-    run initial
-
-liveResumeLifecycle :: Property
-liveResumeLifecycle = forAll (choose (1,maxBound :: Int64)) $ \value -> ioProperty $
-  bracket (elements_hs_live_begin 3) elements_hs_live_free $ \first ->
-  bracket (elements_hs_live_begin 1) elements_hs_live_free $ \second -> do
-    a <- elements_hs_live_resume first nullPtr
-    repeated <- elements_hs_live_resume first nullPtr
-    b <- elements_hs_live_resume second nullPtr
-    c <- withArray [0,0,0,0] (elements_hs_live_resume first)
-    d <- withArray [value,8,8,1] (elements_hs_live_resume first)
-    e <- elements_hs_live_resume first nullPtr
-    rejected <- withArray [0,0,0,0] (elements_hs_live_resume first)
-    unchanged <- elements_hs_live_resume second nullPtr
-    invalid <- elements_hs_live_resume nullPtr nullPtr
-    pure ([a,repeated,b,c,d,e,rejected,unchanged,invalid] === [256,256,256,257,0,0,-2,256,-2])
+liveSynchronousLifecycle :: Property
+liveSynchronousLifecycle = forAll (choose (1,maxBound :: Int64)) $ \value -> ioProperty $ do
+  calls <- newIORef []
+  let readFields _ step fields = do
+        initial <- peekArray 4 fields
+        modifyIORef' calls (++ [(step,initial)])
+        pokeArray fields (if step == 0 then [0,0,0,0] else [value,8,8,1])
+        pure 1
+  bracket (wrapPegFields readFields) freeHaskellFunPtr $ \reader -> do
+    first <- elements_hs_live_evidence 3 reader nullPtr
+    second <- elements_hs_live_evidence 3 reader nullPtr
+    invalid <- elements_hs_live_evidence maxBound reader nullPtr
+    missing <- elements_hs_live_evidence 3 nullFunPtr nullPtr
+    observed <- readIORef calls
+    pure $ conjoin [[first,second,invalid,missing] === [0,0,-2,-2],
+      observed === [(step,replicate 4 0) | step <- [0,1,0,1]]]
 
 liveEvidenceParity :: Property
 liveEvidenceParity = forAll gen $ \(phase,values,failedStep,status) -> ioProperty $
   withArray ([0,0,failedStep,status] ++ values) $ \context -> do
     let call f = f phase referenceLive (castPtr context)
-    actual <- call resumableEvidence
+    actual <- call elements_hs_live_evidence
     trace <- peekArray 2 context
     pokeByteOff context 0 (0 :: Int64)
     pokeByteOff context 8 (0 :: Int64)
     expected <- call reference_live_evidence
     expectedTrace <- peekArray 2 context
-    invalid <- resumableEvidence maxBound nullFunPtr nullPtr
+    invalid <- elements_hs_live_evidence maxBound nullFunPtr nullPtr
     pure $ conjoin [(actual,trace) === (expected,expectedTrace), invalid === -2]
   where
     gen :: Gen (Word32, [Int64], Int64, Int64)
@@ -10026,7 +10501,7 @@ selectionParity :: Property
 selectionParity = forAll gen $ \(phase,responses) -> ioProperty $
   withArray ([0,fromIntegral (length responses)] ++ concat responses) $ \context -> do
     let call f = f phase referenceScripted (castPtr context)
-    actual <- call resumableEvidence
+    actual <- call elements_hs_live_evidence
     calls <- peek context
     poke context (0 :: Int64)
     expected <- call reference_live_evidence
@@ -11061,7 +11536,7 @@ peerStrikes = forAll ((,) <$> choose (0,7) <*> frequency [(1,elements [0,1,maxBo
 main :: IO ()
 main = do
   results <- mapM (\(name,prop) -> putStrLn name >> quickCheckWithResult
-    stdArgs { maxSuccess = 10000, replay = Just (mkQCGen 20261009, 0) } prop)
+    stdArgs { maxSuccess = 10000, replay = Just (mkQCGen 20261009, 0) } prop) $ CustodyIdentityTests.properties ++ CustodyPolicyTests.properties ++ ForcedBlockTests.properties ++ ForcedOutputTests.properties ++ SignetSessionTests.properties ++ CommitmentTests.properties ++ BmmChainTests.properties ++ ProofSessionTests.properties ++ StateStorageTests.properties ++ BmmStateAccessTests.properties ++ BmmHeaderPolicyTests.properties ++ JournalWorkflowTests.properties ++ WalletWithdrawalTests.properties ++ BmmContextTests.properties ++ LocalBidTests.properties ++ ConfirmationDepthTests.properties ++ ReplayStoreTests.properties ++ ParentRpcTests.properties ++ ParentHeaderTests.properties ++ NativeDepositTests.properties ++
     [("next block height / missing tip, signed boundaries and overflow",nextBlockHeight),
      ("tracker height / clamp, predecessor, signed bounds and invalid mode",trackerHeight),
      ("bond tree / lazy single-double composition, fault prefixes and ABI",bondTreeOrder),
@@ -11136,6 +11611,7 @@ main = do
      ("domain ABI / rejection before effects",abiRejectsBeforeEffects),
      ("domain ABI / signed canonicality before effects",abiSignedCanonical),
      ("domain ABI / exceptions preserve result canary",abiExceptionsPreserveResult),
+     ("family ABI / section isolation, canonical arguments and no effects on rejection",abiFamilyRouting),
      ("exchange inbox arithmetic / Integer oracle",exchangeArithmetic),
      ("exchange inbox ABI / canary and invalid projections",exchangeAbi),
      ("exchange processed cursors / ABI and decision table",cursorAbi),
@@ -11159,6 +11635,11 @@ main = do
      ("M6 envelope payload / frozen layout and bounded publication",exchangeEnvelopePayload),
      ("M6 envelope payload / invalid lengths and missing pointers",exchangeEnvelopePayloadBounds),
      ("M6 envelope scan / candidate order, duplicate precedence and bounded callbacks",exchangeEnvelopeScan),
+     ("M6 whole workflow / exact anchor, duplicate precedence and failure boundaries",wholeEnvelopeValidation),
+     ("parent messages / ordered M1-M4 composition, errors and fault prefixes",wholeReplayMessages),
+     ("parent messages / framing rejects before later effects",replayMessageFraming),
+     ("M4 whole workflow / modes, saturation, lazy reads and publication",wholeM4Voting),
+     ("deposit state workflow / legacy decisions, publication order and exceptions",depositStateWorkflowParity),
      ("exchange capital identity / byte offsets and ABI bounds",capitalIdentityAbi),
      ("exchange genesis initialization / version, order and lazy failures",genesisInitializationOrder),
      ("exchange deployment / version and blinder read ordering",deploymentOrder),
@@ -11172,6 +11653,8 @@ main = do
      ("pruned parent recovery / first full peer, service order and failed callbacks",recoveryPeerOrder),
      ("pruned parent recovery / reply and header admission order",recoveryValidationOrder),
      ("pruned parent recovery / outer deadline, retry and active-height order",recoveryBodyOrder),
+     ("pruned parent recovery / composed capabilities, retry trace and failure prefix",recoveryComposedOrder),
+     ("pruned parent recovery / null callback and invalid composed selector",recoveryComposedBoundary),
      ("exchange oracle profile / decoding ABI and untouched failure output",oracleProfileAbi),
      ("exchange Truthcoin profile / portable bytes and output canaries",truthProfileAbi),
      ("exchange checkpoint profiles / independent modes and ABI canaries",checkpointProfileAbi),
@@ -11288,6 +11771,8 @@ main = do
      ("USDD inclusion proof / independent levels, siblings and effect count",usddInclusion),
      ("USDD annex / bounded prefix, total sizes and null ABI",usddAnnexAbi),
      ("exchange inbox entries / serialized layout and ABI canaries",inboxEntryAbi),
+     ("transaction snapshot / native predicate parity and malformed framing",transactionAdmissionAbi),
+     ("public bond snapshot / lazy derivation, failure order and one callback",publicTransactionAdmissionAbi),
      ("depth / old C++",depthParity), ("treasury / old C++",treasuryParity),
      ("treasury matching / slot range, decoder reuse and lazy reads",treasuryMatchParity),
      ("payout / old C++",payoutParity), ("payout conservation",conservation),
@@ -11412,6 +11897,7 @@ main = do
      ("fee asset / shared hex decoder, immutable identity and output preservation",feeAssetResolution),
      ("BMM wait / reset versus retained failures, cadence and interruption",bmmWaitWorkflow),
      ("native and ECX production / stage order, short circuit and malformed responses",productionStages),
+     ("BMM sync heights / comparison, short circuit and malformed responses",bmmSyncHeights),
      ("policy callback boundary / lazy null rejection and exception conversion",policyCallBoundary),
      ("parent RPC address / exact IPv4 and IPv6 loopback policy",parentRpcAddress),
      ("result publication / lazy rejection and write exception preservation",resultPublication),
@@ -11422,6 +11908,42 @@ main = do
      ("replay leader / ranking, ties, margin and saturation",replayLeaderParity),
      ("proposal expiry / ordered mutation and malformed-entry stop",proposalExpiryWorkflowParity),
      ("withdrawal expiry / strict age and effect rejection",withdrawalExpiryWorkflowParity),
+     ("parent maintenance / slot order, snapshots, partial effects and malformed replies",replayMaintenanceExpiry),
+     ("parent maintenance / pruning before ordered publication",replayMaintenancePublication),
+     ("parent maintenance / composed block stages and short circuit",replayComposedStages),
+     ("deposit claims / three complete workflows",DepositClaimTests.whole),
+     ("deposit claims / checkpoint admission and publication",DepositClaimTests.lookupOrder),
+     ("deposit claims / projected transaction rule parity and order",DepositClaimTests.transaction),
+     ("deposit claims / legacy witness and destination precedence",DepositClaimTests.legacy),
+     ("deposit claims / callback exception prefixes",DepositClaimTests.faults),
+     ("deposit claims / malformed replies fail closed",DepositClaimTests.malformed),
+     ("deposit claims / lazy mismatches and missing input",DepositClaimTests.lazyDispatch),
+     ("deposit parsing / complete ordered workflow",DepositParsingTests.whole),
+     ("deposit parsing / domain rejection and publication gates",DepositParsingTests.rejections),
+     ("deposit parsing / callback fault prefixes",DepositParsingTests.faults),
+     ("deposit parsing / malformed frames and scalar widths",DepositParsingTests.malformed),
+     ("deposit parsing / lazy payload mismatch and index admission",DepositParsingTests.lazyDispatch),
+     ("deposit parsing / generic capability composition",DepositParsingTests.stages),
+     ("deposit construction / ordered reconstruction and partial publication",DepositConstructionTests.transcript),
+     ("deposit construction / signed and header-window boundaries",DepositConstructionTests.boundaries),
+     ("deposit construction / callback failure prefixes",DepositConstructionTests.exceptions),
+     ("deposit construction / candidate recovery and fatal exception preservation",DepositConstructionTests.recovery),
+     ("deposit construction / malformed callback replies",DepositConstructionTests.malformed),
+     ("deposit construction / payload equality precedes DSL and effects",DepositConstructionTests.lazyDispatch),
+     ("deposit construction / generic capability stage composition",DepositConstructionTests.stages),
+     ("parent prelude / ordered messages, duplicates, hash order and M8 rejection",ParentBlockTests.preludeMessages),
+     ("parent prelude / callback failure prefixes",ParentBlockTests.preludeFaults),
+     ("parent prelude / admission priority and safe snapshots",ParentBlockTests.preludeAdmission),
+     ("parent prelude / exact M8 encoding",ParentBlockTests.preludeM8),
+     ("parent prelude / payload equality precedes DSL and effects",ParentBlockTests.preludeLazy),
+     ("parent prelude / malformed snapshots and hash replies",ParentBlockTests.preludeMalformed),
+     ("parent block / generic capability stage ordering and short circuit",ParentBlockTests.blockStages),
+     ("parent block / payload equality precedes DSL and effects",ParentBlockTests.blockLazy),
+     ("parent block / complete grouped workflow and publication order",ParentBlockTests.blockWhole),
+     ("parent block / native exception prefixes",ParentBlockTests.blockFaults),
+     ("parent block / malformed callback replies",ParentBlockTests.blockMalformed),
+     ("parent block / domain rejection stops later stages",ParentBlockTests.blockRejections),
+     ("parent block / M5 parsing and block scoped M6 policy",ParentBlockTests.blockTreasury),
      ("CTIP ownership / balance checks, duplicate rejection and order",ctipOwnersWorkflowParity),
      ("CTIP spends / duplicate tracking and indexed effects",ctipSpendsWorkflowParity),
      ("CTIP outputs / active treasury validation and insertion ordering",ctipOutputsWorkflowParity),
@@ -11444,6 +11966,9 @@ main = do
      ("block publication / admission and optional output order",blockPublishWorkflowParity),
      ("slot pruning / occupancy and ordered mutations",pruneSlotsWorkflowParity),
      ("M6 withdrawal / ordered guards and publication",m6WithdrawalWorkflowParity),
+     ("Treasury transaction / legacy rule composition, fault prefixes and effects",treasuryTransactionParity),
+     ("Treasury transaction / invalid modes, null callback and negative counts",treasuryTransactionBoundary),
+     ("BMM state workflow / lifecycle and source decisions preserve ordered native effects",bmmStateWorkflowParity),
      ("M5 deposit / address-first validation and gated publication",m5DepositWorkflowParity),
      ("replay leading workflow / duplicate identities and publication",replayLeadingParity),
      ("replay explicit workflow / abstain, alarm and duplicate identities",replayExplicitParity),
@@ -11516,6 +12041,7 @@ main = do
      ("ELMTP tagged parent / canonicality and partial publication",taggedParentParity),
      ("BMM commitment selection / callback order / frozen native rules",bmmCommitmentParity),
      ("BMM retarget boundaries and timespan clamps",bmmRetargetParity),
+     ("BMM retarget workflow / native parity, lazy reads and publication",bmmRetargetWorkflowParity),
      ("BMM upper-middle median / unsigned times",bmmMedianParity),
      ("BMM storage / ordered effects and height normalization",bmmStoreParity),
      ("BMM encoding / ordered native primitives",bmmEncodingParity),
@@ -11528,6 +12054,7 @@ main = do
      ("signet extraction callback transcript / native rules",signetExtractionParity),
      ("post-Refl signet orchestration / reusable capabilities",property signetCapabilities),
      ("BMM signature hash mode plan / frozen native branches",bmmSignatureParity),
+     ("Bitcoin signature workflow / class dispatch and exact native-effect prefixes",bitcoinSignatureWorkflow),
      ("signet validation / frozen control flow and short-circuit trace",signetValidationParity),
      ("BMM proof and state codecs / frozen native guards",bmmCodecParity),
      ("BMM traversal / frozen loop and short-circuit transcript",bmmTraversalParity),
@@ -11546,6 +12073,8 @@ main = do
      ("BMM state runner / long nonce traversal",bmmStateRunLong),
      ("BMM proof runner / unsigned replies, null callbacks and malformed frames",bmmProofRunBoundaries),
      ("BMM proof runner / long traversal and publication",bmmProofRunLong),
+     ("BMM proof workflow / nested reference, effects and ABI",bmmProofWorkflow),
+     ("Exchange state workflow / nested reference, effects and ABI",stateWorkflowParity),
      ("parent signet signature / encoding before key and split",parentSignatureFlow),
      ("Private BMM construction / retries and publication",bmmPrivateBuildParity),
      ("Private BMM template / integer wrap and byte order",bmmPrivateTemplateParity),
@@ -11573,6 +12102,7 @@ main = do
      ("authenticated CTIP increase / old C++ and full-width amounts",ctipParity),
      ("persisted CTIP / old C++, decode faults and callback ordering",persistedCtipParity),
      ("CTIP script / native packing and read order",ctipScriptPacking),
+     ("Persisted CTIP workflow / old C++, cursor and decoder order",persistedCtipWorkflow),
      ("deposit verification / original branch transcript",depositVerificationFlow),
      ("deposit anchor / original branch transcript",depositAnchorFlow),
      ("deposit lifecycle / original branch transcript and terminal publication",depositLifecycleFlow),
@@ -11689,7 +12219,7 @@ main = do
      ("destination selection / old C++ and callback ordering",destinationParity),
      ("checkpoint ABI bounds, immutable lookup and output canaries",checkpointAbi),
      ("live evidence / old C++, ordered field reads and parser faults",liveEvidenceParity),
-     ("live evidence / resumable ownership and protocol",liveResumeLifecycle),
+     ("live evidence / synchronous isolation and initialized callbacks",liveSynchronousLifecycle),
      ("declaration and deposit selection / old C++ and lazy read traces",selectionParity),
      ("peg event lifecycle and amounts / old C++",pegEventParity),
      ("withdrawal status bytes / old C++ and exact matching",withdrawalStatusParity),
@@ -12008,6 +12538,104 @@ bmmProofRunLong = once $ ioProperty $ do
   invalid <- validate (Bmm.ProofExecution 2 0 (\_ -> error "unknown kind forced action"))
   pure (conjoin [actual === 0,count === 100000,writes === 1,invalid === minBound])
 
+bmmProofWorkflow :: Property
+bmmProofWorkflow = forAll generator $ \(start,count,signet,fault,replacement) -> ioProperty $ do
+  let run interpreter = do
+        seen <- newIORef []
+        position <- newIORef 0
+        let action step = do
+              modifyIORef' seen (++[step])
+              index <- readIORef position
+              when (step == 7) (writeIORef position (index+1))
+              pure $ if step == fault then replacement else case step of
+                1 -> [1,count,8,0]
+                2 -> [0,1,1,100]
+                3 -> [1,1,1,0]
+                7 -> [index,count,0,0]
+                12 -> [3,1,100,0]
+                154 -> [0,if signet then 1 else 0,0,0]
+                205 -> [1,1,0,0]
+                _ -> [1,0,0,0]
+        result <- interpreter action
+        trace <- readIORef seen
+        pure (result,trace)
+      -- The former native nesting, expressed independently of ProofWorkflow.
+      reference action = either id id <$> runExceptT (case start of
+        0 -> do
+          check 0 1
+          gate (-1) 147
+          gate (-1) 18
+          mapM_ entry [1..count]
+          check 5 8
+          gate (-1) 9
+          check 6 10
+          _ <- fields 19
+          pure 0
+        11 -> do
+          check 7 12
+          check 8 13
+          gate (-1) 14
+          check 9 15
+          gate (-1) 16
+          gate (-1) 17
+          pure 0
+        21 -> check 13 22 >> gate (-1) 23 >> pure 0
+        _ -> throwE minBound)
+        where
+          fields = lift . action
+          gate code step = fields step >>= \values -> when (head values == 0) (throwE code)
+          proof phase [flags,a,b,c] = case validate (Bmm.Proof phase (fromIntegral flags) a b c) of
+            0 -> pure ()
+            code -> throwE (100+code)
+          proof _ _ = throwE minBound
+          check phase step = fields step >>= proof phase
+          decode [] bits = pure bits
+          decode (step:rest) bits = do
+            values <- fields step
+            if head values == 0 then pure bits
+              else decode rest (bits .|. (1 `shiftL` fromIntegral (step-201)))
+          extension [] = pure ()
+          extension (step:rest) = fields step >>= \values ->
+            if head values == 0 then throwE 105 else extension rest
+          entry _ = do
+            check 1 2
+            _ <- fields 200
+            bits <- decode [201..204] 0
+            shape <- fields 205
+            proof 2 [bits .|. (head shape `shiftL` 4),shape !! 1,0,0]
+            check 3 3
+            check 10 4
+            extension [150..152]
+            pow <- fields 154
+            proof 11 [head pow,0,0,0]
+            check 12 155
+            when (pow !! 1 /= 0) (gate (-2) 6)
+            _ <- fields 7
+            pure ()
+  expected <- run reference
+  direct <- run (validate . Bmm.ProofWorkflow start)
+  actual <- run $ \action -> bracket (wrapProofFacts (\_ step out -> action step >>= pokeArray out >> pure 1))
+    freeHaskellFunPtr $ \callback -> elements_hs_bmm_proof_workflow start callback nullPtr
+  missing <- elements_hs_bmm_proof_workflow start nullFunPtr nullPtr
+  malformed <- validate (Bmm.ProofWorkflow start (\_ -> pure [1,2,3]))
+  pure (conjoin [direct === expected,actual === expected,missing === minBound,malformed === minBound])
+  where
+    generator = do
+      start <- elements [0,0,11,21]
+      count <- choose (0,8)
+      signet <- arbitrary
+      fault <- elements [0,1,2,3,4,6,8,9,10,12,13,14,15,16,17,22,23,147,150,151,152,154,155,201,202,203,204,205]
+      -- Native booleans remain booleans; malformed transport is tested separately.
+      replacement <- case fault of
+        1 -> elements [[0,count,8,0],[1,0,8,0],[1,9,8,0]]
+        2 -> elements [[0,0,1,100],[0,1,101,100]]
+        3 -> elements [[0,1,1,0],[1,2,1,0],[1,1,1,1]]
+        12 -> elements [[0,1,100,0],[3,0,100,0],[3,101,100,0]]
+        154 -> pure [1,if signet then 1 else 0,0,0]
+        205 -> elements [[0,1,0,0],[1,2,0,0]]
+        _ -> pure [0,0,0,0]
+      pure (start,count,signet,fault,replacement)
+
 bmmPrivateBuildParity :: Property
 bmmPrivateBuildParity = forAll ((,) <$> elements [0,25,26,32] <*> choose (0,100)) $ \(failure,retries) -> ioProperty $
   withArray [0,0] $ \out -> do
@@ -12194,6 +12822,148 @@ signetValidationParity = forAll gen $ \facts -> ioProperty $
           next <- elements_hs_signet_validation (fromIntegral step) a b c d
           run facts next (trace * 10 + fromIntegral step) (fuel - 1)
 
+replayMaintenanceExpiry :: Property
+replayMaintenanceExpiry = forAll gen $ \(height,entries,fault) -> ioProperty $ do
+  seen <- newIORef []
+  let slots = zip (24:[0..] :: [Word8]) entries
+      inventory = B.pack (concatMap (\(slot,(used,_,_)) -> [slot,if used then 1 else 0]) slots)
+      windows = 10 + 5*65536 + 20*4294967296 + 15*281474976710656
+      event step slot payload = (step,fromIntegral slot,payload)
+      erase step slot selected = [event step slot (B.concat (map (wordLE 8) selected)) | not (null selected)]
+      prefix decide = go 0 []
+        where
+          go _ selected [] = (0,reverse selected)
+          go index selected (entry:rest) = case decide entry of
+            Left code -> (code,reverse selected)
+            Right expired -> go (index+1) (if expired then index:selected else selected) rest
+      proposal used (proposed,votes)
+        | proposed > height = Left 1
+        | votes > 65535 = Left (-1)
+        | votes > age = Left 2
+        | otherwise = Right (age > maxAge || (age > maxFails && age-votes >= maxFails))
+        where
+          age = height-proposed
+          (maxAge,maxFails) = if used then (20,5) else (10,5)
+      withdrawals [] = (0,[])
+      withdrawals ((slot,(_,_,rows)):rest) =
+        let decide proposed | proposed > height = Left (1 :: Int32)
+                            | otherwise = Right (height-proposed > 12)
+            (status,selected) = prefix decide rows
+            current = event 3 slot B.empty : erase 4 slot selected
+            (later,following) = withdrawals rest
+        in if status /= 0 then (0x300,current) else (later,current++following)
+      proposals [] = withdrawals (List.sortOn fst (filter (\(_, (used,_,_)) -> used) slots))
+      proposals ((slot,(used,rows,_)):rest) =
+        let (status,selected) = prefix (proposal used) rows
+            current = event 1 slot B.empty : erase 2 slot selected
+            (later,following) = proposals rest
+        in if status /= 0 then (if status < 0 then status else status*256+fromIntegral slot,current)
+          else (later,current++following)
+      (expected,restTrace) = proposals slots
+      trace = (0,0,B.empty):restTrace
+      native step slot payload = do
+        calls <- readIORef seen
+        modifyIORef' seen (++[(step,slot,payload)])
+        pure $ if length calls == fault then B.singleton 255 else case step of
+          0 -> inventory
+          1 -> let (_,rows,_) = fromMaybe (error "unknown proposal slot") (lookup (fromIntegral slot) slots)
+               in B.concat [wordLE 4 (fromIntegral proposed) <> wordLE 4 (fromIntegral votes) | (proposed,votes) <- rows]
+          3 -> let (_,_,rows) = fromMaybe (error "unknown withdrawal slot") (lookup (fromIntegral slot) slots)
+               in B.concat (map (wordLE 4 . fromIntegral) rows)
+          _ -> B.empty
+      failed = fault >= 0 && fault < length trace
+  actual <- execute (ParentReplay.Maintenance height windows 12 0 native) ParentReplay.BeforeTreasury
+  observed <- readIORef seen
+  pure $ conjoin [actual === if failed then -1 else expected,
+    observed === if failed then take (fault+1) trace else trace,
+    property ((() <$ interpret (SomeOperation (undefined :: Withdrawal.WithdrawalRequest))
+      (error "mismatched maintenance DSL forced" `asTypeOf` ParentReplay.BeforeTreasury)) == Nothing)]
+  where
+    gen = (,,) <$> choose (0,110 :: Word32) <*>
+      resize 6 (listOf ((,,) <$> arbitrary <*>
+        resize 8 (listOf ((,) <$> choose (0,110) <*> frequency [(9,choose (0,25)),(1,elements [65535,65536,maxBound])])) <*>
+        resize 8 (listOf (choose (0,110))))) <*> choose (-1,35 :: Int)
+
+replayMaintenancePublication :: Property
+replayMaintenancePublication = forAll gen $ \(flags,occupied,clockFacts,fault) -> ioProperty $ do
+  seen <- newIORef []
+  let slots = zip [0..] occupied :: [(Word8,Word8)]
+      retired = B.pack [slot | (slot,0) <- slots]
+      prefix = [(10,0,B.empty)] ++ [(11,0,retired) | not (B.null retired)]
+      accepted = flags <= 15 && (not (testBit flags 0) || testBit flags 1)
+      budget = [27] ++ if clockFacts !! 4 then [28] ++ [29 | clockFacts !! 5] else []
+      afterInterrupt = [25] ++ if clockFacts !! 3 then [26] else budget
+      clockSteps = 21 : if not (head clockFacts) then budget else
+        22 : if not (clockFacts !! 1) then afterInterrupt else
+          23 : if clockFacts !! 2 then [24] else afterInterrupt
+      clockFailed = last clockSteps `elem` [24,26,29]
+      trace = prefix ++ (if accepted then [(step,0,B.empty) |
+        step <- [12 | testBit flags 2] ++ [13 | testBit flags 3] ++ clockSteps] else [])
+      native step slot payload = do
+        calls <- readIORef seen
+        modifyIORef' seen (++[(step,slot,payload)])
+        pure $ if length calls == fault then B.singleton 255
+          else if step == 10 then B.pack (concatMap (\(a,b) -> [a,b]) slots)
+          else if step `elem` [24,26,29] then B.singleton 255
+          else case lookup step (zip [21,22,23,25,27,28] clockFacts) of
+            Just present -> B.singleton (if present then 1 else 0)
+            Nothing -> B.empty
+      failed = fault >= 0 && fault < length trace
+      expected = if flags > 15 then -1 else if not accepted then 1 else if clockFailed then -1 else 0
+  actual <- execute (ParentReplay.Maintenance 0 0 0 flags native) ParentReplay.AfterTreasury
+  observed <- readIORef seen
+  pure $ conjoin [actual === if failed then -1 else expected,
+    observed === if failed then take (fault+1) trace else trace]
+  where gen = (,,,) <$> choose (0,31) <*> resize 10 (listOf (choose (0,63))) <*>
+          vectorOf 6 arbitrary <*> choose (-1,15 :: Int)
+
+replayComposedStages :: Property
+replayComposedStages = forAll (elements [327,328]) $ \kind ->
+  forAll ((,) <$> vectorOf (if kind == 327 then 7 else 5) arbitrary <*> choose (-1,8 :: Int)) $ \(accepted,fault) -> ioProperty $
+  let replies = zip (if kind == 327 then [1,2,3,4,5,7,8] else [1,4,5,7,8]) (map (\good -> if good then 1 else 0) accepted)
+      script = take (1+length (takeWhile id accepted)) replies
+  in commandTrace kind 8 (\phase result -> validate (ParentReplay.StoreFlow kind phase result))
+    script fault (if and accepted then 1 else 0)
+
+bitcoinSignatureWorkflow :: Property
+bitcoinSignatureWorkflow = forAll gen $ \(mode,isWitness,index,inputs,outputs,hashType,signature,encoding,key,verified,fault) -> ioProperty $ do
+  calls <- newIORef []
+  let bool step = if step == 0 then encoding else if step == 1 then key else verified
+      native step value payload = do
+        seen <- readIORef calls
+        modifyIORef' calls (++ [(step,value,payload)])
+        pure $ if length seen == fault then B.pack [19,23]
+          else if step `elem` [0,1,3] then B.singleton (if bool step then 1 else 0) else B.empty
+      request = if mode == 2 then Bmm.SignatureHashWorkflow hashType index outputs native
+        else Bmm.SignatureVerifyWorkflow mode isWitness index inputs outputs (B.pack signature) native
+      effectiveType = if mode == 2 then hashType else fromIntegral (last signature)
+      effect step = (step,0,B.empty)
+      -- Independent pre-refactor branches, rather than the new capability methods.
+      base = effectiveType `mod` 32
+      anyone = testBit effectiveType 7
+      allOutputs = base /= 2 && base /= 3
+      hashing = [(4,0,B.pack ([100 | not anyone] ++ [101 | not anyone && allOutputs] ++
+        (if allOutputs then [102] else [103 | base == 3 && fromIntegral index < outputs]) ++ [200..210]))]
+      (expected,trace)
+        | mode == 2 = (1,hashing)
+        | mode > 1 = (-1,[])
+        | isWitness == 0 || null signature || (mode == 0 && fromIntegral index >= inputs) = (0,[])
+        | mode == 1 && not encoding = (0,[effect 0])
+        | not key = (0,[effect 0 | mode == 1] ++ [effect 1])
+        | otherwise = (if verified then 1 else 0,[effect 0 | mode == 1] ++ [effect 1] ++
+            [(2,fromIntegral (last signature),B.pack (init signature))] ++ hashing ++ [effect 3])
+      failed = fault >= 0 && fault < length trace
+      mismatch = (() <$ interpret (SomeOperation (undefined :: Withdrawal.WithdrawalRequest))
+        (error "mismatched signature DSL forced" `asTypeOf` Bmm.RunSignature)) == Nothing
+  actual <- execute request Bmm.RunSignature
+  observed <- readIORef calls
+  pure (conjoin [actual === if failed then -1 else expected,
+    observed === if failed then take (fault+1) trace else trace, property mismatch])
+  where
+    gen = (,,,,,,,,,,) <$> elements [0,1,2,3,maxBound] <*> elements [0,1] <*>
+      choose (0,4) <*> choose (0,4) <*> choose (0,4) <*> arbitrary <*>
+      resize 80 arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> choose (-1,5)
+
 bmmSignatureParity :: Property
 bmmSignatureParity = forAll gen $ \(hashType,index,count,isWitness,size) -> ioProperty $ do
   actualPlan <- elements_hs_bmm_sighash_plan hashType index count
@@ -12249,6 +13019,38 @@ bmmRetargetParity = forAll gen $ \(height,interval,target,time,start) -> ioPrope
       edge [-1,0,1,2016,4294967296,maxBound] <*>
       edge [minBound,-1,0,1,3,4,1209600,maxBound `quot` 4,maxBound] <*>
       edge [0,1,302399,302400,1209600,4838400,maxBound] <*> edge [0,1,maxBound]
+
+bmmRetargetWorkflowParity :: Property
+bmmRetargetWorkflowParity = forAll gen $ \(height,interval,target,time,start,payload) -> ioProperty $ do
+  spanTime <- reference_bmm_retarget height interval target time start
+  expectedBytes <- if spanTime < 0 || B.length payload /= 64 then pure B.empty else
+    withArray (B.unpack (B.take 32 payload)) $ \output ->
+    withArray (B.unpack (B.drop 32 payload)) $ \limit -> do
+      status <- reference_bmm_scale_target 32 (fromIntegral spanTime) (fromIntegral target) output limit
+      if status /= 0 then fail "invalid reference target scale" else B.pack <$> peekArray 32 output
+  calls <- newIORef []
+  let native step index input = do
+        modifyIORef' calls (++ [(step,index,input)])
+        pure (if step == 0 then payload else B.empty)
+      expected = if spanTime == -1 then 0 else if spanTime < -1 then -2
+        else if B.length payload /= 64 then -1 else 0
+      expectedCalls = if spanTime < 0 then [] else
+        [(0,0,B.empty)] ++ [(1,0,expectedBytes) | B.length payload == 64]
+  actual <- validate (Bmm.RetargetWorkflow height interval target time start native)
+  trace <- readIORef calls
+  missing <- elements_hs_bmm_retarget_workflow height interval target time start nullFunPtr nullPtr
+  pure $ conjoin [actual === expected,trace === expectedCalls,
+    missing === (if spanTime < 0 then expected else -1)]
+  where
+    gen = do
+      interval <- elements [-1,0,1,2016,4294967296,maxBound]
+      height <- oneof [arbitrary,pure (fromIntegral interval - 1)]
+      target <- edge [minBound,-1,0,1,3,4,1209600,4294967296,maxBound `quot` 4,maxBound]
+      time <- edge [0,1,1209600,4838400,maxBound]
+      start <- edge [0,1,maxBound]
+      size <- frequency [(4,pure 64),(1,elements [0,32,63,65])]
+      payload <- B.pack <$> vectorOf size arbitrary
+      pure (height,interval,target,time,start,payload)
 
 bmmMedianParity :: Property
 bmmMedianParity = forAll (listOf (edge [0,1,maxBound])) $ \times -> ioProperty $

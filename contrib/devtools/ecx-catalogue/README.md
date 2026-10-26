@@ -1,6 +1,6 @@
 # Reproducible ECX jet catalogue
 
-This directory publishes the 24-interface typed ECX catalogue, its exact
+This directory publishes the 26-interface typed ECX catalogue, its exact
 commitments, encodings and fixed costs, and additive C bindings. It replaces the
 six catalogue hard-error includes. It is **not** a production activation profile
 or authorization to deploy a node, spend funds, broadcast, or start paid proving.
@@ -18,13 +18,13 @@ The selected consensus policy costs are:
 | Entries | Count | Cost per entry (milliweight) |
 | --- | ---: | ---: |
 | Required context/identity projections and input-role assertions | 19 | 1,000 |
-| SP1 Groth16 verification variants (generic, V3, V4, V5 activation, V6 successor) | 5 | 1,000,000,000 |
+| SP1 Groth16 verification variants (generic, V3, V4, V5 activation, V6 successor, V7 swaps) | 6 | 1,000,000,000 |
 
 These exact numbers are policy choices, not measured timings. Changing a cost
 changes the jet commitment and therefore requires re-deriving every downstream
 program that uses it. `jet-identities.tsv` and `registry.json` contain the exact
 CMR, typed IMR, AMR, source/target type roots, specification roots and encodings
-for all 24 entries. The Haskell full encoding includes one outer jet bit that
+for all 26 entries. The Haskell full encoding includes one outer jet bit that
 the C/Rust jet decoder has already consumed.
 
 Historical WSL diagnostic records are preserved byte-for-byte in `evidence/`:
@@ -56,16 +56,16 @@ compression/tag/type/jet constructions instead of trusting copied hex strings.
 
 The C runner creates a fresh temporary build, tests both the default-disabled
 and opt-in decoders, and runs the existing native C regression suite against
-the opt-in decoder. Tests cover all 24 paths, proper-prefix truncations,
+the opt-in decoder. Tests cover all 26 paths, proper-prefix truncations,
 unassigned paths, type roots, function bindings, exact policy budgets,
 commitments, environment projections and fail-closed behavior. The node's
-`ecx_exchange_state_tests` also exercise the actual V6 frame adapter and strict
+`ecx_exchange_state_tests` also exercise the actual V6/V7 frame adapters and strict
 annex parser with a recording test callback. That callback is not cryptographic
 proof verification and is never linked into the node runtime.
 
 ## Independent Haskell reproduction
 
-Install `ghc-9.6.7` and Cabal on `PATH` (tested with Cabal 3.14.2.0), plus Git,
+Install `ghc-9.6.7` and Cabal on `PATH` (tested with Cabal 3.14.2.0 and 3.16.1.0), plus Git,
 Python 3 and the system C/Haskell build prerequisites. Initialize Cabal's
 package index if needed. The public `catalogue.project` selects
 `with-compiler: ghc-9.6.7`; it has no absolute compiler or local-volume path.
@@ -80,7 +80,7 @@ This creates a new directory, checks out upstream Simplicity commit
 typed candidate hash, applies the vendored overlay, and builds the actual
 Haskell C/Rust generators. It then derives the typed identities, runs the
 44 reference-semantics checks, compares the TSV byte-for-byte, and independently
-checks all 24 generated C/Rust entries. It never replaces this repository's
+checks all 26 generated C/Rust entries. It never replaces this repository's
 native catalogue with the upstream generator's larger catalogue.
 
 The script retains its artifacts for inspection. Set `TMPDIR` to an existing
@@ -99,3 +99,11 @@ chain/parent context; the exact production configuration and program identities;
 confirmed funding and unbroadcast deployment/activation manifests; and fresh
 witness/public values that pass the canonical preflight and execute-only gates.
 Private regtest proof artifacts must not be substituted for those inputs.
+
+The appended V7 swap verifier uses path 25 and a separate 1,693-byte V24
+statement. The previous 24 jet identities and costs are unchanged. Its native
+parser and callback tests do not establish a qualified swap guest or activation.
+
+The separate V8 custody verifier uses path 26 for the standalone exact ECX
+profile. It does not extend the frozen V24 economic statement or activate a
+deployment. Its source/proof qualification is recorded separately.

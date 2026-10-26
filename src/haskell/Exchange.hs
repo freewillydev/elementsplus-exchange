@@ -6,29 +6,33 @@ module Exchange where
 
 import Control.Operation.Validation
 import Control.Operation
-import Workflow (runRequiredEffects)
+import Workflow (NativeBytes, runRequiredEffects, countMatches)
 import CapabilityContext
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits ((.&.), testBit, setBit, popCount)
+import qualified ExchangeCustody as Custody
+import qualified ExchangeForcedV3 as Forced
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Char8 as C
 import Data.ByteString.Builder (byteString, toLazyByteString, word8, word8HexFixed, word32BE, word32LE, word64BE)
 import Withdrawal (readBE, readLE, wordBE)
+import qualified Withdrawal
 import Data.List (nub)
 import Control.Monad (foldM, forM, zipWithM, when, guard)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Data.Int (Int32, Int64)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import ParentReplay (transition, RequiredFactsFlow(..))
 import BmmConstants (bondRequiredArguments, bondGroupedArguments, exchangeIdentities, bondFixedSupply, capitalModes, oracleModes, forcedBodySizes, depositPayloadSize,
   forcedInclusionBlocks, maxCombinedUnconsumed, maxCombinedAppends, maxPendingWitnessEntries, maxTrancheWork,
-  groth16ProofLength, publicValuesV4Length, publicValuesV5Length, activationValuesLength, successorValuesLength, productionChainName, pegEventCountLimit, pegEventDefaultCount, bondExportBlockLimit, exchangeScriptCacheRevision)
+  groth16ProofLength, publicValuesV4Length, publicValuesV5Length, activationValuesLength, successorValuesLength, swapSuccessorValuesLength, productionChainName, pegEventCountLimit, pegEventDefaultCount, bondExportBlockLimit, exchangeScriptCacheRevision)
 
 groth16Layout :: Word32 -> Int -> Maybe (Word8,Word32)
 groth16Layout kind size = lookup (kind,size)
   [((0,435),(2,0)),((0,1044),(3,4)),((1,1044),(3,4)),
-   ((2,1285),(4,5)),((3,799),(5,1)),((4,2062),(6,23))]
+   ((2,1285),(4,5)),((3,799),(5,1)),((4,2062),(6,23)),((5,2128),(7,24)),((6,1226),(8,25))]
 
 data Groth16Envelope = Groth16Envelope Word32 B.ByteString (B.ByteString -> IO B.ByteString)
 instance Validation Groth16Envelope where
@@ -89,6 +93,15 @@ instance Validation Groth16Header where
 data CanonicalPublicValues = CanonicalPublicValues Word32 B.ByteString
 instance Validation CanonicalPublicValues where
   type ValidationResult CanonicalPublicValues = Bool
+  -- The fresh exact-ECX statement has no legacy bond/USDD projection.
+  validate (CanonicalPublicValues 25 bytes) = validate (Custody.CustodyValues bytes)
+  -- V24 is a fresh proof relation. Its capital projection retains the V23
+  -- offsets; only the new verifier accepts the additional bridge commitment.
+  validate (CanonicalPublicValues 24 bytes) =
+    B.length bytes==swapSuccessorValuesLength && B.take 4 bytes==B.pack [0,0,0,24] &&
+    validate (CanonicalPublicValues 23 (B.pack [0,0,0,23] <> B.take 1623 (B.drop 4 bytes))) &&
+    all (B.any (/=0) . (\offset -> B.take 32 (B.drop offset bytes))) [1627,1659] &&
+    B.index bytes 1691<=1 && B.index bytes 1692<=1
   validate (CanonicalPublicValues version bytes) =
     version `elem` [4,5,23] && B.length bytes==expectedSize &&
     number (if successor then 0 else 32) 4==toInteger version &&
@@ -581,7 +594,7 @@ data CapitalReportFlow = CapitalReportFlow Word32 Word32
 instance Validation CapitalReportFlow where
   type ValidationResult CapitalReportFlow = Int32
   validate (CapitalReportFlow phase result)
-    | phase == 4 = if result == 4 then 5 else 11
+    | phase == 4 = if result `elem` [4,5] then 5 else 11
     | phase == 7 = if result < fromIntegral (length capitalModes) then 8 else 11
     | phase == 8 = if result < fromIntegral (length oracleModes) then 9 else 11
     | phase == 9 = if result <= 1 then 10 else 11
@@ -783,6 +796,79 @@ instance Validation ExplicitCreationsFlow where
      (12,(16,13)),(13,(-11,14)),(14,(-11,15)),(15,(-1,12)),
      (16,(-10,17)),(17,(-11,18)),(18,(-11,19)),(19,(-1,16))]
 
+-- A snapshot of native predicates, not a new transaction encoding. The native
+-- transaction and all cryptographic operations remain owned by Elements.
+data TransactionView = TransactionView
+  { viewInputs :: [B.ByteString], viewOutputs :: [B.ByteString]
+  , viewOutputWitnesses :: B.ByteString, viewInputWitnesses :: B.ByteString }
+
+transactionView :: Word32 -> B.ByteString -> Maybe TransactionView
+transactionView mode bytes = do
+  guard (mode <= 3 && B.length bytes >= 32)
+  let counts = [toInteger (readLE (B.take 8 (B.drop offset bytes))) | offset <- [0,8,16,24]]
+      widths = if mode == 2 then [17,41,1,1] else [1,1,1,1]
+  guard (sum (zipWith (*) counts widths) == toInteger (B.length bytes - 32))
+  let split [] rest = [rest]
+      split (n:ns) rest = let (part,next) = B.splitAt (fromInteger n) rest in part : split ns next
+      records width part | B.null part = []
+                         | otherwise = B.take width part : records width (B.drop width part)
+  [inputs,outputs,outputWitnesses,inputWitnesses,_] <- pure (split (zipWith (*) counts widths) (B.drop 32 bytes))
+  let inputRows = records (if mode == 2 then 17 else 1) inputs
+      outputRows = records (if mode == 2 then 41 else 1) outputs
+  guard (all ((<128) . B.head) inputRows && all ((<32) . B.head) outputRows &&
+    B.all (<4) outputWitnesses && B.all (<4) inputWitnesses)
+  pure (TransactionView inputRows outputRows outputWitnesses inputWitnesses)
+
+ordinaryInputs :: TransactionView -> Bool
+ordinaryInputs = all (\row -> not (testBit (B.head row) 0) && testBit (B.head row) 1) . viewInputs
+
+explicitCreations :: TransactionView -> Bool
+explicitCreations view = all (\row -> B.head row .&. 7 == 7) (viewOutputs view) &&
+  all (\row -> let flags = B.head row in flags .&. 12 /= 0 && flags .&. 48 /= 0) (viewInputs view) &&
+  B.all (==3) (viewOutputWitnesses view) && B.all (==3) (viewInputWitnesses view)
+
+singleIssuance :: TransactionView -> Bool
+singleIssuance view = all (\row -> not (testBit (B.head row) 0)) (viewInputs view) &&
+  length (filter (\row -> not (testBit (B.head row) 1)) (viewInputs view)) == 1
+
+data TransactionAdmission
+  = OrdinaryInputs TransactionView
+  | ExplicitCreations TransactionView
+  | DeploymentInputs TransactionView Word64 Word64 Word64 Word64
+  | PublicBond TransactionView Word64 Word64 Word64 (IO B.ByteString)
+instance Validation TransactionAdmission where
+  type ValidationResult TransactionAdmission = IO Bool
+  validate (OrdinaryInputs view) = pure (ordinaryInputs view)
+  validate (ExplicitCreations view) = pure (explicitCreations view)
+  validate (DeploymentInputs view issuer inventory burn authority) = pure $
+    toInteger issuer < toInteger (length (viewInputs view)) &&
+    all (\i -> toInteger i < toInteger (length (viewOutputs view))) [inventory,burn,authority] &&
+    length (nub [inventory,burn,authority]) == 3 && singleIssuance view
+  validate (PublicBond view issuanceIndex inventoryIndex burnIndex derive)
+    | toInteger issuanceIndex >= toInteger (length inputs) ||
+      toInteger inventoryIndex >= toInteger (length outputs) ||
+      toInteger burnIndex >= toInteger (length outputs) || inventoryIndex == burnIndex = pure False
+    | not (explicitCreations view) || not (singleIssuance view) = pure False
+    | not (testBit (B.head issuance) 6) || not (testBit (B.head issuance) 3) ||
+      readLE (B.take 8 (B.drop 1 issuance)) /= bondFixedSupply ||
+      not (testBit (B.head issuance) 5) || readLE (B.drop 9 issuance) /= 1 = pure False
+    | otherwise = do
+        identities <- derive
+        let asset = B.take 32 identities; token = B.drop 32 identities
+            outputAsset = B.take 32 . B.drop 1
+            amount = readLE . B.drop 33
+        pure (B.length identities == 64 && B.any (/=0) asset && B.any (/=0) token && asset /= token &&
+          outputAsset inventory == asset && amount inventory == bondFixedSupply &&
+          not (testBit (B.head inventory) 3) && not (testBit (B.head inventory) 4) &&
+          outputAsset burn == token && amount burn == 1 && testBit (B.head burn) 4 &&
+          and [(outputAsset out /= asset || i == inventoryIndex) &&
+               (outputAsset out /= token || i == burnIndex) | (i,out) <- zip [0..] outputs])
+    where
+      inputs = viewInputs view; outputs = viewOutputs view
+      issuance = inputs !! fromIntegral issuanceIndex
+      inventory = outputs !! fromIntegral inventoryIndex
+      burn = outputs !! fromIntegral burnIndex
+
 data PublicIssuanceFlow = PublicIssuanceFlow Word32 Word32
 instance Validation PublicIssuanceFlow where
   type ValidationResult PublicIssuanceFlow = Int32
@@ -819,7 +905,7 @@ instance Validation SourcePredecessor where
   type ValidationResult SourcePredecessor = Either Int B.ByteString
   validate (SourcePredecessor [profile,proof,height,parent,_,_,_] input)
     | profile > 1 || B.length input /= 64 = Left (-1)
-    | (profile == 1 && proof /= 1) || height == 0 || parent == 0 ||
+    | (profile == 1 && proof `notElem` [1,2]) || height == 0 || parent == 0 ||
       B.all (==0) (B.take 32 input) || B.take 16 (B.drop 32 input) < B.drop 48 input = Left 1
     | profile == 0 && B.any (/=0) (B.take 8 (B.drop 32 input)) = Left 2
     | otherwise = Right (B.take 48 input)
@@ -1243,6 +1329,51 @@ instance Validation StateTransition where
         1 -> pure True
         _ -> fail "invalid state transition fact"
 
+-- One native boundary for authority admission, tracked-coin binding or a whole
+-- singleton transition. Keep native reads lazy and publish at the old boundary.
+data StateWorkflow = StateWorkflow Word32 Word64 (Word32 -> Word64 -> Word64 -> IO Word64)
+instance Validation StateWorkflow where
+  type ValidationResult StateWorkflow = IO Int32
+  validate (StateWorkflow kind count native)
+    | kind > 3 = pure (-1)
+    | kind < 2 = tagged 100 <$> authority (kind == 1) 0
+    | otherwise = do
+        rejected <- newIORef 0
+        let check successor index = do
+              code <- authority successor index
+              writeIORef rejected code
+              pure (code == 0)
+            tracked 1 = do
+              copied <- boolean 1 0 0
+              when (not copied) (fail "tracked output copy failed")
+              check False 0
+            tracked step = boolean (fromIntegral step) 0 0
+            transitionFact step index
+              | step == 1 || step == 8 = do
+                  inputs <- native step index 0
+                  matches <- countMatches inputs (\input -> do
+                    matches <- boolean (16+step) index input
+                    pure (if matches then 1 else 0))
+                  when (matches < 0) (fail "Haskell match scan failed")
+                  pure (fromIntegral matches)
+              | step == 6 = do
+                  accepted <- check True index
+                  pure (if accepted then 1 else 0)
+              | otherwise = native step index 0
+        code <- if kind == 2 then fromIntegral <$> validate (TransactionShape 24 tracked)
+                else validate (StateTransition count transitionFact)
+        failure <- readIORef rejected
+        pure $ if failure /= 0 then tagged 100 failure
+               else if kind == 2 then tagged 200 code else code
+    where
+      tagged :: Integral code => Int32 -> code -> Int32
+      tagged base code = if code == 0 then 0 else base + fromIntegral code
+      authority successor index = validate (Authority successor (\field -> boolean (64+fromIntegral field) index 0))
+      boolean step index item = native step index item >>= \value -> case value of
+        0 -> pure False
+        1 -> pure True
+        _ -> fail "invalid exchange state workflow fact"
+
 data IdentitySet = IdentitySet [B.ByteString] | AbsentIdentities [B.ByteString] | IsolatedIdentity [B.ByteString]
 instance Validation IdentitySet where
   type ValidationResult IdentitySet = Bool
@@ -1603,9 +1734,10 @@ instance IdentityBinding CapitalRequest where
 instance SnapshotProjection CapitalRequest where
   projectSnapshot (CapitalRequest _ Nothing) = Right B.empty
   projectSnapshot (CapitalRequest (CapitalIdentity profile program values _) (Just context))
-    | profile>1 || B.length context/=96 = Left (-1)
-    | otherwise = maybe (Left (-1)) Right $ validate (CapitalSnapshot profile 0 0
-        (B.take 32 context <> B.replicate 96 0 <> program <> B.drop 32 context <> B.replicate 96 0 <> values))
+    | profile `notElem` [0,1,3] || B.length context/=96 = Left (-1)
+    | otherwise = maybe (Left (-1)) Right $ validate (CapitalSnapshot (if profile==3 then 1 else profile) 0 0
+        (B.take 32 context <> B.replicate 96 0 <> program <> B.drop 32 context <> B.replicate 96 0 <>
+         (if profile==3 then B.take successorValuesLength values else values)))
 
 type CapitalCapabilities = '[IdentityBinding, SnapshotProjection]
 
@@ -1624,7 +1756,7 @@ data CapitalIdentity = CapitalIdentity Word32 B.ByteString B.ByteString B.ByteSt
 instance Validation CapitalIdentity where
   type ValidationResult CapitalIdentity = Int
   validate (CapitalIdentity profile program values expected)
-    | profile > 2 || B.length program /= 32 || B.length values /= size ||
+    | profile > 3 || B.length program /= 32 || B.length values /= size ||
         B.length expected /= 32 + sum (map snd fields) = -1
     | program <> B.concat [B.take width (B.drop offset values) | (offset,width) <- fields] == expected = 0
     | otherwise = 1
@@ -1632,14 +1764,25 @@ instance Validation CapitalIdentity where
       (size,fields) = case profile of
         0 -> (850,hashes [0,36,276,308])
         1 -> (1627,hashes [4,388,420,452,484,516])
-        _ -> (364,hashes [4,36,100,164,196,228] ++ [(324,8),(332,8)])
+        2 -> (364,hashes [4,36,100,164,196,228] ++ [(324,8),(332,8)])
+        _ -> (1693,hashes [4,388,420,452,484,516])
       hashes = map (\offset -> (offset,32))
 
 -- Pure context binding follows parsing/script admission; finite proofs do not
 -- bind a sidechain height. Native-owned snapshots/cursors are checked afterward.
 data SuccessorBinding = SuccessorBinding Bool B.ByteString B.ByteString [Word64]
+                      | SwapSuccessorBinding B.ByteString B.ByteString [Word64]
 instance Validation SuccessorBinding where
   type ValidationResult SuccessorBinding = Int
+  validate (SwapSuccessorBinding values hashes context)
+    | B.length values/=1693 || B.length hashes/=192 || length context/=4 = -1
+    | not (validate (CanonicalPublicValues 24 values)) ||
+      B.take 32 (B.drop 1627 values)/=B.take 32 (B.drop 128 hashes) ||
+      -- This proof consumes sources through the prior native header. Markers
+      -- in the current block are appended only after this transition boundary.
+      B.take 32 (B.drop 1252 values)/=B.drop 160 hashes ||
+      toInteger (B.index values 1691)/=toInteger (context !! 3) = 1
+    | otherwise = validate (SuccessorBinding True (B.take 1627 values) (B.take 128 hashes) (take 3 context))
   validate (SuccessorBinding incremental values hashes context)
     | B.length values /= (if incremental then 1627 else 850) ||
         B.length hashes /= 128 || length context /= 3 = -1
@@ -1667,6 +1810,61 @@ instance Validation EnvelopeHeader where
     | version /= 1 || size < 45 = 1
     | bodySize == 0 || bodySize > 100000 || size /= 45 + fromIntegral bodySize = 2
     | otherwise = 0
+
+data EnvelopeWorkflow = EnvelopeWorkflow Bool NativeBytes
+instance Validation EnvelopeWorkflow where
+  type ValidationResult EnvelopeWorkflow = IO Int32
+  validate (EnvelopeWorkflow inactive native)
+    | inactive = pure 0
+    | otherwise = either id (const 0) <$> runExceptT (do
+        count <- call 0 0 B.empty
+        when (B.null count) (throwE 1)
+        when (B.length count /= 8) (throwE (-1))
+        scan (readLE count) 0 Nothing)
+    where
+      call step index = liftIO . native step index
+      require step index bytes code = do
+        result <- call step index bytes
+        case B.unpack result of
+          [1] -> pure ()
+          [0] -> throwE code
+          _ -> throwE (-1)
+      scan count index found
+        | index == count = finish found
+        | otherwise = do
+            payload <- call 1 index B.empty
+            if B.length payload < 5 || B.take 4 payload /= C.pack "ECXM"
+              then scan count (index+1) found else do
+                case found of Just _ -> throwE 2; Nothing -> pure ()
+                let bodySize = if B.length payload >= 45 then fromIntegral (readLE (B.take 4 (B.drop 41 payload))) else 0
+                case validate (EnvelopeHeader (fromIntegral (B.length payload)) (B.index payload 4) bodySize) of
+                  1 -> throwE 3
+                  2 -> throwE 4
+                  0 -> pure ()
+                  _ -> throwE (-1)
+                require 2 index payload 5
+                scan count (index+1) (Just payload)
+      finish found = do
+        flags <- call 3 0 B.empty
+        bits <- case B.unpack flags of [value] | value <= 7 -> pure value; _ -> throwE (-1)
+        case validate (EnvelopeRequirement (testBit bits 0) (testBit bits 1) (testBit bits 2)
+            (case found of Nothing -> False; Just _ -> True)) of
+          Left code -> throwE (fromIntegral code+5)
+          Right False -> pure ()
+          Right True -> case found of
+            Nothing -> throwE (-1)
+            Just payload -> do
+              sequence_ [require step 0 payload code | (step,code) <- zip [4..11] [9,10,10,11,11,11,11,11]]
+              commitments <- case validate (M6Preimage (B.drop 45 payload)) of
+                Left code -> throwE (fromIntegral code+11)
+                Right bytes -> pure bytes
+              context <- call 12 0 B.empty
+              when (B.length context /= 96) (throwE (-1))
+              let input = B.take 4 (B.drop 5 payload) <> B.take 64 context <> B.take 32 commitments <> B.drop 64 context
+              anchor <- case execute (Withdrawal.WithdrawalRequest 0 input) Withdrawal.withdrawRules Withdrawal.StateAnchor of
+                Left _ -> throwE (-1)
+                Right bytes -> pure bytes
+              require 13 0 (B.drop 32 commitments <> anchor) 17
 
 newtype EnvelopeScan = EnvelopeScan (Word32 -> IO Int32)
 instance Validation EnvelopeScan where
@@ -1912,6 +2110,90 @@ instance Validation ForcedBody where
       bytes offset count = B.take count (B.drop offset body)
       word offset = readBE (bytes offset 8)
       validMarket = bytes 33 16 == market
+
+class ForcedOutputFacts op where
+  forcedOutputFact :: op -> Word32 -> IO Bool
+  forcedOutputFrame :: op -> IO (Maybe B.ByteString)
+  forcedOutputParent :: op -> IO Word64
+
+class ForcedAuthentication op where
+  authenticateForcedPayload :: op -> B.ByteString -> IO (Maybe B.ByteString)
+
+class ForcedOutputEffects op where
+  rejectForcedOutput :: op -> String -> IO ()
+  publishForcedOutput :: op -> B.ByteString -> B.ByteString -> IO ()
+
+-- Only the native canonical signature verifier supplies metadata. Framing or
+-- an admission lifetime alone cannot construct an authenticated action.
+checkForcedOutput :: (ForcedOutputFacts op, ForcedAuthentication op, ForcedOutputEffects op)
+  => Bool -> op -> IO (Maybe (B.ByteString,B.ByteString))
+checkForcedOutput admission value = either (const Nothing) Just <$> runExceptT (do
+  let require action message = liftIO action >>= \ok ->
+        if ok then pure () else reject message
+      reject :: String -> ExceptT () IO a
+      reject message = liftIO (rejectForcedOutput value message) >> throwE ()
+      need action message = liftIO action >>= maybe (reject message) pure
+  require (forcedOutputFact value 0) "Exact forced admission backend is unavailable"
+  require (forcedOutputFact value 1) "Exact forced output index is invalid"
+  require ((==0) <$> validate (OutputProfile False (forcedOutputFact value . (+2) . fromIntegral)))
+    "Exact forced output has a noncanonical asset/value/witness"
+  payload <- need (forcedOutputFrame value) "Exact forced marker framing or economic domain is invalid"
+  metadata <- need (authenticateForcedPayload value payload) "Exact forced canonical codec or signature rejected"
+  when admission $ do
+    parent <- liftIO (forcedOutputParent value)
+    require (pure (validate (Forced.ForcedV3Admission parent (B.index payload 5) metadata)))
+      "Exact forced request is outside its admission lifetime"
+  pure (payload,metadata))
+
+newtype ForcedOutputSession = ForcedOutputSession NativeBytes
+
+forcedOutputRead :: ForcedOutputSession -> Word32 -> B.ByteString -> IO B.ByteString
+forcedOutputRead (ForcedOutputSession native) step = native step 0
+
+instance ForcedOutputFacts ForcedOutputSession where
+  forcedOutputFact value step = forcedOutputRead value step B.empty >>= \bytes -> case B.unpack bytes of
+    [0] -> pure False
+    [1] -> pure True
+    _ -> ioError (userError "invalid forced output fact")
+  forcedOutputFrame value = do
+    pin <- forcedOutputRead value 8 B.empty
+    when (B.length pin/=32) (ioError (userError "invalid forced economic hash length"))
+    script <- forcedOutputRead value 9 B.empty
+    pure (validate (Forced.ForcedV3Frame pin script))
+  forcedOutputParent value = do
+    bytes <- forcedOutputRead value 11 B.empty
+    if B.length bytes==8 then pure (fromIntegral (readLE bytes))
+      else ioError (userError "invalid forced parent height length")
+
+instance ForcedAuthentication ForcedOutputSession where
+  authenticateForcedPayload value payload = do
+    bytes <- forcedOutputRead value 10 payload
+    if bytes==B.singleton 0 then pure Nothing
+      else if B.length bytes==51 && B.head bytes==1 then pure (Just (B.tail bytes))
+      else ioError (userError "invalid forced signature verifier reply")
+
+instance ForcedOutputEffects ForcedOutputSession where
+  rejectForcedOutput value = forcedOutputEffect value 13 . C.pack
+  publishForcedOutput value payload metadata = forcedOutputEffect value 12 (payload<>metadata)
+
+forcedOutputEffect :: ForcedOutputSession -> Word32 -> B.ByteString -> IO ()
+forcedOutputEffect value step bytes = do
+  reply <- forcedOutputRead value step bytes
+  when (reply/=B.singleton 1) (ioError (userError "forced output effect failed"))
+
+type ForcedOutputCapabilities = '[ForcedOutputFacts, ForcedAuthentication, ForcedOutputEffects]
+instance Operation ForcedOutputSession ForcedOutputCapabilities where
+  type Context ForcedOutputSession = CapabilityContext ForcedOutputCapabilities ForcedOutputSession
+  type Outcome ForcedOutputSession = IO Bool
+  data DSL ForcedOutputSession where
+    CheckForcedOutput :: Context ForcedOutputSession => DSL ForcedOutputSession
+    AdmitForcedOutput :: Context ForcedOutputSession => DSL ForcedOutputSession
+  interpret operation request = withOperation @ForcedOutputSession operation $ \value -> case request of
+    CheckForcedOutput -> Just (finish False value)
+    AdmitForcedOutput -> Just (finish True value)
+    where
+      finish admission value = checkForcedOutput admission value >>= maybe (pure False)
+        (\(payload,metadata) -> publishForcedOutput value payload metadata >> pure True)
 
 -- Reader steps: explicit asset/value, null nonce, same asset/value, P2TR size/opcodes.
 data Admission = Authority Bool (Int -> IO Bool) | OutputProfile Bool (Int -> IO Bool)

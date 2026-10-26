@@ -101,12 +101,14 @@ depositAddressLimit = 128
 ownedAnnexLimit :: Word32
 ownedAnnexLimit = 1310720
 
-groth16ProofLength, publicValuesV4Length, publicValuesV5Length, activationValuesLength, successorValuesLength :: Int
+groth16ProofLength, publicValuesV4Length, publicValuesV5Length, activationValuesLength, successorValuesLength, swapSuccessorValuesLength, custodySuccessorValuesLength :: Int
 groth16ProofLength = 356
 publicValuesV4Length = 609
 publicValuesV5Length = 850
 activationValuesLength = 364
 successorValuesLength = 1627
+swapSuccessorValuesLength = 1693
+custodySuccessorValuesLength = 791
 
 simplicityLengths :: [(String, Int)]
 simplicityLengths =
@@ -114,7 +116,9 @@ simplicityLengths =
    ("ECX_SP1_PUBLIC_VALUES_V4_LEN",publicValuesV4Length),
    ("ECX_SP1_PUBLIC_VALUES_V5_LEN",publicValuesV5Length),
    ("ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN",activationValuesLength),
-   ("ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN",successorValuesLength)]
+   ("ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN",successorValuesLength),
+   ("ECX_SP1_SWAP_SUCCESSOR_PUBLIC_VALUES_LEN",swapSuccessorValuesLength),
+   ("ECX_SP1_CUSTODY_SUCCESSOR_PUBLIC_VALUES_LEN",custodySuccessorValuesLength)]
 
 simplicityHeader :: String
 simplicityHeader = unlines $
@@ -489,13 +493,13 @@ exchangeIdentities =
      0x2d,0x9b,0x69,0xa3,0xe7,0x83,0xe0,0xa2,0xe1,0xcc,0xa3,0x5f,0xa4,0x87,0x2e,0x6f])]
 
 exchangeScriptCacheRevision :: Word64
-exchangeScriptCacheRevision = 12
+exchangeScriptCacheRevision = 14
 
 exchangeInterfaceConstants :: [(String,String,Word64)]
 exchangeInterfaceConstants =
   [("uint8_t","EXCHANGE_STATE_INTERFACE_VERSION",1),
    ("uint16_t","EXCHANGE_SCRIPT_CACHE_REVISION",exchangeScriptCacheRevision),
-   ("uint32_t","ECX_CONSENSUS_RULESET_REVISION",6),
+   ("uint32_t","ECX_CONSENSUS_RULESET_REVISION",8),
    ("uint32_t","DEFAULT_BOND_DEPLOYMENT_VERSION",2),
    ("int","DISABLED_EXCHANGE_ACTIVATION_HEIGHT",2147483647),
    ("bool","BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN",1)]
@@ -583,6 +587,10 @@ exchangeHeader
 withdrawalHeaderBit :: Int
 withdrawalHeaderBit = 30
 
+-- This bit has meaning only in the separately selected fresh swap wire mode.
+swapForcedHeaderBit :: Int
+swapForcedHeaderBit = 14
+
 headerExtensionBits :: [Int]
 headerExtensionBits = [20,19..16]
 
@@ -633,8 +641,8 @@ header = unlines $ ["// Generated from BmmConstants.hs; do not edit.",
       ("int64_t","BMM_TARGET_SPACING",targetSpacing),
       ("bool","BMM_REQUIRE_SIGNET_SOLUTION",requireSignet)] ++ replayConstants ++ exchangeInterfaceConstants] ++
   ["static constexpr uint32_t " ++ name ++ "_HF_MASK{" ++ show (2 ^ bit :: Word64) ++ "};" |
-    (name,bit) <- zip ["WITHDRAWAL_BUNDLE","BMM_PROOF","EXCHANGE_STATE","FORCED_INBOX","DEPOSIT_INBOX","INBOX_CURSOR"]
-      (withdrawalHeaderBit : headerExtensionBits)] ++
+    (name,bit) <- zip ["WITHDRAWAL_BUNDLE","BMM_PROOF","EXCHANGE_STATE","FORCED_INBOX","DEPOSIT_INBOX","INBOX_CURSOR","SWAP_FORCED_STATE"]
+      (withdrawalHeaderBit : headerExtensionBits ++ [swapForcedHeaderBit])] ++
   ["static constexpr size_t PARENT_HASH_HEX_LENGTH{" ++ show parentHashHexLength ++ "};",
    "static constexpr int64_t PARENT_RECOVERY_SECONDS{" ++ show parentRecoverySeconds ++ "};"] ++
   ["inline constexpr char DRIVECHAIN_GRPC_ENDPOINT[]{" ++ show grpcEndpoint ++ "};",

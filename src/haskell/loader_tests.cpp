@@ -32,14 +32,16 @@ int main(int argc, char** argv)
                 if (!library) { ok = false; return; }
                 auto initialize = reinterpret_cast<void (*)()>(dlsym(library, "elements_hs_runtime_init"));
                 using Domain = int32_t (*)(uint32_t,uint32_t,uint64_t*,uint32_t,void**,uint32_t,void (**)(),uint64_t*);
-                auto depth = reinterpret_cast<Domain>(dlsym(library, "elements_hs_deposit_evidence_api_v1"));
-                if (!initialize || !depth || dlsym(library, "elements_hs_deposit_depth_v1")) ok = false;
+                auto depth = reinterpret_cast<Domain>(dlsym(library, "elements_hs_peg_api_v2"));
+                if (!initialize || !depth || dlsym(library, "elements_hs_deposit_depth_v1") ||
+                    dlsym(library, "elements_hs_deposit_evidence_api_v1")) ok = false;
                 else {
                     initialize();
                     uint64_t args[]{100,105,6}, result{};
-                    if (depth(8,3,args,0,nullptr,0,nullptr,&result) != 0 || result != 1) ok = false;
+                    constexpr uint32_t DEPTH_OPERATION = (2U << 16) | 8U;
+                    if (depth(DEPTH_OPERATION,3,args,0,nullptr,0,nullptr,&result) != 0 || result != 1) ok = false;
                     args[1] = 104;
-                    if (depth(8,3,args,0,nullptr,0,nullptr,&result) != 0 || result != 0) ok = false;
+                    if (depth(DEPTH_OPERATION,3,args,0,nullptr,0,nullptr,&result) != 0 || result != 0) ok = false;
                 }
                 if (dlclose(library) != 0) ok = false;
             }

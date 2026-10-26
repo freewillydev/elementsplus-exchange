@@ -37,7 +37,8 @@ main = do
         , classifyBondInput = \candidate role -> candidate == index && role == InsuranceReserveInput
         , verifySp1Groth16Sha256 = \variant programId publicValuesHash ->
             variant `elem` [Groth16V4PublicValuesV5Sha256, Groth16V5IncrementalActivationSha256,
-                           Groth16V6IncrementalSuccessorSha256]
+                           Groth16V6IncrementalSuccessorSha256, Groth16V7SwapSuccessorSha256,
+                           Groth16V8CustodySuccessorSha256]
               && programId == one && publicValuesHash == two
         }
 
@@ -104,6 +105,36 @@ main = do
   expect "unavailable verifier is a false bit, not evaluator failure" $
     ecxPrimSem VerifySp1Groth16Sha256 (one, two) emptyEcxEnv == Just (toBit False)
 
+  expect "swap successor verifier callback mismatch" $
+    ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (one, two) env == Just (toBit True)
+  expect "swap successor verifier requires the exact program" $
+    ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (three, two) env == Just (toBit False)
+  expect "swap successor verifier requires the exact public values digest" $
+    ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (one, three) env == Just (toBit False)
+  expect "swap successor verifier cannot reuse an activation-only backend" $
+    ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (one, two)
+      (env { verifySp1Groth16Sha256 = \variant _ _ -> variant == Groth16V5IncrementalActivationSha256 })
+        == Just (toBit False)
+  expect "swap successor verifier is false when unavailable" $
+    ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (one, two) emptyEcxEnv == Just (toBit False)
+  expect "unavailable verifier is a false bit, not evaluator failure" $
+    ecxPrimSem VerifySp1Groth16Sha256 (one, two) emptyEcxEnv == Just (toBit False)
+
+  expect "custody successor verifier callback mismatch" $
+    ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (one, two) env == Just (toBit True)
+  expect "custody successor verifier requires the exact program" $
+    ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (three, two) env == Just (toBit False)
+  expect "custody successor verifier requires the exact public values digest" $
+    ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (one, three) env == Just (toBit False)
+  expect "custody successor verifier cannot reuse an activation-only backend" $
+    ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (one, two)
+      (env { verifySp1Groth16Sha256 = \variant _ _ -> variant == Groth16V5IncrementalActivationSha256 })
+        == Just (toBit False)
+  expect "custody successor verifier is false when unavailable" $
+    ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (one, two) emptyEcxEnv == Just (toBit False)
+  expect "unavailable verifier is a false bit, not evaluator failure" $
+    ecxPrimSem VerifySp1Groth16Sha256 (one, two) emptyEcxEnv == Just (toBit False)
+
   let zeroHashEnv = env { priorActiveExchangeStateRoot = Just (toWord256 0) }
       zeroParentEnv = env { authenticatedBmmParent = Just (EcxBmmParent one (toWord64 0) mtp) }
       zeroIdentityEnv = env { activatedBondIdentity = Just (EcxBondIdentity (toWord256 0) three four five six one) }
@@ -146,4 +177,4 @@ main = do
     ecxPrimName VerifySp1Groth16V6IncrementalSuccessorSha256 ==
       "verify_sp1_groth16_v6_incremental_successor_sha256"
 
-  putStrLn "ECX typed Haskell primitive candidate: 44 checks PASS"
+  putStrLn "ECX typed Haskell primitive candidate: 56 checks PASS"

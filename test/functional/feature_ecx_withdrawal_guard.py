@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Elements Core developers
 # Distributed under the MIT software license.
-"""Reject a drivechain withdrawal without finalized ECX state before mutation."""
+"""Reject retired ECX burn-and-submit withdrawals before mutation."""
 
 from pathlib import Path
 import shutil
@@ -55,8 +55,8 @@ class EcxWithdrawalGuardTest(FedPegTest):
         balance_before = sidechain.getbalances()
         mempool_before = sidechain.getrawmempool()
         assert_raises_rpc_error(
-            -4,
-            "Cannot withdraw before a finalized ECX state header is active",
+            -32601,
+            "no funds were burned",
             sidechain.sendtomainchain,
             destination,
             1,

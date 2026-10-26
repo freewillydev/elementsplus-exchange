@@ -47,6 +47,8 @@ INTERFACES = (
     ("incremental_successor_transition_cmr_required", "1", "h"),
     ("verify_sp1_groth16_v5_incremental_activation_sha256", "*hh", "2"),
     ("verify_sp1_groth16_v6_incremental_successor_sha256", "*hh", "2"),
+    ("verify_sp1_groth16_v7_swap_successor_sha256", "*hh", "2"),
+    ("verify_sp1_groth16_v8_custody_successor_sha256", "*hh", "2"),
 )
 TYPE_INDEX = {"1": "ty_u", "2": "ty_b", "i": "ty_w32",
               "l": "ty_w64", "h": "ty_w256", "*hh": "ty_w512"}
@@ -127,7 +129,7 @@ def load_rows(path: Path = HERE / "jet-identities.tsv") -> list[dict]:
         reader = csv.DictReader(handle, delimiter="\t")
         require(reader.fieldnames == FIELDS, "unexpected TSV columns")
         rows = list(reader)
-    require(len(rows) == len(INTERFACES), "exactly 24 interfaces required")
+    require(len(rows) == len(INTERFACES), "exactly 26 interfaces required")
     roots = type_roots()
     for index, (row, (name, source, target)) in enumerate(zip(rows, INTERFACES), 1):
         require(row["index"] == str(index) and row["name"] == name, f"wrong interface at {index}")
@@ -149,7 +151,7 @@ def load_rows(path: Path = HERE / "jet-identities.tsv") -> list[dict]:
                    source_type_index=TYPE_INDEX[source], target_type_index=TYPE_INDEX[target],
                    enum_name="ECX_" + name.upper(), c_jet_symbol="simplicity_" + name)
     for field in ("name", "cmr", "imr", "encoding_bits"):
-        require(len({row[field] for row in rows}) == 24, f"duplicate {field}")
+        require(len({row[field] for row in rows}) == len(INTERFACES), f"duplicate {field}")
     require(not any(a["encoding_bits"].startswith(b["encoding_bits"])
                     for a in rows for b in rows if a is not b), "non-prefix-free encodings")
     return rows
@@ -200,7 +202,7 @@ def render(rows: list[dict]) -> dict[Path, str]:
     target = REPO / "src/simplicity/elements"
     outputs = {
         target / "ecxPrimitiveEnumJet.inc": banner + "".join(row["enum_name"] + ",\n" for row in rows),
-        target / "ecxPrimitiveEnumTy.inc": banner + "/* All 24 interfaces use existing native types, including ty_w512. */\n",
+        target / "ecxPrimitiveEnumTy.inc": banner + "/* All 26 interfaces use existing native types, including ty_w512. */\n",
         target / "ecxPrimitiveInitTy.inc": banner + "/* No additional unification variables are necessary. */\n",
         target / "ecxElementsJets.h.inc": banner + "".join(
             f"bool {row['c_jet_symbol']}(frameItem* dst, frameItem src, const txEnv* env);\n" for row in rows),
@@ -233,7 +235,7 @@ def render(rows: list[dict]) -> dict[Path, str]:
         "production_benchmark_reviewed": False,
         "cost_basis": {"kind": "user-selected-policy", "context_milliweight": CONTEXT_COST,
                        "proof_milliweight": PROOF_COST,
-                       "note": "Historical WSL diagnostics are separate evidence, not measurements of these policy values or of all 24 current jets."},
+                       "note": "Historical WSL diagnostics are separate evidence, not measurements of these policy values or of all 26 current jets."},
         "input_sha256": {name: hashlib.sha256((HERE / name).read_bytes()).hexdigest() for name in inputs},
         "decoder_policy": {"haskell_prefix": "11", "c_and_rust_prefix": "1", "elements_branch": 5,
                            "native_catalogue_unchanged": True, "first_path_index": 1},
@@ -259,9 +261,9 @@ def main() -> int:
                 path.write_text(content, encoding="ascii")
             else:
                 require(path.read_bytes() == content.encode("ascii"), f"stale generated file: {path.relative_to(REPO)}")
-        print("PASS: 24 independently recomputed typed identities, policy costs, encodings, and exact generated files")
+        print("PASS: 26 independently recomputed typed identities, policy costs, encodings, and exact generated files")
         if args.upstream_generated:
-            print("PASS: pinned upstream C and Rust generator outputs agree for all 24 jets")
+            print("PASS: pinned upstream C and Rust generator outputs agree for all 26 jets")
         print("Live activation and paid proving remain separately gated.")
         return 0
     except (ValueError, OSError, KeyError, IndexError) as exc:

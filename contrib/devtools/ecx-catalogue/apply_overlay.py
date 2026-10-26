@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the pinned 24-interface Alpha catalogue overlay with POLICY costs.
+"""Apply the pinned 26-interface Alpha catalogue overlay with POLICY costs.
 
 The 1,000 / 1,000,000,000 milliweight values are configured policy values,
 not measurements. This derives candidate identities without certifying
@@ -8,7 +8,7 @@ benchmark provenance, production review, or activation readiness.
 Based on the source-workflow overlay with SHA-256:
 3f32e3cb7e02c6375c6d49b0135f014f7be155208237100c682df92ca5796b3a.
 Its old 23-interface source pin/catalogue/encoder were stale; this version
-pins and includes the actual 24-interface typed source.
+pins and includes the actual 26-interface typed source.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ PREIMAGES = {
     "Simplicity.cabal":
         "93ee38c472beefcde66b364d2ffa1c6673d9eaad71815eadffac3fb210e4cb87",
 }
-CANDIDATE_SHA256 = "c92269809eb58fc035652fbe2907354fc97e7c4c329209b5d18659bb8b1e6460"
+CANDIDATE_SHA256 = "a81869482aaf8edd2e60c3289159de6d46f947d536714f7e9712dbc493166840"
 CONTEXT_POLICY_MILLIWEIGHT = 1_000
 PROOF_POLICY_MILLIWEIGHT = 1_000_000_000
 PROOF_CONSTRUCTORS = (
@@ -38,6 +38,8 @@ PROOF_CONSTRUCTORS = (
     "VerifySp1Groth16V4PublicValuesV5Sha256",
     "VerifySp1Groth16V5IncrementalActivationSha256",
     "VerifySp1Groth16V6IncrementalSuccessorSha256",
+    "VerifySp1Groth16V7SwapSuccessorSha256",
+    "VerifySp1Groth16V8CustodySuccessorSha256",
 )
 
 
@@ -211,6 +213,8 @@ def apply(upstream: Path, candidate_source: Path) -> dict[str, str]:
         "  , SomeArrow Ecx.IncrementalSuccessorTransitionCmrRequired\n"
         "  , SomeArrow Ecx.VerifySp1Groth16V5IncrementalActivationSha256\n"
         "  , SomeArrow Ecx.VerifySp1Groth16V6IncrementalSuccessorSha256\n"
+        "  , SomeArrow Ecx.VerifySp1Groth16V7SwapSuccessorSha256\n"
+        "  , SomeArrow Ecx.VerifySp1Groth16V8CustodySuccessorSha256\n"
         "  ]\n"
         "sigHashCatalogue = book\n",
         "Jets catalogue",
@@ -257,7 +261,9 @@ def apply(upstream: Path, candidate_source: Path) -> dict[str, str]:
         "putJetBitEcx Ecx.BondV2IncrementalActivationCmrRequired = putPositive 21\n"
         "putJetBitEcx Ecx.IncrementalSuccessorTransitionCmrRequired = putPositive 22\n"
         "putJetBitEcx Ecx.VerifySp1Groth16V5IncrementalActivationSha256 = putPositive 23\n"
-        "putJetBitEcx Ecx.VerifySp1Groth16V6IncrementalSuccessorSha256 = putPositive 24\n\n"
+        "putJetBitEcx Ecx.VerifySp1Groth16V6IncrementalSuccessorSha256 = putPositive 24\n"
+        "putJetBitEcx Ecx.VerifySp1Groth16V7SwapSuccessorSha256 = putPositive 25\n"
+        "putJetBitEcx Ecx.VerifySp1Groth16V8CustodySuccessorSha256 = putPositive 26\n\n"
         "putJetBitSigHash :: SigHashJet a b -> DList Bool\n",
         "Jets encoder",
     )
@@ -303,7 +309,7 @@ def main() -> int:
         return 1
     for path, digest in sorted(outputs.items()):
         print(f"{digest}  {path}")
-    print("ECX 24-interface Haskell overlay: APPLIED; POLICY COSTS, NOT MEASUREMENTS; UNFROZEN")
+    print("ECX 26-interface Haskell overlay: APPLIED; POLICY COSTS, NOT MEASUREMENTS; UNFROZEN")
     return 0
 
 

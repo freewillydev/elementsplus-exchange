@@ -12,12 +12,38 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 class CDBWrapper;
+
+using DrivechainReplayEffects = std::function<std::vector<unsigned char>(
+    uint32_t, uint64_t, std::span<const unsigned char>)>;
+
+// The session owns replay temporaries; referenced block/state/output objects
+// must outlive it. Parameters and completion use effects 20480 and 20481.
+DrivechainReplayEffects MakeDrivechainParentBlockEffects(
+    const Sidechain::Bitcoin::CBlock& block,
+    const uint32_t height,
+    const int sidechain_slot,
+    const uint256& required_active_proposal,
+    const uint16_t unused_slot_proposal_max_age,
+    const uint16_t unused_slot_activation_threshold,
+    const uint16_t used_slot_proposal_max_age,
+    const uint16_t used_slot_activation_threshold,
+    const uint16_t withdrawal_bundle_max_age,
+    const uint16_t withdrawal_bundle_inclusion_threshold,
+    DrivechainParentReplayState& state,
+    std::vector<DrivechainMintableDeposit>* deposits,
+    std::string* error,
+    std::vector<DrivechainSuccessfulWithdrawal>* successful_withdrawals,
+    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals,
+    drivechain::TreasuryOpcode treasury_opcode,
+    DrivechainM6ReplayRule m6_rule);
 
 /** Persistent tip of the authenticated parent replay. */
 struct DrivechainParentReplayTip {
@@ -62,6 +88,25 @@ public:
     DrivechainParentReplayStore(const DrivechainParentReplayStore&) = delete;
     DrivechainParentReplayStore& operator=(const DrivechainParentReplayStore&) = delete;
 
+    // Native effects for direct Haskell composition. The store and referenced
+    // inputs/outputs must outlive the session, under the existing replay lock.
+    DrivechainReplayEffects LoadEffects(const uint256& identity,
+        DrivechainParentReplayTip& tip, std::string* error) const;
+    DrivechainReplayEffects DepositEffects(const Sidechain::Bitcoin::COutPoint& outpoint,
+        DrivechainMintableDeposit& deposit, std::string* error) const;
+    DrivechainReplayEffects ListDepositEffects(const std::optional<Sidechain::Bitcoin::COutPoint>& after,
+        size_t limit, std::vector<DrivechainMintableDeposit>& deposits,
+        std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error) const;
+    DrivechainReplayEffects ResetEffects(const uint256& identity,
+        const DrivechainParentReplayTip& seed, std::string* error);
+    DrivechainReplayEffects AppendEffects(const DrivechainParentReplayTip& previous,
+        const DrivechainParentReplayTip& next,
+        const std::vector<DrivechainMintableDeposit>& deposits,
+        const std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>>& edge,
+        const std::vector<DrivechainSuccessfulWithdrawal>& successful_withdrawals,
+        const std::vector<DrivechainWithdrawalProposalIdentity>& withdrawal_proposals,
+        std::string* error);
+
     DrivechainReplayStoreLoadStatus Load(const uint256& identity,
                                          DrivechainParentReplayTip& tip,
                                          std::string* error) const;
@@ -105,6 +150,11 @@ public:
         const Sidechain::Bitcoin::COutPoint& outpoint,
         DrivechainMintableDeposit& deposit,
         std::string* error) const;
+
+    /** Bounded discovery only; callers must still authenticate depth and active-chain membership. */
+    bool ListDeposits(const std::optional<Sidechain::Bitcoin::COutPoint>& after,
+        size_t limit, std::vector<DrivechainMintableDeposit>& deposits,
+        std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error) const;
 
     DrivechainReplayStoreReadStatus ReadBmmEdge(
         const uint256& parent_hash,

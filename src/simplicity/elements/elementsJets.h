@@ -76,6 +76,8 @@ bool simplicity_verify_sp1_groth16_v3_public_values_v4_sha256(frameItem* dst, fr
 bool simplicity_verify_sp1_groth16_v4_public_values_v5_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_groth16_v7_swap_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_groth16_v8_custody_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
 #endif
 bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);

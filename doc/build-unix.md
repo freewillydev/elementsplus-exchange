@@ -10,6 +10,9 @@ To Build
 This fork additionally requires the [Haskell toolchain](#haskell-toolchain)
 below. Set it up before running `cabal update` or CMake; Ubuntu's distro Cabal
 may be too old. These requirements supplement the upstream dependencies below.
+External verifier archives also require independently trusted SHA-256 pins;
+see [verifier build integrity](verifier-build-integrity.md). An archive path
+alone is no longer sufficient, including when reconfiguring an existing build.
 
 ```bash
 cmake -B build
@@ -38,7 +41,7 @@ official bindist. The node also needs Rust/Cargo, gRPC C-core and protobuf
 development libraries. For Ubuntu, in addition to the dependencies below:
 
 ```bash
-sudo apt-get install curl ca-certificates xz-utils patch libgrpc-dev libprotobuf-dev protobuf-compiler patchelf
+sudo apt-get install curl ca-certificates xz-utils patch libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler patchelf
 ```
 
 For **Ubuntu 24.04 x86-64 only**, this bootstraps Cabal without relying on a

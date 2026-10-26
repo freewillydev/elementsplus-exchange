@@ -67,8 +67,8 @@ static bool hash_eq(const sha256_midstate* a, const sha256_midstate* b) {
 }
 
 static void test_decoder(void) {
-  CHECK(sizeof(vectors) / sizeof(*vectors) == 24);
-  for (size_t i = 0; i < 24; ++i) {
+  CHECK(sizeof(vectors) / sizeof(*vectors) == 26);
+  for (size_t i = 0; i < 26; ++i) {
     const vector* v = &vectors[i];
     dag_node node = {0};
 #ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
@@ -106,7 +106,7 @@ static void test_decoder(void) {
     CHECK(decode(&node, v->bits, strlen(v->bits)) == SIMPLICITY_ERR_DATA_OUT_OF_RANGE);
 #endif
   }
-  for (uint32_t index = 25; index <= 256; ++index) {
+  for (uint32_t index = 27; index <= 256; ++index) {
     dag_node node;
     CHECK(decode_path(&node, 5, index) == SIMPLICITY_ERR_DATA_OUT_OF_RANGE);
   }
@@ -168,7 +168,7 @@ static void test_runtime(void) {
   /* These values also appear in the typed Haskell semantics tests. */
   const uint32_t expected[] = {1, 2, 3, 0, 9, 1, 77, 88, 2, 3, 4, 5,
                              0, 0, 0, 6, 0, 77, 0, 0, 6, 1, 0, 0};
-  for (size_t i = 0; i < 24; ++i) {
+  for (size_t i = 0; i < 26; ++i) {
     const vector* v = &vectors[i];
     UWORD source[ROUND_UWORD(512)] = {0}, output[ROUND_UWORD(256)] = {0};
     frameItem dst = initWriteFrame(v->target_bits, output + ROUND_UWORD(v->target_bits));
@@ -200,7 +200,7 @@ static void test_runtime(void) {
     dst = initWriteFrame(v->target_bits, output + ROUND_UWORD(v->target_bits));
     CHECK(v->jet(&dst, src, &env));
     frameItem result = initReadFrame(v->target_bits, output);
-    if (v->target_bits == 256) {
+    if (v->target_bits == 266) {
       for (size_t word = 0; word < 7; ++word) CHECK(simplicity_read32(&result) == 0);
       CHECK(simplicity_read32(&result) == expected[i]);
     } else if (v->target_bits == 64) {
@@ -226,9 +226,9 @@ int main(void) {
   test_decoder();
   test_runtime();
 #ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
-  printf("PASS: %zu C checks; all 24 catalogue identities/types/costs/encodings, truncations, runtime frames and fail-closed cases\n", checks);
+  printf("PASS: %zu C checks; all 26 catalogue identities/types/costs/encodings, truncations, runtime frames and fail-closed cases\n", checks);
 #else
-  printf("PASS: %zu C checks; default decoder rejects all 24 ECX encodings; native/runtime checks preserved\n", checks);
+  printf("PASS: %zu C checks; default decoder rejects all 26 ECX encodings; native/runtime checks preserved\n", checks);
 #endif
   return 0;
 }

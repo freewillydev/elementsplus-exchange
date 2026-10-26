@@ -2,6 +2,12 @@
 
 Status: implemented and configured in the current native network identity.
 
+The October 25 Ethereum-mainnet program inputs are recorded in
+[`contrib/release/usdd-mainnet-programs-20261025.json`](../contrib/release/usdd-mainnet-programs-20261025.json).
+This is a build/proof catalogue, **not** a controller activation manifest or a
+new consensus allowlist. See [mainnet qualification](usdd-mainnet-qualification.md)
+for the completed inner proof, exact import procedure and remaining release gates.
+
 The C jet in `src/simplicity/elements/elementsJets.c` invokes the linked Rust
 `usdd_sp1_verify_annex` ABI. Native startup checks the verifier ABI and frozen
 semantic identity and rejects a missing/mismatched library. Envelope parsing
@@ -110,8 +116,13 @@ Before describing a release as production-ready, retain evidence of:
 
 ## Frozen activation
 
-The current identity pins the jet, Ethereum guest program, SP1 6.3.1 verifier
-semantics and resource schedule. V11 commits a parameterized controller family;
+The historical genesis transcript pins the jet, Ethereum guest program,
+original SP1 6.3.1 verifier semantics and resource schedule. The current release
+separately requires the patched SP1 6.8.1 runtime semantic identity in
+`usdd_sp1_verifier_identity.h`; it does not admit the old implementation.
+Preserving historical genesis bytes is not permission to run a vulnerable
+verifier. See [mainnet qualification](usdd-mainnet-qualification.md) for the
+upgrade's evidence and deployment scope. V11 commits a parameterized controller family;
 the executed configuration-bound leaf authenticates concrete controller and
 deployment identities. It is not a mutable host allowlist. The controller
 must require the verifier jet's true result, not merely successful envelope

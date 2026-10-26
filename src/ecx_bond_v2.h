@@ -16,6 +16,7 @@
 namespace ecx {
 
 static constexpr uint16_t BOND_V2_CAPITAL_SNAPSHOT_VERSION{4};
+static constexpr uint16_t SWAP_CAPITAL_SNAPSHOT_VERSION{5};
 
 /** Serialize fixed public integers without a length prefix. */
 struct FixedByteArrayFormatter
@@ -110,7 +111,7 @@ struct BigEndianUint128
 struct BondV2CapitalSnapshot
 {
     uint16_t version{BOND_V2_CAPITAL_SNAPSHOT_VERSION};
-    /** 0 = finite PublicValuesV5, 1 = incremental successor public values. */
+    /** 0 = finite V5, 1 = incremental V23, 2 = swap successor V24. */
     uint8_t proof_profile{0};
     uint256 exchange_state_root;
     uint256 configuration_hash;
@@ -164,6 +165,9 @@ struct BondV2CapitalSnapshot
     uint64_t last_transition_sidechain_height{0};
     uint8_t operationally_safe{0};
     std::array<unsigned char, 16> legacy_fee_pool{};
+    /** Present only in version 5/profile 2, derived after script verification. */
+    uint256 bridge_state_root;
+    uint8_t profit_lock_insolvent{0};
 
     SERIALIZE_METHODS(BondV2CapitalSnapshot, obj)
     {
@@ -217,6 +221,13 @@ struct BondV2CapitalSnapshot
             obj.last_transition_sidechain_height,
             obj.operationally_safe,
             Using<FixedByteArrayFormatter>(obj.legacy_fee_pool));
+        if (obj.version == SWAP_CAPITAL_SNAPSHOT_VERSION) {
+            READWRITE(obj.bridge_state_root, obj.profit_lock_insolvent);
+            if (obj.proof_profile != 2 || obj.bridge_state_root.IsNull() || obj.profit_lock_insolvent > 1)
+                throw std::ios_base::failure("invalid swap capital projection");
+        } else if (obj.version != BOND_V2_CAPITAL_SNAPSHOT_VERSION || obj.proof_profile > 1) {
+            throw std::ios_base::failure("unknown capital projection profile");
+        }
     }
 };
 

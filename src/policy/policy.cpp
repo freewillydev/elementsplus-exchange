@@ -559,21 +559,14 @@ int64_t GetVirtualTransactionSize(int64_t nWeight, int64_t nSigOpCost, unsigned 
     return (std::max(nWeight, nSigOpCost * bytes_per_sigop) + WITNESS_SCALE_FACTOR - 1) / WITNESS_SCALE_FACTOR;
 }
 
-uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx)
+uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx, uint64_t* cumulative)
 {
     static_assert(ANNEX_TAG == 0x50 && TAPROOT_LEAF_MASK == 0xfe &&
         TAPROOT_LEAF_TAPSIMPLICITY == 0xbe && VALIDATION_WEIGHT_OFFSET == 50);
-    return drivechain::haskell::BmmWorkBudget(tx.witness.vtxinwit.size(),
-        [&](uint32_t step, uint64_t witness, uint64_t index) -> uint64_t {
-        const auto& stack = tx.witness.vtxinwit.at(witness).scriptWitness.stack;
-        switch (step) {
-        case 0: return stack.size();
-        case 1: return stack.at(index).empty() ? 256 : stack[index][0];
-        case 2: return stack.at(index).size();
-        case 3: return ::GetSerializeSize(stack);
-        default: throw std::logic_error("invalid work budget read");
-        }
-    });
+    uint64_t total{cumulative ? *cumulative : 0}, work{0};
+    drivechain::haskell::MeasureWork(true, 1, [&](uint64_t) -> const CTransaction& { return tx; }, total, &work);
+    if (cumulative) *cumulative = total;
+    return work;
 }
 
 bool CalculateBmmWorkFeeQuote(

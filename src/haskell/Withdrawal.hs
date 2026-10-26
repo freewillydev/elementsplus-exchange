@@ -6,9 +6,11 @@ module Withdrawal (withdrawal, wordBE, wordLE, readBE, readLE,
   WithdrawalPayout(..), WithdrawalRequest(..), WithdrawalRule(..), WithdrawalFrame(..),
   WithdrawalAction(..), PreflightFlow(..), NativeSubmissionFlow(..), DestinationFlow(..), EventFlow(..), BundleEventFlow(..), SubmissionFlow(..), OutputFlow(..), JournalReadFlow(..), JournalPersistFlow(..), RpcBurnFlow(..), RpcClaimFlow(..), RpcVerifyFlow(..),
   WalletBalance(..), WalletCommandFlow(..), WalletIssueAmount(..), WalletIssueFlow(..), WalletBundleRequest(..), BundleFailure(..), BundlePlan, bundlePayout, bundleFeeScript, bundleInputs, bundleMarker, bundleLayout,
-  withdrawRules, buildWalletBundle, DSL(Withdraw, BuildWalletBundle)) where
+  WalletWithdrawal(..), WalletAdmission(..), WalletPreparation(..), WalletSubmission(..), withdrawFromWallet,
+  WithdrawalJournal(..), JournalValidation(..), JournalStorage(..), readWithdrawalJournal, writeWithdrawalJournal, clearWithdrawalJournal,
+  withdrawRules, buildWalletBundle, DSL(Withdraw, BuildWalletBundle, WithdrawFromWallet, ValidateJournal, ReadJournal, WriteJournal, ClearJournal)) where
 
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT(..), runExceptT)
 import CapabilityContext
@@ -18,12 +20,228 @@ import qualified Data.Bifunctor as Bi
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.Int (Int32, Int64)
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import Control.Operation
 import Control.Operation.Validation
 import ParentReplay (transition)
+import Workflow (NativeBytes, CommandFlow(..))
 
 type Result = Either String B.ByteString
+
+-- Reading composes validation directly, so no native callback re-enters the
+-- FFI for admission, transaction normalization or identity comparison.
+data WithdrawalJournal = WithdrawalJournal Int64 NativeBytes
+class JournalValidation op where
+  validateJournal :: op -> IO Bool
+class JournalStorage op where
+  observeJournal :: op -> Word32 -> IO Int64
+
+journalAbort :: NativeBytes -> String -> IO a
+journalAbort native message = do
+  _ <- native 0 0 (C.pack message)
+  ioError (userError "journal error callback returned")
+
+journalScalar :: NativeBytes -> Word32 -> B.ByteString -> IO Int64
+journalScalar native step input = do
+  bytes <- native step 0 input
+  let value = readLE bytes
+  if B.length bytes == 8 && value <= fromIntegral (maxBound :: Word32)
+    then pure (fromIntegral value)
+    else journalAbort native "invalid withdrawal journal scalar"
+
+instance JournalValidation WithdrawalJournal where
+  validateJournal (WithdrawalJournal maximumMoney native) = do
+    facts <- native 101 0 B.empty
+    unless (B.length facts == 74) (journalAbort native "invalid withdrawal journal facts")
+    case rule JournalAdmission (B.take 42 facts) of
+      Left message -> reject message
+      Right _ -> do
+        bundle <- native 102 0 B.empty
+        case rule JournalLegacy bundle of
+          Left _ -> journalAbort native "Haskell withdrawal transport evaluation failed"
+          Right normalized -> do
+            digest <- native 103 0 normalized
+            unless (B.length digest == 32) (journalAbort native "invalid withdrawal journal digest")
+            either reject (const (pure True)) (rule JournalIdentity (digest <> B.drop 42 facts))
+    where
+      rule action = withdrawal (fromIntegral (fromEnum action)+1) maximumMoney
+      reject message = do
+        reply <- journalScalar native 105 (C.pack message)
+        unless (reply == 1) (journalAbort native "invalid withdrawal journal rejection")
+        pure False
+
+instance JournalStorage WithdrawalJournal where
+  observeJournal (WithdrawalJournal _ native) step = journalScalar native step B.empty
+
+readWithdrawalJournal :: (JournalValidation op, JournalStorage op) => op -> IO Int32
+readWithdrawalJournal value = validate (CommandFlow 10
+  (\phase reply -> validate (JournalReadFlow phase reply))
+  (\step -> if step == 8 then fromIntegral . fromEnum <$> validateJournal value
+            else observeJournal value step))
+
+requireJournalEffect :: JournalStorage op => op -> Word32 -> IO ()
+requireJournalEffect value step = observeJournal value step >>= \reply ->
+  unless (reply == 1) (ioError (userError "invalid journal persistence effect"))
+
+writeWithdrawalJournal :: (JournalValidation op, JournalStorage op) => op -> IO Int32
+writeWithdrawalJournal value = do
+  accepted <- validateJournal value
+  if not accepted then requireJournalEffect value 209 >> pure 0 else do
+    mapM_ (requireJournalEffect value) [201,202]
+    stored <- validate (CommandFlow 8
+      (\phase reply -> validate (JournalPersistFlow False phase reply)) (observeJournal value))
+    if stored < 0 then pure stored else do
+      requireJournalEffect value 203
+      if stored /= 1 then pure stored else do
+        mapM_ (requireJournalEffect value) [204,205]
+        pure 1
+
+clearWithdrawalJournal :: JournalStorage op => op -> IO Int32
+clearWithdrawalJournal value = validate (CommandFlow 4
+  (\phase reply -> validate (JournalPersistFlow True phase reply)) (observeJournal value))
+
+type JournalCapabilities = '[JournalValidation, JournalStorage]
+instance Operation WithdrawalJournal JournalCapabilities where
+  type Context WithdrawalJournal = CapabilityContext JournalCapabilities WithdrawalJournal
+  type Outcome WithdrawalJournal = IO Int32
+  data DSL WithdrawalJournal where
+    ValidateJournal :: Context WithdrawalJournal => DSL WithdrawalJournal
+    ReadJournal :: Context WithdrawalJournal => DSL WithdrawalJournal
+    WriteJournal :: Context WithdrawalJournal => DSL WithdrawalJournal
+    ClearJournal :: Context WithdrawalJournal => DSL WithdrawalJournal
+  interpret operation request = withOperation @WithdrawalJournal operation $ \value -> case request of
+    ValidateJournal -> Just (fromIntegral . fromEnum <$> validateJournal value)
+    ReadJournal -> Just (readWithdrawalJournal value)
+    WriteJournal -> Just (writeWithdrawalJournal value)
+    ClearJournal -> Just (clearWithdrawalJournal value)
+
+-- A single wallet session retains native wallet/transaction ownership while
+-- rules and preparation-to-commit ordering stay inside Haskell.
+data WalletWithdrawal = WalletWithdrawal Int64 NativeBytes
+class WalletAdmission op where
+  admitWithdrawalWallet :: op -> IO Bool
+class WalletPreparation op where
+  prepareWithdrawalWallet :: op -> IO Bool
+class WalletSubmission op where
+  submitWithdrawalWallet :: op -> Bool -> IO ()
+
+walletAbort :: NativeBytes -> String -> IO a
+walletAbort native message = do
+  _ <- native 0 0 (C.pack message)
+  ioError (userError "withdrawal error callback returned")
+
+walletRpcError :: NativeBytes -> (Int32,String) -> IO a
+walletRpcError native (code,message) = do
+  _ <- native 0 1 (wordLE 4 (fromIntegral code) <> C.pack message)
+  ioError (userError "withdrawal RPC error callback returned")
+
+walletScalar :: NativeBytes -> Word32 -> B.ByteString -> IO Word64
+walletScalar native step payload = do
+  bytes <- native step 0 payload
+  if B.length bytes == 8 then pure (readLE bytes)
+    else walletAbort native "invalid wallet withdrawal scalar"
+
+walletFlag :: NativeBytes -> Word32 -> IO Bool
+walletFlag native step = walletScalar native step B.empty >>= \value -> case value of
+  0 -> pure False
+  1 -> pure True
+  _ -> walletAbort native "invalid wallet withdrawal boolean"
+
+walletEffect :: NativeBytes -> Word32 -> B.ByteString -> IO ()
+walletEffect native step payload = walletScalar native step payload >>= \value ->
+  unless (value == 1) (walletAbort native "invalid wallet withdrawal effect")
+
+walletGuard :: NativeBytes -> Word8 -> Bool -> IO ()
+walletGuard native stage flag = either (walletRpcError native) pure
+  (nativeGuard (B.pack [stage,if flag then 1 else 0]))
+
+walletRule :: WalletWithdrawal -> WithdrawalAction -> B.ByteString -> String -> IO B.ByteString
+walletRule (WalletWithdrawal maximumMoney native) action input failure =
+  let request = WithdrawalRequest maximumMoney input
+  in if hasFrame action request then either (const (walletAbort native failure)) pure (withdrawalBody action request)
+    else walletAbort native failure
+
+walletDecoded :: NativeBytes -> [Int32] -> String -> B.ByteString -> IO B.ByteString
+walletDecoded native allowed invalid bytes
+  | B.length bytes < 4 = walletAbort native invalid
+  | code == 0 = pure (B.drop 4 bytes)
+  | code `elem` allowed = walletRpcError native (code,C.unpack (B.drop 4 bytes))
+  | otherwise = walletAbort native invalid
+  where code = fromIntegral (readLE (B.take 4 bytes))
+
+instance WalletAdmission WalletWithdrawal where
+  admitWithdrawalWallet (WalletWithdrawal _ native) = do
+    walletFlag native 1 >>= walletGuard native 0
+    activation <- walletScalar native 2 B.empty
+    unless (activation <= 3) (walletAbort native "invalid withdrawal activation observation")
+    walletGuard native 1 (activation == 3)
+    loaded <- walletFlag native 3
+    when loaded $ mapM_ (\step -> walletEffect native step B.empty) [4,5]
+    pure loaded
+
+instance WalletPreparation WalletWithdrawal where
+  prepareWithdrawalWallet value@(WalletWithdrawal _ native) = do
+    walletEffect native 10 B.empty
+    destinationResult <- validate (CommandFlow 14 (\phase result -> validate (DestinationFlow phase result))
+      (\step -> do
+        reply <- walletScalar native (100+step) B.empty
+        pure (if reply <= 0xffffffff then fromIntegral reply else -1)))
+    unless (destinationResult == 1) (walletAbort native "Haskell parent replay store evaluation failed")
+    payoutFrame <- native 20 0 B.empty
+    payoutResult <- walletRule value NativePayout payoutFrame "Haskell native payout evaluation failed"
+    unless (B.length payoutResult == 12) (walletAbort native "Haskell native payout evaluation failed")
+    case fromIntegral (readLE (B.take 4 payoutResult)) :: Int32 of
+      -3 -> walletRpcError native (-3,"Invalid withdrawal payout amount")
+      -8 -> do
+        minimumAmount <- native 21 0 (B.drop 4 payoutResult)
+        walletRpcError native (-8,"Bitcoin withdrawal payout is dust for this destination (minimum "++C.unpack minimumAmount++")")
+      0 -> pure ()
+      _ -> walletAbort native "Invalid Haskell native payout result"
+    omittedSubtract <- walletFlag native 22
+    subtractFee <- if omittedSubtract then pure False else walletFlag native 23
+    walletGuard native 2 subtractFee
+    omittedVerbose <- walletFlag native 24
+    verbose <- if omittedVerbose then pure False else walletFlag native 25
+    omittedFee <- walletFlag native 26
+    unless omittedFee (walletEffect native 27 B.empty)
+    burnFrame <- native 28 0 B.empty
+    burn <- walletRule value NativeBurnPlan burnFrame "Haskell native burn planning failed"
+      >>= walletDecoded native [-3,-8] "Invalid Haskell native burn plan"
+    unless (B.length burn >= 8) (walletAbort native "Invalid Haskell native burn plan")
+    walletEffect native 29 burn
+    dataCarrier <- walletFlag native 30
+    when dataCarrier (walletEffect native 31 B.empty)
+    walletFlag native 32 >>= walletGuard native 3
+    walletEffect native 40 B.empty
+    pure verbose
+
+instance WalletSubmission WalletWithdrawal where
+  submitWithdrawalWallet value@(WalletWithdrawal _ native) verbose = do
+    mapM_ (\step -> walletEffect native step B.empty) [41,42]
+    available <- walletFlag native 43
+    hasTransaction <- if available then walletFlag native 44 else pure False
+    unless hasTransaction (walletRpcError native (-4,"Committed withdrawal transaction is unavailable in the wallet"))
+    frame <- native 46 0 B.empty
+    output <- walletRule value NativeOutputSelection frame "Haskell native output selection failed"
+      >>= walletDecoded native [-4] "Invalid Haskell native output selection"
+    unless (B.length output == 4) (walletAbort native "Invalid Haskell native output selection")
+    walletEffect native 47 output
+    walletEffect native (if verbose then 49 else 48) B.empty
+
+withdrawFromWallet :: (WalletAdmission op, WalletPreparation op, WalletSubmission op) => op -> IO Int32
+withdrawFromWallet value = do
+  present <- admitWithdrawalWallet value
+  if not present then pure 0 else prepareWithdrawalWallet value >>= submitWithdrawalWallet value >> pure 1
+
+type WalletWithdrawalCapabilities = '[WalletAdmission, WalletPreparation, WalletSubmission]
+instance Operation WalletWithdrawal WalletWithdrawalCapabilities where
+  type Context WalletWithdrawal = CapabilityContext WalletWithdrawalCapabilities WalletWithdrawal
+  type Outcome WalletWithdrawal = IO Int32
+  data DSL WalletWithdrawal where
+    WithdrawFromWallet :: Context WalletWithdrawal => DSL WalletWithdrawal
+  interpret operation request = withOperation @WalletWithdrawal operation $ \value -> case request of
+    WithdrawFromWallet -> Just (withdrawFromWallet value)
+
 
 newtype WalletBalance = WalletBalance [Int64]
 instance Validation WalletBalance where

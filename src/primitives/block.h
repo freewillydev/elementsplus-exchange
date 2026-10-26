@@ -14,10 +14,15 @@
 #include <utreexo.h>
 #include <util/time.h>
 
+#include <array>
+
 // ELEMENTS:
 // Globals to avoid circular dependencies.
 extern bool g_con_blockheightinheader;
 extern bool g_signed_blocks;
+// Separate, inactive chain serialization profile. Never enable on an existing
+// datadir: historical version bit14 remains an ordinary bit in legacy mode.
+extern bool g_con_ecx_swap_v3;
 
 class CProof
 {
@@ -223,6 +228,10 @@ public:
     uint64_t forcedProcessedCursor;
     uint64_t depositProcessedCursor;
     uint64_t sourceBacklogOldestParentHeight;
+    // Canonical ECXFv3 state, including full u128 count/cursor and tranche caps.
+    // Carried directly by the header; no lossy u64 mirror or extra state DB.
+    static constexpr size_t SWAP_FORCED_STATE_SIZE{145};
+    std::array<unsigned char, SWAP_FORCED_STATE_SIZE> swapForcedState{};
     UtreexoCommitment utreexo;
     uint32_t nTime;
     // Height in header as well as in coinbase for easier hsm validation
@@ -263,9 +272,11 @@ public:
     // after ecxParentHeight when present.
     static const uint32_t INBOX_CURSOR_HF_MASK = drivechain::INBOX_CURSOR_HF_MASK;
 
+    static constexpr uint32_t SWAP_FORCED_STATE_HF_MASK{drivechain::SWAP_FORCED_STATE_HF_MASK};
+
     struct HeaderLayout {
         int32_t version;
-        bool withdrawal{false}, bmm{false}, exchange{false}, forced{false}, deposit{false}, cursors{false}, dynamic{false}, parent_height{false}, zero_bmm{false};
+        bool withdrawal{false}, bmm{false}, exchange{false}, forced{false}, deposit{false}, cursors{false}, dynamic{false}, parent_height{false}, zero_bmm{false}, swap_forced{false};
     };
     static HeaderLayout GetLayout(int32_t version, bool withdrawal, bool dynamic, bool reading = false, bool critical = false);
     uint32_t GetRawExtensionFlags() const;
@@ -273,7 +284,7 @@ public:
     template <typename Stream>
     inline void Serialize(Stream& s, const TransactionSerParams& params) const {
         const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, has_exchange_state,
-            has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm] =
+            has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm, has_swap_forced] =
             GetLayout(this->nVersion, !hashWithdrawalBundle.IsNull(), !m_dynafed_params.IsNull());
         s << (nVersion);
 
@@ -305,6 +316,7 @@ public:
             s << depositProcessedCursor;
             s << sourceBacklogOldestParentHeight;
         }
+        if (has_swap_forced) s << swapForcedState;
         if (HasUtreexo()) s << utreexo;
         // Dynamic witness follows every header extension, except in stripped mode.
         if (is_dyna && params.allow_witness) s << m_signblock_witness.stack;
@@ -321,7 +333,7 @@ public:
         int32_t wire_version;
         s >> wire_version;
         const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, has_exchange_state,
-            has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm] = GetLayout(wire_version, false, false, true);
+            has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm, has_swap_forced] = GetLayout(wire_version, false, false, true);
         this->nVersion = nVersion;
 
         s >> hashPrevBlock;
@@ -362,6 +374,8 @@ public:
             depositProcessedCursor = 0;
             sourceBacklogOldestParentHeight = 0;
         }
+        if (has_swap_forced) s >> swapForcedState;
+        else swapForcedState.fill(0);
         if (HasUtreexo()) s >> utreexo;
         else utreexo = {};
         if (is_dyna && params.allow_witness) s >> m_signblock_witness.stack;
@@ -387,6 +401,7 @@ public:
         forcedProcessedCursor = 0;
         depositProcessedCursor = 0;
         sourceBacklogOldestParentHeight = 0;
+        swapForcedState.fill(0);
         utreexo = {};
         nTime = 0;
         block_height = 0;
@@ -414,6 +429,7 @@ public:
     bool HasExchangeState() const { return (GetRawExtensionFlags() & 4) != 0; }
     bool HasForcedInbox() const { return (GetRawExtensionFlags() & 8) != 0; }
     bool HasDepositInbox() const { return (GetRawExtensionFlags() & 16) != 0; }
+    bool HasSwapForcedState() const { return g_con_elementsmode && (GetRawExtensionFlags() & 512) != 0; }
     bool HasUtreexo() const { return g_con_elementsmode && g_con_utreexo && (uint32_t(nVersion) & utreexo::HEADER_BIT); }
 
     NodeSeconds Time() const
@@ -491,6 +507,7 @@ public:
         block.forcedProcessedCursor = forcedProcessedCursor;
         block.depositProcessedCursor = depositProcessedCursor;
         block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
+        block.swapForcedState = swapForcedState;
         block.nTime          = nTime;
         block.block_height   = block_height;
         block.nBits          = nBits;

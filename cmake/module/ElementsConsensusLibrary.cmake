@@ -46,7 +46,7 @@ install(FILES $<TARGET_FILE:secp256k1> DESTINATION ${CMAKE_INSTALL_LIBDIR}
   RENAME ${CMAKE_STATIC_LIBRARY_PREFIX}elements-secp256k1${CMAKE_STATIC_LIBRARY_SUFFIX}
   COMPONENT elementsconsensus)
 
-set(consensus_private_libs "-lelements-secp256k1 -lelements_haskell_bridge -lelements_haskell")
+set(consensus_private_libs "-lelements-secp256k1 -lelements_haskell")
 foreach(verifier IN ITEMS USDD ECX)
   if(${verifier}_SP1_VERIFIER_ARCHIVE)
     string(TOLOWER ${verifier} name)

@@ -24,3 +24,5 @@ bool simplicity_bond_v2_incremental_activation_cmr_required(frameItem* dst, fram
 bool simplicity_incremental_successor_transition_cmr_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_groth16_v7_swap_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
+bool simplicity_verify_sp1_groth16_v8_custody_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);

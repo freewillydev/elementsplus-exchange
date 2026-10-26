@@ -27,7 +27,7 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
-#include <wallet/drivechain_withdrawal.h>
+#include <test/util/haskell_reference.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>

@@ -1,9 +1,10 @@
 {-# LANGUAGE FlexibleInstances, ScopedTypeVariables #-}
 -- Copyright (c) 2026 The Elements Core developers
 -- Distributed under the MIT software license.
-module Abi (Handler, handler, dispatch) where
+module Abi (Entry, Handler, handler, dispatch, dispatchFamily) where
 
 import Control.Exception (SomeException, catch, evaluate)
+import Data.Bits ((.&.), shiftR)
 import Data.Int (Int32, Int64)
 import Data.Proxy (Proxy(..))
 import Data.Word (Word8, Word32, Word64)
@@ -16,6 +17,8 @@ import Foreign.Storable (poke)
 data Kind = U8 | U32 | U64 | I32 | I64 | Pointer | Callback deriving Eq
 type Frame = ([Word64], [Ptr ()], [FunPtr ()])
 data Handler = Handler [Kind] (Frame -> IO Word64)
+type Entry = Word32 -> Word32 -> Ptr Word64 -> Word32 -> Ptr (Ptr ())
+  -> Word32 -> Ptr (FunPtr ()) -> Ptr Word64 -> IO Int32
 
 class Argument a where
   kind :: Proxy a -> Kind
@@ -65,8 +68,15 @@ instance Invocation (IO Int64) where
 handler :: forall f. Invocation f => f -> Handler
 handler f = Handler (signature (Proxy :: Proxy f)) (invoke f)
 
-dispatch :: [Handler] -> Word32 -> Word32 -> Ptr Word64 -> Word32 -> Ptr (Ptr ())
-  -> Word32 -> Ptr (FunPtr ()) -> Ptr Word64 -> IO Int32
+-- High 16 bits select a stable section; low 16 bits retain its operation index.
+-- Unknown sections fail before any borrowed pointers or handlers are inspected.
+dispatchFamily :: [[Handler]] -> Entry
+dispatchFamily sections operation
+  | section >= length sections = \_ _ _ _ _ _ _ -> pure (-1)
+  | otherwise = dispatch (sections !! section) (operation .&. 0xffff)
+  where section = fromIntegral (operation `shiftR` 16)
+
+dispatch :: [Handler] -> Entry
 dispatch handlers operation scalarCount scalars pointerCount pointers callbackCount callbacks result =
   run `catch` (\(_ :: SomeException) -> pure (-3))
   where

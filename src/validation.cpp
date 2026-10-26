@@ -621,13 +621,19 @@ static void BindPriorActiveExchangeStateRoot(
         txdata.m_current_bmm_parent_mtp.reset();
     }
 
-    const auto& frozen{ecx::LayerTwoLabsExchangeConsensus().bond_v2};
+    const auto& deployment{ecx::LayerTwoLabsExchangeConsensus()};
+    const auto& frozen{deployment.bond_v2};
     const auto have_capital = drivechain::haskell::ParentReplayAll<2>({
         [&] { return previous != nullptr; },
         [&] { return previous->ecxBondV2Capital.has_value(); },
     });
     if (have_capital) {
         const auto& capital{*previous->ecxBondV2Capital};
+        const bool swaps = capital.proof_profile == 2;
+        const auto& successor_program = swaps ? deployment.swap_successor.program_id : frozen.incremental_successor_program_id;
+        const auto& successor_configuration = swaps ? deployment.swap_successor.configuration_hash : frozen.incremental_successor_configuration_hash;
+        const auto& successor_cmr = swaps ? deployment.swap_successor.transition_cmr : frozen.incremental_successor_transition_cmr;
+        const auto& successor_domain = swaps ? deployment.swap_successor.state_node_domain_sha256 : frozen.incremental_successor_state_node_domain_sha256;
         uint64_t prior_bond_inbox_count{0};
         const auto matches_identity = [&](const auto& configuration, const auto& program, const auto& cmr) {
             return drivechain::haskell::ParentReplayAll<3>({
@@ -636,10 +642,10 @@ static void BindPriorActiveExchangeStateRoot(
                 [&] { return capital.transition_cmr == cmr; },
             });
         };
-        const bool finite_identity = matches_identity(frozen.configuration_hash,
+        const bool finite_identity = !swaps && matches_identity(frozen.configuration_hash,
             frozen.transition_program_id, frozen.transition_cmr);
-        const bool successor_identity = matches_identity(frozen.incremental_successor_configuration_hash,
-            frozen.incremental_successor_program_id, frozen.incremental_successor_transition_cmr);
+        const bool successor_identity = matches_identity(successor_configuration,successor_program,successor_cmr) &&
+            (!swaps || ecx::CheckCapitalProjectionIdentity(capital,previous->hashExchangeStateRoot,deployment));
         const auto admitted_bond = drivechain::haskell::ParentReplayStore(
             drivechain::haskell::ReplayStoreFlow::BOND_CONTEXT_ADMISSION, [&](uint32_t step) -> uint32_t {
             switch (step) {
@@ -655,10 +661,10 @@ static void BindPriorActiveExchangeStateRoot(
             case 10: return !frozen.incremental_activation_program_id.IsNull();
             case 11: return !frozen.incremental_activation_configuration_hash.IsNull();
             case 12: return !frozen.incremental_activation_cmr.IsNull();
-            case 13: return !frozen.incremental_successor_program_id.IsNull();
-            case 14: return !frozen.incremental_successor_configuration_hash.IsNull();
-            case 15: return !frozen.incremental_successor_transition_cmr.IsNull();
-            case 16: return !frozen.incremental_successor_state_node_domain_sha256.IsNull();
+            case 13: return !successor_program.IsNull();
+            case 14: return !successor_configuration.IsNull();
+            case 15: return !successor_cmr.IsNull();
+            case 16: return !successor_domain.IsNull();
             case 17: return 0;
             default: throw std::logic_error("invalid bond context admission action");
             }
@@ -684,13 +690,13 @@ static void BindPriorActiveExchangeStateRoot(
             txdata.m_bond_v2_incremental_activation_cmr =
                 frozen.incremental_activation_cmr;
             txdata.m_incremental_successor_program_id =
-                frozen.incremental_successor_program_id;
+                successor_program;
             txdata.m_bond_v2_incremental_successor_configuration_hash =
-                frozen.incremental_successor_configuration_hash;
+                successor_configuration;
             txdata.m_incremental_successor_transition_cmr =
-                frozen.incremental_successor_transition_cmr;
+                successor_cmr;
             txdata.m_incremental_successor_state_node_domain_sha256 =
-                frozen.incremental_successor_state_node_domain_sha256;
+                successor_domain;
             txdata.m_prior_active_bond_inbox_root =
                 capital.node_bond_inbox_head_root;
             txdata.m_prior_active_bond_inbox_count =
@@ -801,7 +807,7 @@ static void BindPriorActiveExchangeStateRootFromView(
             std::string error;
             const bool have_parent = drivechain::haskell::ParentReplayAll<4>({
                 [&] { return previous != nullptr; },
-                [&] { return frozen.activation_enabled; },
+                [&] { return frozen.activation_enabled || ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled; },
                 [&] { return drivechain::haskell::BmmActivation(4, 1, previous->nHeight,
                     ecx::LayerTwoLabsExchangeConsensus().activation_height) != 0; },
                 [&] { return GetDrivechainMempoolParentContext(*Params().GetConsensus().drivechain_slot, native_parent, &error); },
@@ -1534,7 +1540,7 @@ private:
     // Looks up inputs, calculates feerate, considers replacement, evaluates
     // package limits, etc. As this function can be invoked for "free" by a peer,
     // only tests that are fast should be done here (to avoid CPU DoS).
-    bool PreChecks(ATMPArgs& args, Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+    bool PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTransactionRef> package = {}) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
     // Run checks for mempool replace-by-fee, only used in AcceptSingleTransaction.
     bool ReplacementChecks(Workspace& ws) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
@@ -1775,7 +1781,7 @@ private:
     }
 };
 
-bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
+bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTransactionRef> package)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
@@ -1802,10 +1808,23 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
 
     std::string ecx_source_error;
+    if (chainparams.GetConsensus().elements_mode &&
+        !ecx::CheckCustodyReservedSpendPolicy(tx,m_active_chainstate.m_chain.Tip(),ecx_source_error,
+            ecx::LayerTwoLabsExchangeConsensus(),[&](const Txid& parent) {
+                // Package parents are not in the main mempool during prechecks.
+                for (const auto& candidate : package) if (candidate->GetHash()==parent) return candidate;
+                return m_pool.get(parent.ToUint256());
+            }))
+        return state.Invalid(TxValidationResult::TX_NOT_STANDARD,"ecx-custody-pair-policy",ecx_source_error);
+    PrecomputedTransactionData exact_admission_context;
+    if (ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled)
+        BindPriorActiveExchangeStateRootFromView(exact_admission_context,m_active_chainstate.m_chain.Tip(),
+            m_active_chainstate.CoinsTip(),chainparams.GetConsensus().elements_mode);
     if (drivechain::haskell::ParentReplayAll<2>({
         [&] { return chainparams.GetConsensus().elements_mode; },
         [&] { return !ecx::CheckSourceTransactionPolicy(tx,
-            drivechain::haskell::NextBlockHeight(true, m_active_chainstate.m_chain.Height()), ecx_source_error); },
+            drivechain::haskell::NextBlockHeight(true, m_active_chainstate.m_chain.Height()), ecx_source_error,
+            ecx::LayerTwoLabsExchangeConsensus(),exact_admission_context.m_current_bmm_parent_height); },
     })) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "ecx-source-policy", ecx_source_error);
     }
@@ -2712,7 +2731,7 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
 
     // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
     for (Workspace& ws : workspaces) {
-        if (!PreChecks(args, ws)) {
+        if (!PreChecks(args, ws, txns)) {
             package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
             // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
@@ -4336,6 +4355,11 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
         }
     }
 
+    // Fresh custody snapshots require actual proof/script verification, even
+    // when historical assume-valid optimization is available for other lanes.
+    if (ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled &&
+        pindex->nHeight>=ecx::LayerTwoLabsExchangeConsensus().activation_height) fScriptChecks=true;
+
     assert(m_chainman.num_blocks_total > 0);
     const auto time_1{SteadyClock::now()};
     m_chainman.time_check += time_1 - time_start;
@@ -4740,6 +4764,24 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
         default: throw std::logic_error("invalid capital connection action");
         }
     })) return false;
+    if (exchange_consensus.custody_successor.activation_enabled && pindex->nHeight>=exchange_consensus.activation_height) {
+        if (exchange_consensus.bond_v2.activation_enabled || !g_con_ecx_swap_v3 || !exchange_parent)
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,"bad-ecx-custody-profile",
+                "fresh custody requires its independent native/header/BMM profile");
+        ecx::CustodyProjection custody;
+        const bool custody_valid = pindex->nHeight==exchange_consensus.activation_height ?
+            ecx::InitializeCustodyProjection(block,view,pindex->nHeight,custody,capital_error,exchange_consensus) :
+            ecx::DeriveCustodyProjectionAfterScripts(block,pindex->pprev,blockundo,pindex->nHeight,
+                exchange_parent->block_hash,exchange_parent->height,exchange_parent->median_time_past,
+                custody,capital_error,exchange_consensus);
+        if (!custody_valid)
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,"bad-ecx-custody-projection",capital_error);
+        if (!fJustCheck) {
+            pindex->ecxCustodyProjection=std::move(custody);
+            pindex->ecxBondV2Capital.reset();
+            m_blockman.m_dirty_blockindex.insert(pindex);
+        }
+    }
     usdd::WithdrawalAccumulatorState next_withdrawal_accumulator;
     std::string withdrawal_accumulator_error;
     if (!drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::USDD_ACCUMULATOR_CONNECTION, [&](uint32_t step) -> uint32_t {

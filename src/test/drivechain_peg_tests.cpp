@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/haskell_reference.h>
 #include <drivechain_bmm.h>
 #include <drivechain_peg.h>
 #include <drivechain_parent_replay.h>
@@ -32,7 +33,7 @@
 #include <test/util/setup_common.h>
 #include <tinyformat.h>
 #include <util/strencodings.h>
-#include <wallet/drivechain_withdrawal.h>
+#include <util/moneystr.h>
 #include <wallet/rpc/util.h>
 #include <wallet/db.h>
 #include <streams.h>
@@ -52,6 +53,231 @@
 #include <sys/stat.h>
 #endif
 
+// Sealed predecessor adapters. The production RPC executes the complete
+// withdrawal workflow in Haskell; these remain test-only compatibility oracles.
+namespace wallet {
+void CheckWithdrawal(WithdrawalCheck check, bool value)
+{
+    const std::array<unsigned char,2> input{static_cast<unsigned char>(check),value};
+    std::vector<unsigned char> output;
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::NATIVE_GUARD_RESULT,input,output,nullptr))
+        throw std::runtime_error("Haskell withdrawal guard evaluation failed");
+    if (const auto code = static_cast<int32_t>(ReadLE32(output.data())); code != 0)
+        throw JSONRPCError(code,std::string(output.begin()+4,output.end()));
+}
+
+CAmount ValidateNativePayout(const CScript& destination, CAmount payout)
+{
+    static_assert(DUST_RELAY_TX_FEE_BITCOIN == 3000);
+    std::array<unsigned char,13> input{};
+    int version{0};
+    std::vector<unsigned char> program, output;
+    WriteLE64(input.data(),payout);
+    input[12] = destination.IsWitnessProgram(version,program);
+    WriteLE32(input.data()+8, static_cast<uint32_t>(GetSerializeSize(Sidechain::Bitcoin::CTxOut(0,destination))));
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::NATIVE_PAYOUT,input,output,nullptr) || output.size()!=12)
+        throw std::runtime_error("Haskell native payout evaluation failed");
+    const auto code=static_cast<int32_t>(ReadLE32(output.data()));
+    if (code == RPC_TYPE_ERROR) throw JSONRPCError(code,"Invalid withdrawal payout amount");
+    if (code == RPC_INVALID_PARAMETER) throw JSONRPCError(code,strprintf(
+        "Bitcoin withdrawal payout is dust for this destination (minimum %s)",FormatMoney(ReadLE64(output.data()+4))));
+    if (code != 0) throw std::runtime_error("Invalid Haskell native payout result");
+    return payout;
+}
+
+CAmount PrepareNativeBurn(const uint256& parent, const CScript& destination,
+    CAmount payout, CAmount fee, CScript& burn)
+{
+    std::vector<unsigned char> input(16), output;
+    WriteLE64(input.data(),payout);
+    WriteLE64(input.data()+8,fee);
+    input.insert(input.end(),parent.begin(),parent.end());
+    input.insert(input.end(),destination.begin(),destination.end());
+    burn.clear();
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::NATIVE_BURN_PLAN,input,output,nullptr))
+        throw std::runtime_error("Haskell native burn planning failed");
+    const auto code=static_cast<int32_t>(ReadLE32(output.data()));
+    if (code == RPC_TYPE_ERROR || code == RPC_INVALID_PARAMETER)
+        throw JSONRPCError(code,std::string(output.begin()+4,output.end()));
+    if (code != 0 || output.size()<12) throw std::runtime_error("Invalid Haskell native burn plan");
+    burn.assign(output.begin()+12,output.end());
+    return static_cast<CAmount>(ReadLE64(output.data()+4));
+}
+
+CAmount LegacyWithdrawalAmount(CAmount payout)
+{
+    std::array<unsigned char,17> input{};
+    input[0] = 2;
+    WriteLE64(input.data()+1, payout);
+    std::vector<unsigned char> output;
+    std::string error;
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::NATIVE_AMOUNT, input, output, &error))
+        throw JSONRPCError(RPC_TYPE_ERROR, error);
+    return static_cast<CAmount>(ReadLE64(output.data()));
+}
+
+uint32_t FindNativeWithdrawalOutput(const CTransaction& tx, const CScript& burn_script,
+    const CAsset& asset, const uint256& parent_genesis, CAmount burn, CAmount payout, CAmount fee)
+{
+    std::vector<unsigned char> input(asset.begin(),asset.end()), output;
+    input.insert(input.end(),parent_genesis.begin(),parent_genesis.end());
+    input.resize(92);
+    WriteLE64(input.data()+64,burn); WriteLE64(input.data()+72,payout); WriteLE64(input.data()+80,fee);
+    WriteLE32(input.data()+88,static_cast<uint32_t>(burn_script.size()));
+    input.insert(input.end(),burn_script.begin(),burn_script.end());
+    for (uint32_t index=0; index<tx.vout.size(); ++index) {
+        const auto& candidate=tx.vout[index];
+        const size_t offset=input.size();
+        input.resize(offset+49);
+        WriteLE32(input.data()+offset,index);
+        const CAsset actual=candidate.nAsset.IsExplicit() ? candidate.nAsset.GetAsset() : CAsset{};
+        std::copy(actual.begin(),actual.end(),input.begin()+offset+4);
+        input[offset+36]=candidate.nAsset.IsExplicit(); input[offset+37]=candidate.nValue.IsExplicit();
+        input[offset+38]=candidate.nNonce.IsNull();
+        input[offset+39]=index>=tx.witness.vtxoutwit.size() || tx.witness.vtxoutwit[index].IsNull();
+        WriteLE64(input.data()+offset+40,candidate.nValue.IsExplicit() ? candidate.nValue.GetAmount() : 0);
+        input[offset+48]=candidate.scriptPubKey == burn_script;
+    }
+    if (!drivechain::haskell::WithdrawalBytes(drivechain::haskell::WithdrawalOp::NATIVE_OUTPUT_SELECTION,input,output,nullptr))
+        throw std::runtime_error("Haskell native output selection failed");
+    const auto code=static_cast<int32_t>(ReadLE32(output.data()));
+    if (code == RPC_WALLET_ERROR) throw JSONRPCError(code,std::string(output.begin()+4,output.end()));
+    if (code != 0 || output.size()!=8) throw std::runtime_error("Invalid Haskell native output selection");
+    return ReadLE32(output.data()+4);
+}
+
+namespace {
+static std::array<unsigned char,40> WithdrawalInputContext(const COutPoint& outpoint, uint32_t height)
+{
+    std::array<unsigned char,40> context{};
+    std::copy_n(UCharCast(outpoint.hash.begin()),32,context.begin());
+    WriteLE32(context.data()+32,outpoint.n);
+    WriteLE32(context.data()+36,height);
+    return context;
+}
+
+DrivechainWithdrawalBundle BuildBundle(
+    CAmount amount, CAmount mainchain_fee, const CScript& payout_script,
+    const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height,
+    std::span<const unsigned char> anchor_context)
+{
+    static_assert(MAX_SCRIPT_SIZE == 10000);
+    Sidechain::Bitcoin::CMutableTransaction tx;
+    DrivechainWithdrawalBundle result;
+    result.bytes = drivechain::haskell::BuildWithdrawalBundle(amount, mainchain_fee,
+        payout_script.size(), !withdrawal_outpoint.IsNull(), [&](const auto& plan) -> const std::vector<unsigned char>& {
+        tx.version = plan.version;
+        for (const auto role : plan.outputs) {
+            switch (role) {
+            case 0: tx.vout.emplace_back(0, CScript(plan.fee_script.begin(),plan.fee_script.end())); break;
+            case 1: tx.vout.emplace_back(0, CScript() << OP_RETURN << ToByteVector(Hash(plan.inputs))); break;
+            case 2: tx.vout.emplace_back(plan.payout,payout_script); break;
+            case 3: tx.vout.emplace_back(0, CScript(plan.marker.begin(),plan.marker.end())); break;
+            default: throw std::logic_error("invalid withdrawal output role");
+            }
+        }
+        VectorWriter{result.no_witness_bytes, 0, TX_NO_WITNESS(tx)};
+        result.m6id = tx.GetHash();
+        return result.no_witness_bytes;
+    }, WithdrawalInputContext(withdrawal_outpoint,sidechain_block_height), anchor_context);
+    return result;
+}
+} // namespace
+
+std::string FindWithdrawalBundleEventStatus(const UniValue& peg_data, const std::string& m6id_hex)
+{
+    const UniValue& blocks = peg_data["blocks"];
+    std::vector<UniValue>::const_iterator block_it, event_it;
+    const UniValue *events{nullptr}, *bundle{nullptr}, *m6id{nullptr}, *status{nullptr};
+    std::vector<unsigned char> bytes;
+    uint256 event_m6id;
+    const auto selected = drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_EVENT,
+        [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return blocks.isArray();
+        case 2: block_it = blocks.getValues().begin(); return 1;
+        case 3: return block_it != blocks.getValues().end();
+        case 4: events = &(*block_it)["blockInfo"]["events"]; return events->isArray();
+        case 5: event_it = events->getValues().begin(); return 1;
+        case 6: ++block_it; return 1;
+        case 7: return event_it != events->getValues().end();
+        case 8: bundle = &(*event_it)["withdrawalBundle"]; return bundle->isObject();
+        case 9: m6id = &(*bundle)["m6id"]["hex"]; return m6id->isStr();
+        case 10: ++event_it; return 1;
+        case 11: bytes = ParseHex(m6id->get_str()); return std::min<size_t>(bytes.size(), UINT32_MAX);
+        case 12: std::copy(bytes.begin(), bytes.end(), event_m6id.begin()); return event_m6id.GetHex() == m6id_hex;
+        case 13: status = &(*bundle)["event"]; return status->isObject();
+        case 14: return !(*status)["submitted"].isNull();
+        case 15: return !(*status)["succeeded"].isNull();
+        case 16: return !(*status)["failed"].isNull();
+        default: throw std::logic_error("invalid withdrawal event step");
+        }
+    });
+    return drivechain::WITHDRAWAL_STATE_NAMES[selected];
+}
+
+CScript DecodeDrivechainWithdrawalDestination(const std::string& destination)
+{
+    static_assert(static_cast<int>(TxoutType::PUBKEY) == 2 && static_cast<int>(TxoutType::PUBKEYHASH) == 3 &&
+        static_cast<int>(TxoutType::SCRIPTHASH) == 4 && static_cast<int>(TxoutType::MULTISIG) == 5 &&
+        static_cast<int>(TxoutType::WITNESS_V0_SCRIPTHASH) == 7 && static_cast<int>(TxoutType::WITNESS_V0_KEYHASH) == 8 &&
+        static_cast<int>(TxoutType::WITNESS_V1_TAPROOT) == 9);
+    static_assert(drivechain::NATIVE_WITHDRAWAL_MAX_DESTINATION_SIZE == 128);
+    CScript script;
+    std::string hex, error;
+    CTxDestination address;
+    TxoutType type{TxoutType::NONSTANDARD};
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::WITHDRAWAL_DESTINATION, [&](uint32_t step) -> uint32_t {
+        switch (step) {
+        case 1: return destination.starts_with("hex:");
+        case 2: hex = destination.substr(4); return std::min<size_t>(hex.size(), UINT32_MAX);
+        case 3: return IsHex(hex);
+        case 4: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "hex: destination must be a nonempty, bounded hexadecimal scriptPubKey");
+        case 5: address = DecodeParentDestination(destination, error); return IsValidDestination(address);
+        case 6: {
+            const auto bytes = ParseHex(hex);
+            script = CScript(bytes.begin(), bytes.end()); return 1;
+        }
+        case 8: script = GetScriptForDestination(address); return 1;
+        case 9: return std::min<size_t>(script.size(), UINT32_MAX);
+        case 10: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address: " + error);
+        case 11: return IsStandard(script, std::nullopt, type);
+        case 12: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Bitcoin destination must be a standard script of 1..128 bytes");
+        case 13: return static_cast<uint32_t>(type);
+        case 14: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Bitcoin destination must be a recognized spendable script");
+        default: throw std::logic_error("invalid withdrawal destination step");
+        }
+    });
+    return script;
+}
+
+DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
+    CAmount amount, CAmount mainchain_fee, const CScript& payout_script,
+    const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height)
+{
+    return BuildBundle(amount, mainchain_fee, payout_script, withdrawal_outpoint,
+                       sidechain_block_height, {});
+}
+
+DrivechainWithdrawalBundle BuildDrivechainWithdrawalBundle(
+    CAmount amount, CAmount mainchain_fee, const CScript& payout_script,
+    const COutPoint& withdrawal_outpoint, uint32_t sidechain_block_height,
+    const uint256& child_genesis, const uint256& previous_child_hash,
+    const uint256& exchange_state_root)
+{
+    std::array<unsigned char,96> anchor_context{};
+    std::copy_n(child_genesis.begin(),32,anchor_context.begin());
+    std::copy_n(previous_child_hash.begin(),32,anchor_context.begin()+32);
+    std::copy_n(exchange_state_root.begin(),32,anchor_context.begin()+64);
+    try {
+        return BuildBundle(amount, mainchain_fee, payout_script, withdrawal_outpoint,
+                           sidechain_block_height, anchor_context);
+    } catch (const drivechain::haskell::WithdrawalAnchorError& error) {
+        throw JSONRPCError(RPC_MISC_ERROR,error.what());
+    }
+}
+} // namespace wallet
+
 namespace {
 
 const std::string MAINCHAIN_TIP{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"};
@@ -61,6 +287,86 @@ const std::string NEXT_CTIP_TXID{"dddddddddddddddddddddddddddddddddddddddddddddd
 const std::string SIGNET_CHALLENGE{"00148835832e28c816b7acd8fdb19772ab2199603a56"};
 const std::string HASH_ID_1{"5883560531f013b9b27b2f9cfbac4f64ee5062b95ad3e21593a8f6916530b74b"};
 const std::string HASH_ID_2{"b2b7b20f3fbc4baf50e9d39f58661c6168e279d4"};
+
+bool OriginalReplayTip(const DrivechainParentReplayTip& tip)
+{
+    using Kind = drivechain::haskell::ReplayRecordKind;
+    const auto height_valid = [&](uint32_t height) {
+        return drivechain::haskell::ParentReplayRecord(Kind::HEIGHT, 0, 0, height, tip.height);
+    };
+    const auto* active = &tip.state.active_proposal_hash;
+    const auto* ctip = &tip.state.ctip;
+    auto value = tip.state.ctip_value;
+    const auto* proposals = &tip.state.pending_proposals;
+    const auto* withdrawals = &tip.state.pending_withdrawals;
+    auto proposal = proposals->begin();
+    size_t withdrawal{0};
+    auto slot = tip.state.other_slots.begin();
+    auto action = tip.state.previous_m4_actions.begin();
+    auto action_slot = tip.state.other_slots.end();
+    bool configured{true}, configured_action_seen{false};
+    std::set<uint256> m6ids;
+    std::set<Sidechain::Bitcoin::COutPoint> ctips;
+    return drivechain::haskell::ParentReplayTip([&](uint32_t step) {
+        switch (step) {
+        case 1: return !tip.hash.IsNull();
+        case 2: return tip.state.required_proposal_activated;
+        case 3: return !tip.state.active_proposal_hash.IsNull();
+        case 4: return !tip.state.required_activation_block_hash.IsNull();
+        case 5: return height_valid(tip.state.required_activation_height);
+        case 6: return tip.state.required_activation_height == 0;
+        case 7: return tip.state.required_activation_block_hash.IsNull();
+        case 8: case 27: case 34: case 39: return ctip->has_value();
+        case 9: case 35: return value == 0;
+        case 10: case 24: case 32: return !active->IsNull();
+        case 11: case 38: return drivechain::haskell::ParentReplayRecord(Kind::AMOUNT, 0, value, 0, MAX_MONEY);
+        case 12: proposal = proposals->begin(); return true;
+        case 13: return proposal != proposals->end();
+        case 14: return !proposal->first.IsNull();
+        case 15: return height_valid(proposal->second.proposal_height);
+        case 16: return drivechain::haskell::ParentReplayRecord(Kind::PROPOSAL_VOTES, 0,
+            proposal->second.votes, tip.height, proposal->second.proposal_height);
+        case 17: ++proposal; return true;
+        case 18: withdrawal = 0; m6ids.clear(); return true;
+        case 19: return withdrawal < withdrawals->size();
+        case 20: return height_valid((*withdrawals)[withdrawal].proposal_height);
+        case 21: return drivechain::haskell::ParentReplayRecord(Kind::WITHDRAWAL_VOTES, 0,
+            (*withdrawals)[withdrawal].votes, tip.height, (*withdrawals)[withdrawal].proposal_height);
+        case 22: return m6ids.insert((*withdrawals)[withdrawal].m6id).second;
+        case 23: ++withdrawal; return true;
+        case 25: return withdrawals->empty();
+        case 26: return configured;
+        case 28: ctips.insert(**ctip); return true;
+        case 29: slot = tip.state.other_slots.begin(); return true;
+        case 30: return slot != tip.state.other_slots.end();
+        case 31:
+            configured = false;
+            active = &slot->second.active_proposal_hash;
+            ctip = &slot->second.ctip;
+            value = slot->second.ctip_value;
+            proposals = &slot->second.pending_proposals;
+            withdrawals = &slot->second.pending_withdrawals;
+            return true;
+        case 33: return !ctip->has_value();
+        case 36: ++slot; return true;
+        case 40: action = tip.state.previous_m4_actions.begin(); return true;
+        case 41: return ctips.insert(**ctip).second;
+        case 42: return action != tip.state.previous_m4_actions.end();
+        case 43: return action->second.type == DrivechainM4ActionType::UPVOTE;
+        case 44: return action->second.type == DrivechainM4ActionType::ALARM;
+        case 45: return action->second.m6id.IsNull();
+        case 46:
+            action_slot = tip.state.other_slots.find(action->first);
+            return action_slot != tip.state.other_slots.end();
+        case 47: return !action_slot->second.active_proposal_hash.IsNull();
+        case 48: return configured_action_seen;
+        case 49: return !tip.state.active_proposal_hash.IsNull();
+        case 50: configured_action_seen = true; return true;
+        case 51: ++action; return true;
+        default: throw std::logic_error("invalid parent replay tip action");
+        }
+    });
+}
 
 UniValue ParseJson(const std::string& json)
 {
@@ -271,6 +577,55 @@ CTransaction LegacyPublicDeposit()
     stream >> TX_WITH_WITNESS(tx);
     BOOST_REQUIRE(stream.empty());
     return CTransaction(tx);
+}
+
+bool ReferenceVerifyDepositTransaction(
+    const CTransaction& tx,
+    const size_t input_index,
+    const drivechain::AuthenticatedDeposit& authenticated,
+    std::string& error)
+{
+    return [&] {
+        uint32_t facts{0};
+        CAmount witness_value{0};
+        std::array<unsigned char, 2> flags{};
+        std::array<int64_t, 2> amounts{};
+        drivechain::haskell::DepositTransactionFacts([&](uint32_t step) -> uint64_t {
+            switch (step) {
+            case 1: return tx.vin.size();
+            case 2: return input_index;
+            case 3: return tx.witness.vtxinwit.size();
+            case 4: {
+                const auto& input = tx.vin[0];
+                facts = input.m_is_pegin | ((input.prevout == authenticated.outpoint) << 1) |
+                    (input.scriptSig.empty() << 2) | (input.assetIssuance.IsNull() << 3);
+                return facts;
+            }
+            case 5: {
+                CScript claim_script;
+                uint256 mainchain_txid;
+                const bool decoded = GetDrivechainDepositPeginData(tx.witness.vtxinwit[0].m_pegin_witness,
+                    tx.vin[0].prevout, witness_value, claim_script, mainchain_txid);
+                facts |= (decoded << 4) | ((mainchain_txid == authenticated.outpoint.hash) << 5) |
+                    ((claim_script == (CScript() << OP_TRUE)) << 6);
+                return 0;
+            }
+            case 7: case 9: return tx.vout.size();
+            case 8: case 10: {
+                const size_t i = (step - 8) / 2;
+                const auto& output = tx.vout[i];
+                flags[i] = (output.nAsset.IsExplicit() && output.nAsset.GetAsset() == Params().GetConsensus().pegged_asset) |
+                    (output.nValue.IsExplicit() << 1) | (output.nNonce.IsNull() << 2) |
+                    (output.scriptPubKey.empty() << 3) | ((output.scriptPubKey == authenticated.destination_script) << 4);
+                amounts[i] = output.nValue.IsExplicit() ? output.nValue.GetAmount() : 0;
+                return 0;
+            }
+            default: throw std::logic_error("invalid deposit fact projection action");
+            }
+        });
+        return drivechain::haskell::AuthenticatedDeposit(tx.vin.size(), input_index, tx.witness.vtxinwit.size(), facts,
+            authenticated.value, witness_value, tx.vout.size(), flags, amounts, error);
+    }();
 }
 
 struct DeterministicFixture
@@ -1060,7 +1415,7 @@ BOOST_AUTO_TEST_CASE(deposit_codec_dispatch_keeps_native_and_ecx_state_separate)
     BOOST_CHECK(IsDrivechainDepositPeginWitness(native, outpoint, &classified_value));
     BOOST_CHECK_EQUAL(classified_value, 2'000);
     BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(native, outpoint));
-    BOOST_CHECK(GetPeginSpentKey(native, outpoint) == std::make_pair(outpoint.hash, outpoint));
+    BOOST_CHECK(GetPeginSpentKey(native, outpoint) == std::make_pair(outpoint.hash.ToUint256(), outpoint));
 
     for (size_t length : {size_t{0}, size_t{100}, size_t{101}}) {
         CScriptWitness altered = native;
@@ -1471,6 +1826,562 @@ BOOST_AUTO_TEST_CASE(parent_replay_store_flows_preserve_status_and_fault_order)
     }
 }
 
+BOOST_AUTO_TEST_CASE(parent_replay_store_sessions_preserve_recovery_and_atomicity)
+{
+    namespace hs = drivechain::haskell;
+    const auto identity = uint256S("01");
+    const DrivechainParentReplayTip seed{100,uint256S("02"),{}}, next{101,uint256S("03"),{}};
+    const std::vector<DrivechainMintableDeposit> deposits;
+    const std::optional<std::pair<uint256,DrivechainReplayedBmmEdge>> edge;
+    const std::vector<DrivechainSuccessfulWithdrawal> withdrawals;
+    const std::vector<DrivechainWithdrawalProposalIdentity> proposals;
+    for (unsigned family = 0; family < 3; ++family) for (bool late : {false,true}) for (bool native_fault : {false,true}) {
+        DrivechainParentReplayStore store(m_args.GetDataDirBase() / "replay-session-fault",1 << 20,true);
+        std::string error;
+        BOOST_REQUIRE(store.Reset(identity,seed,&error));
+        DrivechainParentReplayTip loaded;
+        auto effects = family == 0 ? store.LoadEffects(identity,loaded,&error) :
+            family == 1 ? store.ResetEffects(identity,seed,&error) :
+                store.AppendEffects(seed,next,deposits,edge,withdrawals,proposals,&error);
+        const auto mode = family == 0 ? hs::ReplayStoreWorkflow::LOAD_SESSION :
+            family == 1 ? hs::ReplayStoreWorkflow::RESET_SESSION : hs::ReplayStoreWorkflow::APPEND_SESSION;
+        const uint32_t fault = family == 0 ? (late ? 6 : 39) : (late ? 23 : 1);
+        std::vector<uint32_t> calls;
+        const auto callback = [&](uint32_t step,uint64_t index,std::span<const unsigned char> input) {
+            calls.push_back(step);
+            if (step == fault && native_fault) return effects(99,0,{});
+            auto reply = effects(step,index,input);
+            if (step == fault) reply.push_back(0);
+            return reply;
+        };
+        const bool recoverable = late || family == 2;
+        if (recoverable) {
+            BOOST_CHECK_EQUAL(hs::RunReplayStore(mode,callback),family == 0 ? 2U : 0U);
+            const std::string prefix = family == 0 ? "persistent parent replay load failed: " :
+                family == 1 ? "failed to rebuild persistent parent replay database: " :
+                    "persistent parent replay append failed: ";
+            const std::string failure = native_fault ?
+                (family == 0 ? "invalid replay load effect" : family == 1 ? "invalid replay reset effect" : "invalid replay append effect") :
+                "Haskell replay store workflow failed";
+            BOOST_CHECK_EQUAL(error,prefix+failure);
+            BOOST_CHECK_EQUAL(calls.back(),43U);
+        } else {
+            BOOST_CHECK_THROW(hs::RunReplayStore(mode,callback),std::exception);
+            BOOST_CHECK_EQUAL(calls.back(),native_fault ? fault : 43U);
+        }
+        BOOST_CHECK(std::find(calls.begin(),calls.end(),24U) == calls.end());
+        effects = {};
+        const auto status = store.Load(identity,loaded,&error);
+        if (family == 1 && late) {
+            BOOST_CHECK(status == DrivechainReplayStoreLoadStatus::EMPTY);
+        } else {
+            BOOST_REQUIRE(status == DrivechainReplayStoreLoadStatus::LOADED);
+            BOOST_CHECK_EQUAL(loaded.height,seed.height);
+            BOOST_CHECK(loaded.hash == seed.hash);
+        }
+        BOOST_REQUIRE(store.Reset(identity,seed,&error));
+        BOOST_REQUIRE(store.Append(seed,next,deposits,edge,withdrawals,proposals,&error));
+        BOOST_REQUIRE(store.Load(identity,loaded,&error) == DrivechainReplayStoreLoadStatus::LOADED);
+        BOOST_CHECK_EQUAL(loaded.height,next.height);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_block_session_preserves_parameters_and_errors)
+{
+    Sidechain::Bitcoin::CBlock block;
+    DrivechainParentReplayState state;
+    const uint256 proposal = uint256S("01");
+    auto effects = MakeDrivechainParentBlockEffects(block, 123, 24, proposal,
+        2,1,4,3,6,5, state, nullptr, nullptr, nullptr, nullptr,
+        drivechain::TreasuryOpcode::NOP5, DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6);
+    const auto parameters = effects(20480,0,{});
+    BOOST_REQUIRE_EQUAL(parameters.size(), 28U);
+    BOOST_CHECK_EQUAL(ReadLE32(parameters.data()), 123U);
+    BOOST_CHECK_EQUAL(ReadLE64(parameters.data()+4), uint64_t{2} | (uint64_t{1}<<16) |
+        (uint64_t{4}<<32) | (uint64_t{3}<<48));
+    BOOST_CHECK_EQUAL(ReadLE32(parameters.data()+12), 6U);
+    BOOST_CHECK_EQUAL(ReadLE32(parameters.data()+16), 5U);
+    BOOST_CHECK_EQUAL(ReadLE32(parameters.data()+20), 0xb4U);
+    BOOST_CHECK_EQUAL(ReadLE32(parameters.data()+24), 1U);
+    auto retained = effects;
+    effects = {};
+    BOOST_CHECK(retained(20481,0,{}) == std::vector<unsigned char>{1});
+    BOOST_CHECK(retained(20481,1,{}) == std::vector<unsigned char>{0});
+    const std::array<std::string, 4> messages{
+        "Haskell parent block replay failed", "Haskell M2 activation failed",
+        "Haskell M3 proposal admission failed", "Haskell M4 workflow failed"};
+    for (unsigned code = 2; code <= 5; ++code) {
+        BOOST_CHECK_EXCEPTION(retained(20481,code,{}), std::runtime_error,
+            [&](const auto& error) { return error.what() == messages[code-2]; });
+    }
+    BOOST_CHECK_THROW(retained(20480,1,{}), std::logic_error);
+    BOOST_CHECK_THROW(retained(20482,0,{}), std::logic_error);
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_cache_progress_matches_previous_control_flow)
+{
+    namespace hs = drivechain::haskell;
+    using Key = std::tuple<std::optional<uint8_t>, std::optional<uint256>, uint256, uint256,
+        std::array<uint16_t, 6>, uint32_t>;
+    using Event = std::tuple<uint32_t, uint64_t, std::vector<unsigned char>>;
+    const auto bytes = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto hash = [](uint32_t height) { return ArithToUint256(arith_uint256{uint64_t{height} + 1}); };
+    struct Rejected {};
+    for (unsigned flags = 0; flags < 64; ++flags) for (unsigned mode = 0; mode < 29; ++mode) {
+        const bool locked = flags & 1, require_active = flags & 2, activated = flags & 4, has_error = flags & 8;
+        const uint32_t checkpoint = flags & 16 ? UINT32_MAX - 3 : 100;
+        uint32_t initial_height = checkpoint + ((flags & 32) ? 2 : 0);
+        uint32_t target = checkpoint + ((flags & 32) ? 1 : 2);
+        if (mode == 6) target = checkpoint - 1;
+        if (mode == 27) { initial_height = UINT32_MAX - 1; target = UINT32_MAX; }
+        if (mode == 28) initial_height = checkpoint - 1;
+        const Key configured{mode == 1 ? std::nullopt : std::optional<uint8_t>{24},
+            mode == 2 ? std::nullopt : std::optional<uint256>{hash(1)}, hash(2),
+            mode == 3 ? uint256{} : hash(checkpoint), {2,1,4,3,6,5}, 5};
+        const auto snapshot = [&](const Key& key, const auto&... fields) {
+            const auto& windows = std::get<4>(key);
+            auto encoded = bytes(std::get<0>(key).has_value(), std::get<0>(key).value_or(0),
+                std::get<1>(key).has_value(), std::get<1>(key).value_or(uint256{}),
+                std::get<2>(key), std::get<3>(key), windows[0], windows[1], windows[2],
+                windows[3], windows[4], windows[5], std::get<5>(key));
+            const auto tail = bytes(fields...);
+            encoded.insert(encoded.end(), tail.begin(), tail.end());
+            return encoded;
+        };
+        struct Result {
+            unsigned status;
+            std::vector<Event> events;
+            std::string error;
+            uint32_t height, remaining;
+            uint256 hash;
+            bool published;
+        };
+        const auto run = [&](bool migrated, size_t fault) -> Result {
+            Key key = configured;
+            if (mode == 5) {
+                switch (flags % 10) {
+                case 0: std::get<0>(key) = 25; break;
+                case 1: std::get<1>(key) = hash(3); break;
+                case 2: std::get<2>(key) = hash(3); break;
+                case 3: std::get<3>(key) = hash(3); break;
+                case 4: std::get<5>(key) = 4; break;
+                default: ++std::get<4>(key)[flags % 6]; break;
+                }
+            }
+            bool initialized = mode != 4 && mode != 22, published = true;
+            uint32_t height = initial_height, remaining = mode == 16 ? 0 : 4;
+            uint256 current_hash = hash(height), pending_hash;
+            unsigned hash_reads{0}, writes{0};
+            std::vector<Event> events;
+            std::string error{"stale"};
+            const uint256 active_proposal = mode == 14 ? hash(3) : hash(1);
+            const uint32_t activation_height = mode == 15 ? target + 1 : checkpoint;
+            Sidechain::Bitcoin::CBlock replay_block;
+            Sidechain::Bitcoin::CMutableTransaction replay_coinbase;
+            replay_coinbase.vin.resize(1);
+            if (mode != 19) replay_block.vtx.push_back(Sidechain::Bitcoin::MakeTransactionRef(replay_coinbase));
+            DrivechainParentReplayState replay_state;
+            DrivechainReplayEffects block_effects;
+            const auto call = [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) -> std::vector<unsigned char> {
+                events.emplace_back(step, index, std::vector<unsigned char>(input.begin(), input.end()));
+                if (fault && events.size() == fault) throw std::domain_error("cache fixture fault");
+                if (step >= 30000 && step <= 50481) {
+                    BOOST_REQUIRE(bool(block_effects));
+                    return block_effects(step-30000,index,input);
+                }
+                if (step != 11 && step != 12 && step != 19 && step != 206 && step != 425 && step != 507 && step != 525) BOOST_CHECK(input.empty());
+                if ((step >= 400 && step <= 443) || (step >= 500 && step <= 543)) {
+                    const bool loading = step < 500;
+                    const auto command = step - (loading ? 400 : 500);
+                    std::vector<unsigned char> reply;
+                    switch (command) {
+                    case 0: case 3: case 5: reply = bytes(true); break;
+                    case 1: reply = bytes(DrivechainParentReplayTip{height,current_hash,{}}); break;
+                    case 2: reply = bytes(DrivechainParentReplayTip{height+1,pending_hash,{}}); break;
+                    case 4: reply = bytes(true,uint32_t{5},hash(1)); break;
+                    case 6: reply = bytes(true,DrivechainParentReplayTip{
+                        loading ? checkpoint : height,loading ? hash(checkpoint) : current_hash,{}}); break;
+                    case 7: reply = bytes(hash(3)); break;
+                    case 8: reply = index == 0 ? bytes(uint32_t{5}) : bytes(uint64_t{0},false,uint64_t{0},uint64_t{0}); break;
+                    case 18: case 23: case 39: break;
+                    case 24: if (mode != 21) ++writes; reply = bytes(mode != 21); break;
+                    case 25: if (has_error) error.assign(input.begin(),input.end()); break;
+                    case 26: reply = bytes(hash(1)); break;
+                    case 43: return bytes(true,static_cast<uint32_t>(index));
+                    default: throw std::logic_error("unexpected cache store effect");
+                    }
+                    reply.insert(reply.begin(),1);
+                    return reply;
+                }
+                switch (step) {
+                case 0: return snapshot(configured, checkpoint, target, hash(target), require_active);
+                case 1: {
+                    auto encoded = snapshot(key, height, current_hash, activated, active_proposal, activation_height);
+                    encoded.insert(encoded.begin(), initialized);
+                    return encoded;
+                }
+                case 2: return bytes(locked);
+                case 3: return bytes(remaining, has_error);
+                case 4: remaining = index; return {};
+                case 5:
+                    BOOST_CHECK(index == 1 || index == 7 || index == 8);
+                    return bytes(int64_t(index == 7 && locked));
+                case 6: published = false; return {};
+                case 7: initialized = false; height = 0; current_hash = {}; return {};
+                case 8: case 26: return {};
+                case 300: return snapshot(configured, std::vector<unsigned char>{1}, hash(1), std::vector<unsigned char>{2},
+                    uint32_t{1}, hash(1), uint32_t{2}, hash(2), checkpoint, hash(4), uint256{}, UINT32_MAX,
+                    int64_t{0}, hash(0), true, uint32_t{5}, uint64_t{MAX_MONEY});
+                case 301: return bytes(hash(1));
+                case 302: return bytes(hash(2));
+                case 303: return mode == 22 || mode == 26 ? bytes(false) : bytes(true, hash(0));
+                case 304: return bytes(true, checkpoint, hash(4));
+                case 319: return bytes(uint64_t{MAX_MONEY});
+                case 320: case 27: return {};
+                case 311: return bytes(checkpoint+1, std::vector<unsigned char>{2}, uint256{}, hash(1),
+                    checkpoint, hash(1), true, hash(2), uint32_t{2}, false);
+                case 310:
+                    if (index == 114) { key = configured; initialized = true; }
+                    if (index == 218) height = checkpoint;
+                    if (index == 219) current_hash = hash(height);
+                    return bytes(int64_t{index == 204 || index == 205 ? 0 :
+                        index == 225 ? checkpoint+1 : index == 209 ? checkpoint : 1});
+                case 9: {
+                    ++hash_reads;
+                    if (mode == 24 && hash_reads == flags % 6 + 1) return bytes(false);
+                    const unsigned corrupt = mode == 8 || mode == 26 ? 2 :
+                        mode >= 9 && mode <= 13 ? (mode == 9 ? 1 : mode - 7) : 0;
+                    return bytes(true, hash(hash_reads == corrupt ? 0 : index));
+                }
+                case 10: return mode == 23 ? bytes(false) : bytes(true, mode == 7 ? height - 1 : height);
+                case 11: if (has_error) error.assign(input.begin(), input.end()); return {};
+                case 12: pending_hash = uint256{input.data(), input.size()}; return {};
+                case 13: return bytes(mode != 25);
+                case 14: return bytes(mode == 17 ? hash(0) : current_hash);
+                case 15: case 18: case 19: case 23: case 25: case 206: return {};
+                case 201: return bytes(int32_t{24}, false, uint256{});
+                case 202: return bytes(true, uint64_t{0});
+                case 16:
+                    replay_state = {};
+                    block_effects = MakeDrivechainParentBlockEffects(replay_block, index, 24,
+                        *std::get<1>(configured), 2,1,4,3,6,5, replay_state, nullptr,
+                        has_error ? &error : nullptr, nullptr, nullptr,
+                        drivechain::TreasuryOpcode::NOP5, DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6);
+                    return block_effects(20480,0,{});
+                case 28: block_effects = {}; return {};
+                case 17: return bytes(mode != 20);
+                case 100: return bytes(uint32_t{1}, std::vector<unsigned char>{}, true, uint8_t{24}, true, hash(1),
+                    uint32_t{2}, hash(2), uint32_t{3}, hash(3), uint32_t{4}, hash(4), uint256{}, uint32_t{0}, int64_t{0});
+                case 20: return bytes(mode != 18);
+                case 21:
+                    return bytes(uint64_t{MAX_MONEY});
+                case 22: BOOST_CHECK(writes > 0); --writes; height = index; current_hash = pending_hash; return {};
+                case 24: BOOST_CHECK_EQUAL(writes, 0U); published = true; return {};
+                default: throw std::logic_error("unexpected cache fixture effect");
+                }
+            };
+            const auto effect = [&](uint32_t step, uint64_t index = 0) { return call(step, index, {}); };
+            const auto boolean = [&](uint32_t step, uint64_t index = 0) { return effect(step,index).at(0) != 0; };
+            const auto fail = [&](const std::string& message) {
+                call(11,0,{reinterpret_cast<const unsigned char*>(message.data()),message.size()});
+                throw Rejected{};
+            };
+            const auto deadline = [&] {
+                effect(5,1); effect(5,7);
+                if (locked) effect(5,8);
+            };
+            const auto active_hash = [&](uint32_t at) {
+                DataStream stream{effect(9,at)};
+                bool present;
+                stream >> present;
+                if (!present) throw Rejected{};
+                uint256 result;
+                stream >> result;
+                return result;
+            };
+            const auto initialize = [&](bool force) {
+                effect(8,force);
+                effect(300); effect(301); effect(302);
+                const bool available = boolean(303);
+                if (available) {
+                    effect(304);
+                    for (uint32_t step = 101; step <= 114; ++step) effect(310,step);
+                    effect(310,200); effect(310,201);
+                    for (uint32_t step = 601; step <= 638; ++step) effect(310,step);
+                    for (uint32_t step : {639,204,205}) effect(310,step);
+                    effect(319);
+                    for (uint32_t step : {439,400,403,404,408,426,405,406}) effect(step);
+                    effect(443,1); effect(320);
+                    effect(311);
+                    for (uint32_t step : {218,219,220,250}) effect(310,step);
+                }
+                effect(26);
+                return available;
+            };
+            const auto reference = [&]() -> unsigned {
+                effect(0);
+                if (!std::get<0>(configured) || !std::get<1>(configured) || std::get<3>(configured).IsNull()) return 1;
+                if (target < checkpoint) fail(strprintf("parent height %u predates native drivechain launch checkpoint %u", target, checkpoint));
+                effect(1);
+                if (!initialized || key != configured) {
+                    if (boolean(2)) fail("authenticated parent replay cache is not warmed");
+                    effect(6); effect(7);
+                    if (!initialize(false)) return 0;
+                    effect(1);
+                }
+                if (active_hash(checkpoint) != std::get<3>(configured)) {
+                    effect(6); fail("active parent chain no longer contains the pinned drivechain launch checkpoint");
+                }
+                bool stale{false};
+                if (target < height) {
+                    DataStream stream{effect(10)};
+                    bool present;
+                    stream >> present;
+                    if (!present) return 0;
+                    uint32_t active;
+                    stream >> active;
+                    stale = active < height;
+                }
+                if (!stale) stale = active_hash(height) != current_hash;
+                if (stale) {
+                    effect(6);
+                    if (boolean(2)) fail("authenticated parent replay cache is stale after a parent reorganization");
+                    effect(7);
+                    if (!initialize(true)) return 0;
+                    effect(1);
+                }
+                if (active_hash(target) != hash(target)) fail("requested parent replay target is not active at its claimed height");
+                if (height < target) {
+                    const auto steps = target-height;
+                    if (boolean(2)) {
+                        deadline(); effect(3);
+                        if (steps > remaining) {
+                            if (has_error) fail(strprintf(
+                                "parent replay needs %u uncached blocks; locked validation permits at most %u before background warming", steps, remaining));
+                            return 0;
+                        }
+                        effect(4,remaining-steps);
+                    }
+                    while (height < target) {
+                        const uint32_t next = height+1;
+                        deadline();
+                        const auto block_hash = active_hash(next);
+                        call(12,next,bytes(block_hash));
+                        if (!boolean(13)) return 0;
+                        DataStream stream{effect(14)};
+                        uint256 previous; stream >> previous;
+                        if (previous != current_hash) {
+                            effect(6); fail("authenticated parent-state replay is not a contiguous chain");
+                        }
+                        effect(15);
+                        effect(16,next);
+                        // The independent cache reference composes the retained
+                        // standalone block interpreter over the same native scope.
+                        const auto replay = hs::ReplayParentBlock(next, {2,1,4,3}, 6,5,0xb4,true,
+                            [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                                return call(30000+step,index,input);
+                            });
+                        const bool applied = boolean(50481,replay);
+                        effect(28);
+                        if (!applied || !boolean(17,next)) { effect(6); return 0; }
+                        effect(100); // No milestone at this fixture's synthetic height.
+                        deadline(); effect(18);
+                        if (checkpoint < next) {
+                            effect(25); effect(201); effect(202);
+                            const std::string message{"BMM successor has no enforcer-recognized M7 for sidechain slot 24"};
+                            call(206,0,{reinterpret_cast<const unsigned char*>(message.data()),message.size()});
+                            call(19,next,bytes(false));
+                        }
+                        if (!boolean(20)) { effect(6); return 0; }
+                        effect(21,next);
+                        for (uint32_t step : {500,501,502,503,504,508,505,506}) effect(step);
+                        const auto state = bytes(DrivechainParentReplayState{});
+                        call(507,0,state); call(507,0,state); effect(508,1);
+                        effect(518); effect(523);
+                        const bool appended = effect(524).at(1) != 0;
+                        if (!appended) {
+                            const std::string message{"failed to atomically append persistent parent replay block"};
+                            call(525,0,{reinterpret_cast<const unsigned char*>(message.data()),message.size()});
+                        }
+                        effect(543,appended); effect(27);
+                        if (!appended) { effect(6); return 0; }
+                        effect(22,next); effect(23);
+                    }
+                }
+                if (active_hash(checkpoint) != std::get<3>(configured)) {
+                    effect(6); fail("parent-chain reorg raced the pinned launch checkpoint check");
+                }
+                if (active_hash(target) != hash(target)) {
+                    effect(6); fail("parent-chain reorg raced the replay target check");
+                }
+                effect(1);
+                if (active_hash(height) != current_hash) {
+                    effect(6); fail("parent-chain reorg raced the replay cache tip check");
+                }
+                if (require_active && !(activated && active_proposal == *std::get<1>(key) && activation_height <= target))
+                    fail(strprintf("configured Elements slot proposal is not active at parent height %u", target));
+                deadline(); effect(24);
+                return 1;
+            };
+            unsigned status;
+            try { status = migrated ? hs::RunReplayStore(hs::ReplayStoreWorkflow::CACHE, call) : reference(); }
+            catch (const Rejected&) { status = 0; }
+            catch (const std::domain_error&) { status = 2; }
+            return {status, events, error, height, remaining, current_hash, published};
+        };
+        const auto expected = run(false,0);
+        for (size_t fault = 0; fault <= expected.events.size(); ++fault) {
+            const auto reference = fault ? run(false,fault) : expected;
+            const auto actual = run(true,fault);
+            BOOST_CHECK_EQUAL(actual.status, reference.status);
+            BOOST_CHECK(actual.events == reference.events);
+            BOOST_CHECK_EQUAL(actual.error, reference.error);
+            BOOST_CHECK_EQUAL(actual.height, reference.height);
+            BOOST_CHECK_EQUAL(actual.remaining, reference.remaining);
+            BOOST_CHECK(actual.hash == reference.hash);
+            BOOST_CHECK_EQUAL(actual.published, reference.published);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_load_preserves_states_errors_and_faults)
+{
+    namespace hs = drivechain::haskell;
+    const auto bytes = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto identity = uint256S("01");
+    for (unsigned flags = 0; flags < 1024; ++flags) {
+        const bool open = flags & 1, present = flags & 2, readable = flags & 4, schema = flags & 8;
+        const bool matches = flags & 16, has_tip = flags & 32, read_tip = flags & 64, sane = flags & 128;
+        const bool has_error = flags & 256;
+        const uint32_t version = flags & 512 ? 5 : 4;
+        DrivechainParentReplayTip tip;
+        tip.height = 100;
+        if (sane) tip.hash = uint256S("02");
+        std::vector<uint32_t> expected{39, 0};
+        std::string expected_error;
+        unsigned status{2};
+        if (!open) expected_error = "persistent parent replay database is not open";
+        else {
+            expected.push_back(3);
+            if (!present) {
+                expected.push_back(5);
+                if (has_tip) expected_error = "persistent parent replay has a tip but no identity";
+                else status = 0;
+            } else {
+                expected.push_back(4);
+                if (!readable) expected_error = "persistent parent replay identity record is malformed";
+                else {
+                    expected.push_back(8);
+                    if (schema) expected.push_back(26);
+                    if (!schema || !matches) {
+                        status = 3;
+                        expected_error = "persistent parent replay schema or immutable network identity does not match";
+                    } else {
+                        expected.push_back(5);
+                        if (has_tip) expected.push_back(6);
+                        if (has_tip && !read_tip) expected_error = "persistent parent replay tip record is malformed";
+                        else if (!has_tip || !sane) expected_error = "persistent parent replay tip is missing or internally inconsistent";
+                        else status = 1;
+                    }
+                }
+            }
+        }
+        if (!expected_error.empty()) expected.push_back(25);
+        for (size_t fault = 0; fault <= expected.size(); ++fault) {
+            std::vector<uint32_t> seen;
+            std::string error{"stale"};
+            const auto run = [&] {
+                return hs::RunReplayStore(hs::ReplayStoreWorkflow::LOAD,
+                    [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                        seen.push_back(step);
+                        BOOST_CHECK_EQUAL(index, 0U);
+                        if (fault && seen.size() == fault) throw std::domain_error("load fixture fault");
+                        if (step == 25) {
+                            if (has_error) error.assign(input.begin(), input.end());
+                            return std::vector<unsigned char>{};
+                        }
+                        BOOST_CHECK(input.empty());
+                        switch (step) {
+                        case 0: return bytes(open);
+                        case 3: return bytes(present);
+                        case 4: return readable ? bytes(true, uint32_t(schema ? version : 0), matches ? identity : uint256{}) : bytes(false);
+                        case 5: return bytes(has_tip);
+                        case 6: return read_tip ? bytes(true, tip) : bytes(false);
+                        case 8: return bytes(version);
+                        case 26: return bytes(identity);
+                        case 39: if (has_error) error.clear(); return std::vector<unsigned char>{};
+                        default: throw std::logic_error("unexpected load effect");
+                        }
+                    });
+            };
+            if (fault) BOOST_CHECK_THROW(run(), std::domain_error);
+            else {
+                BOOST_CHECK_EQUAL(run(), status);
+                BOOST_CHECK_EQUAL(error, has_error ? expected_error : "stale");
+            }
+            auto prefix = expected;
+            if (fault) prefix.resize(fault);
+            BOOST_CHECK(seen == prefix);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_reset_validates_before_release_and_commits_once)
+{
+    namespace hs = drivechain::haskell;
+    const auto bytes = [](const auto& value) {
+        DataStream stream;
+        stream << value;
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    for (unsigned flags = 0; flags < 8; ++flags) {
+        const bool sane = flags & 1, committed = flags & 2, has_error = flags & 4;
+        DrivechainParentReplayTip seed;
+        if (sane) seed.hash = uint256S("01");
+        const unsigned status = sane && committed;
+        std::vector<uint32_t> expected{1};
+        if (sane) expected.insert(expected.end(), {40, 41, 42, 23, 24});
+        if (!status) expected.push_back(25);
+        const std::string expected_error = !has_error || status ? "stale" : sane ?
+            "failed to atomically seed persistent parent replay" :
+            "refusing to seed persistent parent replay with an invalid tip";
+        for (size_t fault = 0; fault <= expected.size(); ++fault) {
+            std::vector<uint32_t> seen;
+            std::string error{"stale"};
+            const auto run = [&] {
+                return hs::RunReplayStore(hs::ReplayStoreWorkflow::RESET,
+                    [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                        seen.push_back(step);
+                        BOOST_CHECK_EQUAL(index, 0U);
+                        if (fault && seen.size() == fault) throw std::domain_error("reset fixture fault");
+                        if (step == 25) {
+                            if (has_error) error.assign(input.begin(), input.end());
+                        } else BOOST_CHECK(input.empty());
+                        switch (step) {
+                        case 1: return bytes(seed);
+                        case 24: return bytes(committed);
+                        case 23: case 25: case 40: case 41: case 42: return std::vector<unsigned char>{};
+                        default: throw std::logic_error("unexpected reset effect");
+                        }
+                    });
+            };
+            if (fault) BOOST_CHECK_THROW(run(), std::domain_error);
+            else { BOOST_CHECK_EQUAL(run(), status); BOOST_CHECK_EQUAL(error, expected_error); }
+            auto prefix = expected;
+            if (fault) prefix.resize(fault);
+            BOOST_CHECK(seen == prefix);
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(parent_replay_append_preserves_loops_batch_order_and_faults)
 {
     namespace hs = drivechain::haskell;
@@ -1552,6 +2463,398 @@ BOOST_AUTO_TEST_CASE(parent_replay_append_preserves_loops_batch_order_and_faults
                 }), NativeFault);
                 BOOST_CHECK_EQUAL(reads, fault + 1);
             }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_lookup_preserves_records_status_and_faults)
+{
+    namespace hs = drivechain::haskell;
+    const auto bytes = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto id = uint256S("01"), block = uint256S("02");
+    const Sidechain::Bitcoin::COutPoint out(id, 0);
+    constexpr const char* descriptions[]{"deposit", "BMM edge", "successful withdrawal", "withdrawal occurrence"};
+    constexpr const char* inconsistent[]{"deposit record", "BMM edge", "successful-withdrawal record", "withdrawal occurrence"};
+    for (unsigned family = 0; family < 4; ++family)
+    for (unsigned variant = 0; variant < 16; ++variant)
+    for (unsigned flags = 0; flags < 16; ++flags) {
+        const bool open = flags & 1, schema = flags & 2, present = flags & 4, readable = flags & 8;
+        const auto kind = static_cast<hs::ReplayStoreWorkflow>(family + 2);
+        std::vector<unsigned char> key, record;
+        bool sane{false};
+        if (family == 0) {
+            DrivechainMintableDeposit value{out, block, 1, 1000, {0x51}};
+            switch (variant) {
+            case 1: value.outpoint.hash.SetNull(); break;
+            case 2: value.outpoint.n = UINT32_MAX; break;
+            case 3: value.block_hash.SetNull(); break;
+            case 4: value.value = -1; break;
+            case 5: value.value = 0; break;
+            case 6: value.value = MAX_MONEY; break;
+            case 7: value.value = MAX_MONEY + 1; break;
+            case 8: value.address.clear(); break;
+            case 9: value.address.resize(10000); break;
+            case 10: value.address.resize(10001); break;
+            case 11: value.outpoint.n = 1; break;
+            case 12: value.block_height = UINT32_MAX; break;
+            default: break;
+            }
+            const uint32_t facts = !value.outpoint.hash.IsNull() | ((value.outpoint.n != UINT32_MAX) << 1) |
+                ((!value.block_hash.IsNull()) << 2);
+            sane = hs::ParentReplayRecord(hs::ReplayRecordKind::DEPOSIT, facts, value.value, value.address.size(), MAX_MONEY) && value.outpoint == out;
+            key = bytes(out); record = bytes(true, value);
+        } else if (family == 1) {
+            DrivechainReplayedBmmEdge value{block, 0, 1, true, id};
+            uint256 parent = id;
+            switch (variant) {
+            case 1: parent.SetNull(); break;
+            case 2: value.successor_hash.SetNull(); break;
+            case 3: value.parent_height = UINT32_MAX; value.successor_height = 0; break;
+            case 4: value.successor_height = 0; break;
+            case 5: value.successor_height = 2; break;
+            case 6: value.committed_sidechain_hash.SetNull(); break;
+            case 7: value.has_canonical_commitment = false; break;
+            case 8: value.has_canonical_commitment = false; value.committed_sidechain_hash.SetNull(); break;
+            case 9: value.parent_height = UINT32_MAX-1; value.successor_height = UINT32_MAX; break;
+            default: break;
+            }
+            const uint32_t facts = !parent.IsNull() | ((!value.successor_hash.IsNull()) << 1) |
+                (value.has_canonical_commitment << 2) | ((!value.committed_sidechain_hash.IsNull()) << 3);
+            sane = hs::ParentReplayRecord(hs::ReplayRecordKind::EDGE, facts, 0, value.parent_height, value.successor_height);
+            key = bytes(parent); record = bytes(true, value);
+        } else {
+            DrivechainSuccessfulWithdrawal value{24, id, 1, block};
+            switch (variant) {
+            case 1: value.block_hash.SetNull(); break;
+            case 2: value.sidechain_slot = 25; break;
+            case 3: value.m6id.SetNull(); break;
+            case 4: value.block_height = 2; break;
+            case 5: value.block_height = UINT32_MAX; break;
+            default: break;
+            }
+            sane = !value.block_hash.IsNull() && value.sidechain_slot == 24 && value.m6id == id &&
+                (family != 3 || value.block_height == 1);
+            key = family == 3 ? bytes(uint8_t{24}, id, uint32_t{1}) : bytes(uint8_t{24}, id);
+            record = bytes(true, value);
+        }
+        std::vector<uint32_t> expected{0};
+        std::string expected_error;
+        unsigned status{0};
+        if (open && family == 3) expected.push_back(8);
+        if (!open || (family == 3 && !schema)) {
+            status = 2;
+            expected_error = family == 3 ? "withdrawal occurrence lookup requires the re-proposal replay schema" :
+                "persistent parent replay database is not open";
+        } else {
+            expected.push_back(27);
+            if (!present) status = 1;
+            else {
+                expected.push_back(28);
+                if (!readable) {
+                    status = 2;
+                    expected_error = strprintf("persistent parent replay %s record is malformed", descriptions[family]);
+                } else {
+                    expected.push_back(26);
+                    if (!sane) {
+                        status = 2;
+                        expected_error = strprintf("persistent parent replay %s is internally inconsistent", inconsistent[family]);
+                    }
+                }
+            }
+        }
+        if (!expected_error.empty()) expected.push_back(25);
+        for (size_t fault = 0; fault <= expected.size(); ++fault) {
+            std::vector<uint32_t> seen;
+            std::string error;
+            const auto run = [&] {
+                return hs::RunReplayStore(kind,[&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                    seen.push_back(step);
+                    BOOST_CHECK_EQUAL(index, 0U);
+                    if (fault && seen.size() == fault) throw std::domain_error("lookup fixture fault");
+                    if (step == 25) { error.assign(input.begin(), input.end()); return std::vector<unsigned char>{}; }
+                    BOOST_CHECK(input.empty());
+                    switch (step) {
+                    case 0: return bytes(open);
+                    case 8: return bytes(uint32_t(schema ? 5 : 4));
+                    case 26: return key;
+                    case 27: return bytes(present);
+                    case 28: return readable ? record : bytes(false);
+                    default: throw std::logic_error("unexpected lookup effect");
+                    }
+                });
+            };
+            if (fault) BOOST_CHECK_THROW(run(), std::domain_error);
+            else { BOOST_CHECK_EQUAL(run(), status); BOOST_CHECK_EQUAL(error, expected_error); }
+            auto prefix = expected;
+            if (fault) prefix.resize(fault);
+            BOOST_CHECK(seen == prefix);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_tip_matches_native_records)
+{
+    namespace hs = drivechain::haskell;
+    FastRandomContext rng(true);
+    const auto bytes = [](const DrivechainParentReplayTip& tip) {
+        DataStream stream;
+        stream << tip;
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto run = [&](const std::vector<unsigned char>& record) {
+        return hs::RunReplayStore(hs::ReplayStoreWorkflow::CHECK_TIP,
+            [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                BOOST_REQUIRE_EQUAL(step, 1U);
+                BOOST_REQUIRE_EQUAL(index, 0U);
+                BOOST_REQUIRE(input.empty());
+                return record;
+            });
+    };
+    DrivechainParentReplayTip seed;
+    seed.height = 100;
+    seed.hash = uint256S("01");
+    seed.state.active_proposal_hash = uint256S("02");
+    seed.state.required_proposal_activated = true;
+    seed.state.required_activation_height = 50;
+    seed.state.required_activation_block_hash = uint256S("03");
+    seed.state.pending_proposals.emplace(uint256S("04"), DrivechainPendingProposal{90, 10});
+    seed.state.pending_withdrawals.push_back({uint256S("05"), 90, 12});
+    seed.state.ctip = Sidechain::Bitcoin::COutPoint(uint256S("06"), 0);
+    seed.state.ctip_value = 100;
+    seed.state.other_slots[7].active_proposal_hash = uint256S("07");
+    seed.state.other_slots[7].ctip = Sidechain::Bitcoin::COutPoint(uint256S("08"), 0);
+    seed.state.other_slots[7].ctip_value = 100;
+    seed.state.previous_m4_actions[7] = {DrivechainM4ActionType::ALARM, {}};
+    seed.state.previous_m4_actions[24] = {DrivechainM4ActionType::UPVOTE, uint256S("09")};
+    for (unsigned fixture = 0; fixture < 10000; ++fixture) {
+        auto tip = seed;
+        auto& state = tip.state;
+        for (unsigned mutation = 0; mutation < fixture % 4; ++mutation) {
+            switch (rng.randrange(22)) {
+            case 0: tip.height = rng.randbool() ? rng.rand32() : 0; break;
+            case 1: tip.hash.SetNull(); break;
+            case 2: state.active_proposal_hash.SetNull(); break;
+            case 3: state.required_proposal_activated = rng.randbool(); break;
+            case 4: state.required_activation_height = rng.rand32(); break;
+            case 5: state.required_activation_block_hash.SetNull(); break;
+            case 6: state.ctip.reset(); break;
+            case 7: state.ctip_value = rng.randbool() ? -1 : MAX_MONEY + 1; break;
+            case 8: state.pending_proposals[uint256{}] = {0, 0}; break;
+            case 9: state.pending_proposals.begin()->second.proposal_height = rng.rand32(); break;
+            case 10: state.pending_proposals.begin()->second.votes = rng.rand32(); break;
+            case 11: state.pending_withdrawals.front().proposal_height = rng.rand32(); break;
+            case 12: state.pending_withdrawals.front().votes = rng.randrange(65536); break;
+            case 13: state.pending_withdrawals.push_back(state.pending_withdrawals.front()); break;
+            case 14: state.other_slots[7].ctip = state.ctip; break;
+            case 15: state.other_slots[7].active_proposal_hash.SetNull(); break;
+            case 16: state.other_slots[7].ctip_value = rng.randbool() ? -1 : 0; break;
+            case 17: state.other_slots[7].pending_withdrawals = state.pending_withdrawals; break;
+            case 18: state.previous_m4_actions[25] = state.previous_m4_actions[24]; break;
+            case 19: state.previous_m4_actions[7].type = static_cast<DrivechainM4ActionType>(rng.randrange(256)); break;
+            case 20: state.previous_m4_actions[7].m6id = uint256S("01"); break;
+            case 21: state.previous_m4_actions.clear(); break;
+            }
+        }
+        BOOST_CHECK_EQUAL(run(bytes(tip)), OriginalReplayTip(tip));
+    }
+    auto encoded = bytes(seed);
+    for (size_t length = 0; length < encoded.size(); ++length) {
+        BOOST_CHECK_THROW(run({encoded.begin(), encoded.begin() + length}), std::runtime_error);
+    }
+    encoded.push_back(0);
+    BOOST_CHECK_THROW(run(encoded), std::runtime_error);
+    auto large = seed;
+    for (uint32_t i = 0; i < 300; ++i) {
+        uint256 key;
+        WriteLE32(key.begin(), i + 1);
+        large.state.pending_proposals.emplace(key, DrivechainPendingProposal{90, i % 11});
+    }
+    BOOST_CHECK_EQUAL(run(bytes(large)), OriginalReplayTip(large));
+}
+
+
+BOOST_AUTO_TEST_CASE(parent_replay_typed_append_preserves_records_and_effects)
+{
+    namespace hs = drivechain::haskell;
+    const auto encode = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto nonzero = [](const uint256& hash) { return !hash.IsNull(); };
+    struct Fixture {
+        DrivechainParentReplayTip previous, next, stored;
+        uint32_t schema{4}, stored_schema{4};
+        bool open{true}, identity_exists{true}, identity_read{true}, tip_exists{true}, tip_read{true}, commit{true};
+        bool deposit_exists{false}, edge_exists{false}, withdrawal_exists{false}, occurrence_exists{false}, proposal_exists{false};
+        std::vector<DrivechainMintableDeposit> deposits;
+        std::optional<std::pair<uint256, DrivechainReplayedBmmEdge>> edge;
+        std::vector<DrivechainSuccessfulWithdrawal> withdrawals;
+        std::vector<DrivechainWithdrawalProposalIdentity> proposals;
+    };
+    Fixture seed;
+    seed.previous.height = 100;
+    seed.previous.hash = uint256S("01");
+    seed.next.height = 101;
+    seed.next.hash = uint256S("02");
+    seed.stored = seed.previous;
+    seed.deposits.push_back({{uint256S("03"), 0}, seed.next.hash, 101, 100, {0x51}});
+    seed.edge = std::make_pair(seed.previous.hash, DrivechainReplayedBmmEdge{seed.next.hash, 100, 101, true, uint256S("04")});
+    seed.withdrawals.push_back({24, uint256S("05"), 101, seed.next.hash});
+    seed.proposals.push_back({24, uint256S("06")});
+    using Event = std::tuple<uint32_t, uint64_t, std::vector<unsigned char>>;
+    using Events = std::vector<Event>;
+    struct NativeFault {};
+    const auto run = [&](const Fixture& f, bool migrated, int fault, Events& events) {
+        const auto call = [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) -> std::vector<unsigned char> {
+            // Compare observable database effects and diagnostics, not pure field reads.
+            if (step == 3 || step == 4 || step == 5 || step == 6 || step == 10 || step == 12 ||
+                step == 14 || step == 15 || step == 17 || step >= 18) {
+                events.emplace_back(step, index, std::vector<unsigned char>(input.begin(), input.end()));
+                if (static_cast<int>(events.size()) == fault) throw NativeFault{};
+            }
+            switch (step) {
+            case 0: return encode(f.open);
+            case 1: return encode(f.previous);
+            case 2: return encode(f.next);
+            case 3: return encode(f.identity_exists);
+            case 4: return f.identity_read ? encode(true, f.stored_schema, uint256{}) : encode(false);
+            case 5: return encode(f.tip_exists);
+            case 6: return f.tip_read ? encode(true, f.stored) : encode(false);
+            case 7: return encode(Hash(input));
+            case 8: return index == 0 ? encode(f.schema) : encode(uint64_t{f.deposits.size()}, f.edge.has_value(),
+                uint64_t{f.withdrawals.size()}, uint64_t{f.proposals.size()});
+            case 9: return encode(f.deposits.at(index));
+            case 10: return encode(f.deposit_exists);
+            case 11: return encode(f.edge.value());
+            case 12: return encode(f.edge_exists);
+            case 13: return encode(f.withdrawals.at(index));
+            case 14: return encode(f.withdrawal_exists);
+            case 15: return encode(f.occurrence_exists);
+            case 16: return encode(f.proposals.at(index).sidechain_slot, f.proposals.at(index).m6id);
+            case 17: return encode(f.proposal_exists);
+            case 24: return encode(f.commit);
+            default: return {};
+            }
+        };
+        try {
+            if (migrated) return int(hs::RunReplayStore(hs::ReplayStoreWorkflow::APPEND, call));
+            const auto effect = [&](uint32_t step, uint64_t index = 0) { call(step, index, {}); };
+            const auto query = [&](uint32_t step, uint64_t index = 0) { return call(step, index, {}).at(0) != 0; };
+            const auto error = [&](const std::string& message) {
+                call(25, 0, std::span{reinterpret_cast<const unsigned char*>(message.data()), message.size()});
+                return 0;
+            };
+            const auto read = [&](uint32_t present, uint32_t record, const char* name) {
+                if (!query(present)) return false;
+                if (query(record)) return true;
+                error(std::string("persistent parent replay ") + name + " record is malformed");
+                return false;
+            };
+            if (!f.open) return error("persistent parent replay database is not open");
+            if (!OriginalReplayTip(f.previous) || !OriginalReplayTip(f.next) ||
+                f.previous.height == UINT32_MAX || f.next.height != f.previous.height + 1)
+                return error("refusing a non-contiguous persistent parent replay append");
+            if (!read(3, 4, "identity") || f.stored_schema != f.schema)
+                return error("persistent parent replay append uses the wrong schema");
+            if (!read(5, 6, "tip") || f.stored.height != f.previous.height || f.stored.hash != f.previous.hash ||
+                (HashWriter{} << f.stored.state).GetHash() != (HashWriter{} << f.previous.state).GetHash())
+                return error("persistent parent replay tip changed before append");
+            std::set<Sidechain::Bitcoin::COutPoint> deposits;
+            for (size_t i = 0; i < f.deposits.size(); ++i) {
+                const auto& d = f.deposits[i];
+                const uint32_t facts = nonzero(d.outpoint.hash) | ((d.outpoint.n != UINT32_MAX) << 1) | (nonzero(d.block_hash) << 2);
+                if (!hs::ParentReplayRecord(hs::ReplayRecordKind::DEPOSIT, facts, d.value, d.address.size(), MAX_MONEY) ||
+                    d.block_height != f.next.height || d.block_hash != f.next.hash || !deposits.insert(d.outpoint).second || query(10, i))
+                    return error("persistent parent replay append contains a duplicate or malformed deposit");
+            }
+            if (f.edge) {
+                const auto& [parent, edge] = *f.edge;
+                const uint32_t facts = nonzero(parent) | (nonzero(edge.successor_hash) << 1) |
+                    (edge.has_canonical_commitment << 2) | (nonzero(edge.committed_sidechain_hash) << 3);
+                if (!hs::ParentReplayRecord(hs::ReplayRecordKind::EDGE, facts, 0, edge.parent_height, edge.successor_height) ||
+                    edge.parent_height != f.previous.height || edge.successor_height != f.next.height ||
+                    edge.successor_hash != f.next.hash || parent != f.previous.hash || query(12))
+                    return error("persistent parent replay append contains a duplicate or malformed BMM edge");
+            }
+            std::set<std::pair<uint8_t, uint256>> withdrawals, proposals;
+            for (size_t i = 0; i < f.withdrawals.size(); ++i) {
+                const auto& w = f.withdrawals[i];
+                if (!nonzero(w.block_hash) || w.block_height != f.next.height || w.block_hash != f.next.hash ||
+                    !withdrawals.emplace(w.sidechain_slot, w.m6id).second || (f.schema == 4 && query(14, i)) || query(15, i))
+                    return error("persistent parent replay append contains a duplicate or malformed successful withdrawal");
+            }
+            for (size_t i = 0; i < f.proposals.size(); ++i) {
+                const auto& p = f.proposals[i];
+                if (!proposals.emplace(p.sidechain_slot, p.m6id).second)
+                    return error("persistent parent replay append contains a duplicate M3 proposal identity");
+                if (f.schema == 4 && query(17, i))
+                    return error("M3 re-proposes a withdrawal that already succeeded on the active parent chain");
+            }
+            effect(18);
+            for (size_t i = 0; i < f.deposits.size(); ++i) effect(19, i);
+            if (f.edge) effect(20);
+            for (size_t i = 0; i < f.withdrawals.size(); ++i) {
+                if (!query(14, i)) effect(21, i);
+                if (f.schema == 5) effect(22, i);
+            }
+            effect(23);
+            return query(24) ? 1 : error("failed to atomically append persistent parent replay block");
+        } catch (const NativeFault&) {
+            return -1;
+        }
+    };
+    FastRandomContext rng(true);
+    for (unsigned fixture = 0; fixture < 1800; ++fixture) {
+        auto f = seed;
+        f.schema = f.stored_schema = fixture % 2 ? 5 : 4;
+        if (fixture % 6 == 0) { f.deposits.clear(); f.withdrawals.clear(); f.proposals.clear(); f.edge.reset(); }
+        for (unsigned mutation = 0; mutation < fixture % 4; ++mutation) {
+            switch (rng.randrange(28)) {
+            case 0: f.open = false; break;
+            case 1: f.identity_exists = false; break;
+            case 2: f.identity_read = false; break;
+            case 3: f.tip_exists = false; break;
+            case 4: f.tip_read = false; break;
+            case 5: f.commit = false; break;
+            case 6: f.stored_schema = 99; break;
+            case 7: f.previous.height = UINT32_MAX; break;
+            case 8: f.next.height = rng.rand32(); break;
+            case 9: f.next.hash.SetNull(); break;
+            case 10: f.stored.height = 99; break;
+            case 11: f.stored.hash.SetNull(); break;
+            case 12: f.stored.state.ctip_value = 1; break;
+            case 13: f.deposit_exists = true; break;
+            case 14: f.edge_exists = true; break;
+            case 15: f.withdrawal_exists = true; break;
+            case 16: f.occurrence_exists = true; break;
+            case 17: f.proposal_exists = true; break;
+            case 18: f.deposits.push_back(seed.deposits.front()); break;
+            case 19: f.withdrawals.push_back(seed.withdrawals.front()); break;
+            case 20: f.proposals.push_back(seed.proposals.front()); break;
+            case 21: if (!f.deposits.empty()) f.deposits[0].value = rng.randbool() ? -1 : MAX_MONEY + 1; break;
+            case 22: if (!f.deposits.empty()) f.deposits[0].address.resize(rng.randbool() ? 0 : 10001); break;
+            case 23: if (!f.deposits.empty()) f.deposits[0].outpoint.SetNull(); break;
+            case 24: if (!f.withdrawals.empty()) f.withdrawals[0].block_height = 100; break;
+            case 25: if (f.edge) f.edge->second.committed_sidechain_hash.SetNull(); break;
+            case 26: if (f.edge) f.edge->first.SetNull(); break;
+            case 27: if (!f.deposits.empty()) f.deposits[0].block_hash.SetNull(); break;
+            }
+        }
+        Events expected, actual;
+        const int status = run(f, false, -1, expected);
+        BOOST_CHECK_EQUAL(run(f, true, -1, actual), status);
+        BOOST_CHECK(actual == expected);
+        for (size_t fault = 1; fault <= expected.size(); ++fault) {
+            Events old_fault, new_fault;
+            BOOST_CHECK_EQUAL(run(f, false, fault, old_fault), -1);
+            BOOST_CHECK_EQUAL(run(f, true, fault, new_fault), -1);
+            BOOST_CHECK(new_fault == old_fault);
+            BOOST_CHECK_EQUAL(new_fault.size(), fault);
         }
     }
 }
@@ -2470,6 +3773,124 @@ BOOST_AUTO_TEST_CASE(authenticated_json_preserves_lazy_transport_and_response_cl
     }
 }
 
+BOOST_AUTO_TEST_CASE(bmm_context_workflow_preserves_native_faults_and_lock_lifetimes)
+{
+    namespace hs = drivechain::haskell;
+    using Event = std::pair<uint32_t,uint64_t>;
+    for (unsigned route = 0; route < 5; ++route) {
+        const bool cached = route == 2, peer = route == 1 || route == 3;
+        std::vector<Event> expected;
+        const auto steps = [&](std::initializer_list<uint32_t> values) {
+            for (const auto value : values) expected.emplace_back(value,0);
+        };
+        steps({1,2,3,4,6,9,10});
+        if (cached) steps({11});
+        expected.emplace_back(13,cached ? 1 : 0);
+        steps({15});
+        expected.emplace_back(10,1);
+        steps({13,15,16});
+        if (cached) {
+            steps({17,18,19,20,21,22,23,24,25,26});
+        } else {
+            steps({27});
+            if (peer) {
+                steps({28,29});
+                for (uint64_t index = 1; index <= 14; ++index) expected.emplace_back(30,index);
+                steps({31,32});
+                if (route == 1) {
+                    expected.emplace_back(0,8);
+                    steps({43});
+                } else {
+                    steps({33,34,78,38,39,40,41,42,43,27,48,54,55,57,58});
+                    expected.emplace_back(59,101);
+                    steps({60,61,62,63,64,65,66,67,68,69,70,72,73,74,75,77});
+                }
+            } else {
+                steps({27,44,48});
+                if (route == 4) {
+                    steps({49,50});
+                    expected.emplace_back(51,5);
+                    steps({52});
+                }
+            }
+        }
+        for (unsigned kind = 0; kind < 4; ++kind) {
+            const size_t attempts = kind == 0 ? 1 : expected.size();
+            for (size_t fault = 0; fault < attempts; ++fault) {
+                std::mutex cache_mutex, replay_mutex;
+                std::vector<Event> seen;
+                bool standard{false}, nonstandard{false};
+                unsigned status{99};
+                {
+                    std::optional<std::unique_lock<std::mutex>> cache_lock, replay_lock;
+                    const auto scalar = [](uint64_t value) {
+                        std::vector<unsigned char> bytes(8);
+                        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = value >> (8*i);
+                        return bytes;
+                    };
+                    const auto native = [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                        BOOST_REQUIRE(input.empty());
+                        const auto position = seen.size();
+                        seen.emplace_back(step,index);
+                        if (kind == 1 && position == fault) throw std::runtime_error("original BMM context failure");
+                        if (kind == 2 && position == fault) throw 678;
+                        if (kind == 3 && position == fault) return std::vector<unsigned char>(9,0);
+                        switch (step) {
+                        case 0: return scalar(3);
+                        case 2: cache_lock.emplace(cache_mutex,std::defer_lock); break;
+                        case 4: return scalar(cache_lock->try_lock());
+                        case 6: case 11: case 23: case 24: case 31: case 73: return scalar(7);
+                        case 10: return scalar(cached && index == 0 ? 1 : 0);
+                        case 16: return scalar(cached ? 1 : 0);
+                        case 27: return scalar(peer);
+                        case 28: replay_lock.emplace(replay_mutex,std::defer_lock); break;
+                        case 29: return scalar(replay_lock->try_lock());
+                        case 32: return scalar(route != 1);
+                        case 34: case 78: return scalar(0);
+                        case 38: case 39: case 62: return scalar(101);
+                        case 40: case 54: case 58: return scalar(100);
+                        case 43: replay_lock.reset(); break;
+                        case 44: return scalar(0);
+                        case 48:
+                            BOOST_CHECK(!replay_lock);
+                            return scalar(route == 0 ? 2 : route == 4 ? 1 : 0);
+                        case 55: return scalar(99);
+                        default: break;
+                        }
+                        return scalar(1);
+                    };
+                    try {
+                        status = hs::RunReplayStore(hs::ReplayStoreWorkflow::BMM_CONTEXT,native);
+                    } catch (const std::exception& error) {
+                        standard = true;
+                        if (kind == 1) BOOST_CHECK_EQUAL(error.what(),"original BMM context failure");
+                    } catch (int value) {
+                        nonstandard = true;
+                        BOOST_CHECK_EQUAL(value,678);
+                    }
+                }
+                std::unique_lock recovered_cache(cache_mutex,std::try_to_lock);
+                BOOST_REQUIRE(recovered_cache.owns_lock());
+                std::unique_lock recovered_replay(replay_mutex,std::try_to_lock);
+                BOOST_REQUIRE(recovered_replay.owns_lock());
+                if (kind == 0) {
+                    BOOST_CHECK(!standard && !nonstandard);
+                    BOOST_CHECK_EQUAL(status,route < 2 ? 3U : route == 4 ? 2U : 0U);
+                    BOOST_CHECK(seen == expected);
+                } else {
+                    BOOST_CHECK(kind == 2 ? nonstandard : standard);
+                    std::vector<Event> prefix(expected.begin(),expected.begin()+fault+1);
+                    const auto opened = std::find(expected.begin(),expected.end(),Event{28,0});
+                    const auto closed = std::find(expected.begin(),expected.end(),Event{43,0});
+                    if (kind == 3 && opened != expected.end() && expected.begin()+fault > opened &&
+                        expected.begin()+fault < closed) prefix.emplace_back(43,0);
+                    BOOST_CHECK(seen == prefix);
+                }
+            }
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(bmm_successor_preserves_preparation_and_failure_order)
 {
     namespace hs = drivechain::haskell;
@@ -3263,6 +4684,70 @@ BOOST_AUTO_TEST_CASE(deposit_preflight_preserves_diagnostics_and_lazy_identity)
     }
 }
 
+BOOST_FIXTURE_TEST_CASE(deposit_admission_native_entry_preserves_status_and_errors, SlotAssignedPeginSetup)
+{
+    const auto& consensus = Params().GetConsensus();
+    BOOST_REQUIRE(consensus.drivechain_slot.has_value());
+    const int configured = *consensus.drivechain_slot;
+    for (const int slot : {INT_MIN, -1, 0, configured, 255, 256, INT_MAX}) {
+        for (const CAmount amount : {INT64_MIN, int64_t{-1}, int64_t{0}, int64_t{1}, int64_t{MAX_MONEY}, int64_t{MAX_MONEY+1}, INT64_MAX}) {
+            for (const size_t size : {size_t{0},size_t{1},size_t{128},size_t{129}}) {
+                const std::vector<unsigned char> address(size, 1);
+                std::string message{"old diagnostic"};
+                const auto status = GetConfirmedDrivechainDepositStatus(uint256{},slot,COutPoint{},amount,address,&message);
+                const auto silent = GetConfirmedDrivechainDepositStatus(uint256{},slot,COutPoint{},amount,address,nullptr);
+                BOOST_CHECK(status == silent);
+                if (slot != configured) {
+                    BOOST_CHECK(status == DrivechainDepositStatus::INVALID);
+                    BOOST_CHECK_EQUAL(message,strprintf("drivechain sidechain slot must match configured slot %u, got %d", configured,slot));
+                } else if (amount <= 0 || !MoneyRange(amount) || size == 0 || size > 128) {
+                    BOOST_CHECK(status == DrivechainDepositStatus::INVALID);
+                    BOOST_CHECK_EQUAL(message,"invalid slot, amount, or address for drivechain deposit");
+                } else {
+                    // The real serialized identity passes; no unit-test cache is authenticated.
+                    BOOST_CHECK(status == DrivechainDepositStatus::UNAVAILABLE);
+                    BOOST_CHECK_EQUAL(message,"authenticated parent replay cache is not warmed");
+                }
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(deposit_admission_callback_failures_preserve_native_exception)
+{
+    namespace hs = drivechain::haskell;
+    for (const uint32_t failure : {0U,1U,4U}) {
+        std::vector<uint32_t> seen;
+        const auto native = [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+            BOOST_CHECK_EQUAL(index,0U);
+            BOOST_CHECK(step == 4 || input.empty());
+            seen.push_back(step);
+            if (step == failure) throw std::runtime_error("original admission native failure");
+            if (step == 1) return std::vector<unsigned char>(22, 0); // Unconfigured slot.
+            return std::vector<unsigned char>{};
+        };
+        BOOST_CHECK_EXCEPTION(hs::RunReplayStore(hs::ReplayStoreWorkflow::DEPOSIT_ADMISSION,native),
+            std::runtime_error, [](const auto& error) { return std::string(error.what()) == "original admission native failure"; });
+        const std::vector<uint32_t> expected = failure == 0 ? std::vector<uint32_t>{0} :
+            failure == 1 ? std::vector<uint32_t>{0,1} : std::vector<uint32_t>{0,1,4};
+        BOOST_CHECK(seen == expected);
+    }
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        unsigned calls{0};
+        BOOST_CHECK_THROW(hs::RunReplayStore(hs::ReplayStoreWorkflow::DEPOSIT_ADMISSION,
+            [&](uint32_t step, uint64_t, std::span<const unsigned char>) {
+                ++calls;
+                if (step == 0) return std::vector<unsigned char>{};
+                std::vector<unsigned char> reply(22,0);
+                if (mode == 0) reply.pop_back();
+                if (mode == 1) reply.push_back(0);
+                if (mode == 2) reply[0] = 2;
+                return reply;
+            }), std::runtime_error);
+        BOOST_CHECK_EQUAL(calls,2U);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(confirmed_deposit_flow_preserves_order_faults_and_lock_lifetime)
 {
     namespace hs = drivechain::haskell;
@@ -3338,6 +4823,270 @@ BOOST_AUTO_TEST_CASE(confirmed_deposit_flow_preserves_order_faults_and_lock_life
             BOOST_CHECK(seen == std::vector<uint32_t>(expected.begin(), expected.begin() + std::min(fault + 1, expected.size())));
             BOOST_CHECK(effects == std::vector<uint32_t>(expected.begin(), expected.begin() + fault));
             std::unique_lock released(mutex, std::try_to_lock);
+            BOOST_REQUIRE(released.owns_lock());
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(confirmed_deposit_fold_uses_native_store_and_preserves_lifetimes)
+{
+    namespace hs = drivechain::haskell;
+    const auto bytes = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto proposal = uint256S("01"), checkpoint = uint256S("02"), block = uint256S("03");
+    const Sidechain::Bitcoin::COutPoint out(proposal, 0);
+    const DrivechainMintableDeposit record{out,block,101,1000,{0x51}};
+    DrivechainParentReplayStore store(m_args.GetDataDirBase() / "confirmed-deposit-fold",1 << 20,true);
+    std::string error;
+    const DrivechainParentReplayTip seed{100,checkpoint,{}}, tip{101,block,{}};
+    BOOST_REQUIRE(store.Reset(proposal,seed,&error));
+    BOOST_REQUIRE(store.Append(seed,tip,{record},std::nullopt,{}, {},&error));
+    const auto key = [&](uint32_t version) {
+        return bytes(true,uint8_t{24},true,proposal,checkpoint,checkpoint,
+            uint16_t{2},uint16_t{1},uint16_t{4},uint16_t{3},uint16_t{6},uint16_t{5},version);
+    };
+    // Exercise the real recoverable database closure, not a second fake lookup.
+    for (unsigned mode = 0; mode <= 22; ++mode) for (unsigned flags = 0; flags < 4; ++flags) {
+        const bool budget = flags != 0, anchored = flags >= 2, explicit_target = flags == 3;
+        const uint32_t activation = mode == 9 ? 111 : mode == 17 ? 102 : 0;
+        const uint64_t epoch = mode == 4 ? 0 : 5;
+        std::mutex mutex;
+        std::vector<uint32_t> seen;
+        bool session_live{false};
+        const auto run = [&](size_t fault) {
+            seen.clear(); error.clear();
+            std::unique_lock lock(mutex,std::defer_lock);
+            DrivechainMintableDeposit loaded;
+            DrivechainReplayEffects lookup;
+            const auto native = [&](uint32_t step,uint64_t index,std::span<const unsigned char> input) {
+                seen.push_back(step);
+                if (seen.size() == fault) throw std::domain_error("confirmed fold native fault");
+                if (step >= 3 && step != 15) BOOST_REQUIRE(lock.owns_lock());
+                if (step >= 200) return bytes(true, uint64_t{step == 200 ? 0U : step == 242 ? 64U : 1U});
+                if (step >= 100) {
+                    BOOST_REQUIRE(session_live);
+                    if (mode == 12 && step == 128) return lookup(99,0,{});
+                    if (mode == 13 && step == 128) {
+                        auto invalid = record;
+                        invalid.outpoint.hash.SetNull();
+                        return bytes(true,true,invalid);
+                    }
+                    return lookup(step-100,index,input);
+                }
+                BOOST_CHECK(step == 14 || index == 0);
+                BOOST_CHECK(step == 15 || input.empty());
+                switch (step) {
+                case 0: return bytes(budget);
+                case 1: return bytes(mode != 1 && lock.try_lock());
+                case 2: lock.lock(); break;
+                case 3: {
+                    auto snapshot = bytes(mode != 2);
+                    const auto identity = key(5);
+                    snapshot.insert(snapshot.end(),identity.begin(),identity.end());
+                    const auto state = bytes(uint32_t{110},block,mode != 7,mode == 8 ? checkpoint : proposal,activation,epoch);
+                    snapshot.insert(snapshot.end(),state.begin(),state.end());
+                    return snapshot;
+                }
+                case 4: return anchored ? bytes(true,uint32_t{110},mode == 6 ? uint64_t{4} : epoch,explicit_target) : bytes(false);
+                case 5: return bytes(mode != 10);
+                case 6: {
+                    auto lifetime = std::shared_ptr<bool>(&session_live,[](bool* live) { *live = false; });
+                    session_live = true;
+                    auto effects = store.DepositEffects(mode == 11 ? Sidechain::Bitcoin::COutPoint(proposal,1) : out,loaded,&error);
+                    lookup = [effects = std::move(effects),lifetime](uint32_t action,uint64_t n,std::span<const unsigned char> data) {
+                        return effects(action,n,data);
+                    };
+                    break;
+                }
+                case 7: return bytes(loaded,mode == 14 ? checkpoint : block,int64_t{mode == 15 ? 1001 : 1000},
+                    std::vector<unsigned char>{static_cast<unsigned char>(mode == 16 ? 0x52 : 0x51)});
+                case 8: return bytes(int64_t{0}, std::string{}, false, false, false, uint8_t{0},
+                    uint256{}, uint256{}, uint256{}, uint32_t{mode == 20 ? 11U : 6U});
+                case 9: return mode == 18 ? bytes(false) : bytes(true,mode == 19 ? checkpoint : block);
+                case 10: case 11: case 12: case 13: break;
+                case 14:
+                    BOOST_CHECK_EQUAL(index,epoch);
+                    if (mode >= 21) throw std::runtime_error(mode == 21 ? "parent deadline expired" :
+                        "authenticated parent replay epoch revoked during deposit validation");
+                    break;
+                case 15: error.assign(input.begin(),input.end()); break;
+                case 16: return key(mode == 3 ? 4 : 5);
+                case 17: lookup = {}; BOOST_CHECK(!session_live); break;
+                case 18: return bytes(mode == 5 ? uint64_t{4} : epoch);
+                default: throw std::logic_error("unexpected confirmation fold effect");
+                }
+                return std::vector<unsigned char>{};
+            };
+            return hs::RunReplayStore(hs::ReplayStoreWorkflow::CONFIRMED_DEPOSIT,native);
+        };
+        const unsigned rejected = explicit_target ? 1 : 2;
+        unsigned expected = 0;
+        std::string expected_error;
+        if (mode == 1 && budget) { expected = 2; expected_error = "authenticated parent replay cache is busy warming"; }
+        else if (mode >= 2 && mode <= 5) { expected = 2; expected_error = "authenticated parent replay cache is not warmed"; }
+        else if (mode == 6 && anchored) { expected = 2; expected_error = "authenticated parent replay cache changed during validation"; }
+        else if (mode >= 7 && mode <= 9) { expected = 2; expected_error = "configured Elements slot proposal is not active at parent height 110"; }
+        else if (mode == 10) { expected = 2; expected_error = "persistent authenticated parent replay index is not open"; }
+        else if (mode == 11) { expected = rejected; expected_error = explicit_target ?
+            "deposit is not a genesis-replay-derived canonical CTIP increase before the block's authenticated parent anchor" :
+            "deposit is not present in the currently warmed parent replay snapshot"; }
+        else if (mode == 12) { expected = 2; expected_error = "persistent parent replay deposit read failed: invalid replay lookup effect"; }
+        else if (mode == 13) { expected = 2; expected_error = "persistent parent replay deposit record is internally inconsistent"; }
+        else if (mode >= 14 && mode <= 16) { expected = rejected; expected_error = "deposit does not exactly match the genesis-replay-derived canonical CTIP increase"; }
+        else if (mode == 17) { expected = rejected; expected_error = "native deposit at parent height 101 predates Elements proposal activation at height 102"; }
+        else if (mode == 18 && !anchored) { expected = 2; }
+        else if (mode == 19 && !anchored) { expected = 2; expected_error = "authenticated parent replay cache is stale after a parent reorganization"; }
+        else if (mode == 20) { expected = rejected; expected_error = "deposit at parent height 101 does not have 11 confirmations through authenticated parent height 110"; }
+        if (mode >= 21) BOOST_CHECK_THROW(run(0),std::runtime_error);
+        else { BOOST_CHECK_EQUAL(run(0),expected); BOOST_CHECK_EQUAL(error,expected_error); }
+        BOOST_CHECK(!session_live);
+        const auto complete = seen;
+        if (mode == 12 || mode == 13) {
+            const std::vector<uint32_t> invalidation{17,10,11,12};
+            BOOST_CHECK(std::equal(invalidation.begin(),invalidation.end(),complete.end()-invalidation.size()));
+        }
+        if (expected == 0 && mode < 21) {
+            BOOST_REQUIRE_EQUAL(complete.back(),14U);
+            BOOST_CHECK_EQUAL(std::count(complete.begin(),complete.end(),9U),anchored ? 0 : 1);
+            BOOST_CHECK_EQUAL(std::count(complete.begin(),complete.end(),13U),budget && !anchored ? 1 : 0);
+        }
+        for (size_t fault = 1; fault <= complete.size(); ++fault) {
+            BOOST_CHECK_EXCEPTION(run(fault),std::domain_error,[](const auto& e) {
+                return std::string(e.what()) == "confirmed fold native fault";
+            });
+            BOOST_CHECK(seen == std::vector<uint32_t>(complete.begin(),complete.begin()+fault));
+            BOOST_CHECK(!session_live);
+            std::unique_lock released(mutex,std::try_to_lock);
+            BOOST_REQUIRE(released.owns_lock());
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(deposit_candidate_fold_preserves_native_scan_cursor_and_lifetimes)
+{
+    namespace hs = drivechain::haskell;
+    const auto bytes = [](const auto&... values) {
+        DataStream stream;
+        (stream << ... << values);
+        return std::vector<unsigned char>{UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
+    };
+    const auto proposal = uint256S("01"), checkpoint = uint256S("02"), block = uint256S("03");
+    DrivechainParentReplayStore store(m_args.GetDataDirBase() / "deposit-candidate-fold",1 << 20,true);
+    std::string error;
+    DrivechainParentReplayTip tip{100,checkpoint,{}};
+    std::vector<DrivechainMintableDeposit> records;
+    BOOST_REQUIRE(store.Reset(proposal,tip,&error));
+    for (unsigned i = 0; i < 72; ++i) {
+        const auto hash = uint256S(strprintf("%02x",i+1));
+        DrivechainParentReplayTip next{101+i,hash,{}};
+        records.push_back({Sidechain::Bitcoin::COutPoint(hash,0),hash,101+i,1000,{0x51}});
+        BOOST_REQUIRE(store.Append(tip,next,{records.back()},std::nullopt,{}, {},&error));
+        tip = next;
+    }
+    const auto key = [&](uint32_t version) {
+        return bytes(true,uint8_t{24},true,proposal,checkpoint,checkpoint,
+            uint16_t{2},uint16_t{1},uint16_t{4},uint16_t{3},uint16_t{6},uint16_t{5},version);
+    };
+    for (unsigned mode = 0; mode <= 11; ++mode) for (int after_index : {-1,63,70,71})
+    for (uint32_t depth : {0U,1U,6U,UINT32_MAX}) {
+        const auto after = after_index < 0 ? std::nullopt : std::optional{records[after_index].outpoint};
+        const uint32_t activation = mode == 9 ? 173 : 130;
+        std::vector<DrivechainMintableDeposit> selected;
+        std::optional<Sidechain::Bitcoin::COutPoint> cursor;
+        std::vector<uint32_t> seen;
+        std::mutex mutex;
+        bool session_live{false};
+        const auto run = [&](size_t fault) {
+            selected.clear(); cursor.reset(); error.clear(); seen.clear();
+            std::unique_lock lock(mutex,std::defer_lock);
+            std::vector<DrivechainMintableDeposit> page;
+            DrivechainReplayEffects scan;
+            return hs::RunReplayStore(hs::ReplayStoreWorkflow::DEPOSIT_CANDIDATES,
+                [&](uint32_t step,uint64_t index,std::span<const unsigned char> input) {
+                seen.push_back(step);
+                if (seen.size() == fault) throw std::domain_error("candidate native fault");
+                if (step != 0 && step != 11) BOOST_REQUIRE(lock.owns_lock());
+                if (step >= 100) {
+                    BOOST_REQUIRE(session_live);
+                    if (mode == 10 && step == 134) return scan(99,0,{});
+                    if (mode == 11 && step == 134) {
+                        auto invalid = records.front(); invalid.value = 0;
+                        return bytes(true,true,invalid);
+                    }
+                    return scan(step-100,index,input);
+                }
+                BOOST_CHECK(index == 0 || step == 9 || step == 10);
+                BOOST_CHECK(input.empty() || step == 11);
+                switch (step) {
+                case 0: return bytes(mode != 1 && lock.try_lock());
+                case 1: {
+                    auto frame = bytes(mode != 2);
+                    const auto identity = key(5);
+                    frame.insert(frame.end(),identity.begin(),identity.end());
+                    const auto state = bytes(uint32_t{172},block,mode != 7,mode == 8 ? checkpoint : proposal,
+                        activation,uint64_t{mode == 5 ? 0U : 5U});
+                    frame.insert(frame.end(),state.begin(),state.end());
+                    return frame;
+                }
+                case 2: return key(mode == 3 ? 4 : 5);
+                case 3: return bytes(mode != 4);
+                case 4: return bytes(uint64_t{mode == 6 ? 4U : 5U});
+                case 5: {
+                    auto lifetime = std::shared_ptr<bool>(&session_live,[](bool* live) { *live = false; });
+                    session_live = true;
+                    auto effects = store.ListDepositEffects(after,64,page,cursor,&error);
+                    scan = [effects = std::move(effects),lifetime](uint32_t command,uint64_t n,std::span<const unsigned char> data) {
+                        return effects(command,n,data);
+                    };
+                    return bytes(uint64_t{MAX_MONEY});
+                }
+                case 6: scan = {}; BOOST_CHECK(!session_live); break;
+                case 7: BOOST_CHECK(!session_live); return bytes(int64_t{0}, std::string{}, false, false, false, uint8_t{0},
+                    uint256{}, uint256{}, uint256{}, depth);
+                case 8: return bytes(uint64_t{page.size()});
+                case 9: return bytes(page.at(index).block_height);
+                case 10: selected.push_back(std::move(page.at(index))); break;
+                case 11: error.assign(input.begin(),input.end()); break;
+                default: throw std::logic_error("unexpected candidate fold effect");
+                }
+                return std::vector<unsigned char>{};
+            });
+        };
+        const size_t begin = after_index+1, end = std::min(begin+64,records.size());
+        const bool failed_scan = mode >= 10 && begin < end;
+        const bool accepted = (mode == 0 || mode >= 10) && !failed_scan;
+        BOOST_CHECK_EQUAL(run(0),accepted);
+        BOOST_CHECK(!session_live);
+        std::vector<Sidechain::Bitcoin::COutPoint> expected, actual;
+        if (accepted) for (size_t i = begin; i < end; ++i) {
+            const auto& record = records[i];
+            if (record.block_height >= activation && uint64_t{172}-record.block_height+1 >= std::max(1U,depth))
+                expected.push_back(record.outpoint);
+        }
+        for (const auto& record : selected) {
+            actual.push_back(record.outpoint);
+            BOOST_CHECK_EQUAL(record.value,1000);
+            BOOST_CHECK(record.address == std::vector<unsigned char>{0x51});
+        }
+        BOOST_CHECK(actual == expected);
+        BOOST_CHECK(cursor == (accepted && end < records.size() ? std::optional{records[end-1].outpoint} : std::nullopt));
+        const std::string expected_error = mode >= 1 && mode <= 6 ? "authenticated parent deposit index is unavailable" :
+            mode >= 7 && mode <= 9 ? "configured Elements slot proposal is not active at parent height 172" :
+            failed_scan ? (mode == 10 ? "parent deposit scan failed: invalid replay scan effect" : "malformed parent deposit scan record") : "";
+        BOOST_CHECK_EQUAL(error,expected_error);
+        const auto complete = seen;
+        // Every reached boundary is faulted on a small real page; successful
+        // large pages above independently check the unfiltered lookahead cursor.
+        if (after_index == 70 && depth == 0) for (size_t fault = 1; fault <= complete.size(); ++fault) {
+            BOOST_CHECK_EXCEPTION(run(fault),std::domain_error,[](const auto& e) {
+                return std::string(e.what()) == "candidate native fault";
+            });
+            BOOST_CHECK(seen == std::vector<uint32_t>(complete.begin(),complete.begin()+fault));
+            BOOST_CHECK(!session_live);
+            std::unique_lock released(mutex,std::try_to_lock);
             BOOST_REQUIRE(released.owns_lock());
         }
     }
@@ -5374,6 +7123,127 @@ BOOST_AUTO_TEST_CASE(parent_milestones_preserve_guarded_reads_and_fault_order)
             return step == 1 ? uint32_t(matches) : 0U;
         }), uint32_t(matches));
         BOOST_CHECK(actual == (matches ? std::vector<uint32_t>{1} : std::vector<uint32_t>{1,2}));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_milestone_workflow_matches_native_reference)
+{
+    namespace Bitcoin = Sidechain::Bitcoin;
+    const auto reference = [](const Consensus::Params& c, uint32_t height, const Bitcoin::CBlock& block,
+                             const DrivechainParentReplayState& state, std::string* error) {
+        const auto fail = [&](const std::string& message) { if (error) *error = message; return false; };
+        const auto hash = [&](const uint256& expected) {
+            return block.GetHash() == expected || fail(strprintf(
+                "authenticated parent milestone height %u hashes to %s, expected %s",
+                height, block.GetHash().GetHex(), expected.GetHex()));
+        };
+        const auto message = [&](const std::vector<unsigned char>& expected) {
+            if (block.vtx.empty() || !block.vtx[0] || !block.vtx[0]->IsCoinBase())
+                return fail("pinned parent identity block has no coinbase transaction");
+            size_t matches{0};
+            for (const auto& out : block.vtx[0]->vout) {
+                auto pc = out.scriptPubKey.begin();
+                opcodetype opcode{};
+                std::vector<unsigned char> pushed;
+                if (out.scriptPubKey.GetOp(pc, opcode, pushed) && opcode == OP_RETURN &&
+                    out.scriptPubKey.GetOp(pc, opcode, pushed) && opcode <= OP_PUSHDATA4 &&
+                    pc == out.scriptPubKey.end() && pushed == expected) ++matches;
+            }
+            return matches == 1 || fail(strprintf(
+                "pinned parent identity block contains %u copies of its expected drivechain message", matches));
+        };
+        const bool post = !c.drivechain_parent_state_active_proposal_description.empty();
+        if (post && height == c.drivechain_parent_state_proposal_height) {
+            if (!hash(c.drivechain_parent_state_proposal_block_hash)) return false;
+            auto payload = ParseHex("d5e0c4af");
+            payload.push_back(*c.drivechain_slot);
+            payload.insert(payload.end(), c.drivechain_parent_state_active_proposal_description.begin(),
+                c.drivechain_parent_state_active_proposal_description.end());
+            if (!message(payload)) return false;
+            const auto found = state.pending_proposals.find(*c.drivechain_parent_state_active_proposal_hash);
+            if (found == state.pending_proposals.end() || found->second.proposal_height != height || found->second.votes != 0)
+                return fail("authenticated parent proposal milestone did not derive the expected pending proposal state");
+        }
+        if (post && height == c.drivechain_parent_state_activation_height) {
+            if (!hash(c.drivechain_parent_state_activation_block_hash)) return false;
+            auto payload = ParseHex("d6e1c5df");
+            payload.push_back(*c.drivechain_slot);
+            payload.insert(payload.end(), c.drivechain_parent_state_active_proposal_hash->begin(),
+                c.drivechain_parent_state_active_proposal_hash->end());
+            if (!message(payload)) return false;
+            if (state.active_proposal_hash != *c.drivechain_parent_state_active_proposal_hash ||
+                state.pending_proposals.count(*c.drivechain_parent_state_active_proposal_hash) != 0)
+                return fail("authenticated parent activation milestone did not derive the expected active proposal state");
+        }
+        if (height == c.drivechain_parent_state_height) {
+            if (!hash(c.drivechain_parent_state_hash)) return false;
+            const bool ctip = !c.drivechain_parent_state_ctip_txid.IsNull() ? state.ctip &&
+                state.ctip->hash == c.drivechain_parent_state_ctip_txid && state.ctip->n == c.drivechain_parent_state_ctip_vout &&
+                state.ctip_value == c.drivechain_parent_state_ctip_value : !state.ctip && state.ctip_value == 0;
+            const bool proposal = post ? state.active_proposal_hash == *c.drivechain_parent_state_active_proposal_hash :
+                state.active_proposal_hash.IsNull();
+            if (!proposal || !ctip) return fail("authenticated parent checkpoint milestone did not derive the asserted active proposal and CTIP");
+        }
+        return true;
+    };
+    for (unsigned mode = 0; mode < 5; ++mode)
+    for (unsigned flags = 0; flags < 256; ++flags)
+    for (unsigned envelope = 0; envelope < 4; ++envelope) {
+        auto c = Params().GetConsensus();
+        const uint32_t height = mode < 3 ? 10 * (mode+1) : mode == 3 ? 42 : 10;
+        c.drivechain_slot = flags & 128 ? 255 : 24;
+        c.drivechain_parent_state_active_proposal_hash = uint256S("aa");
+        c.drivechain_parent_state_active_proposal_description = flags & 1 ? std::vector<unsigned char>{} : std::vector<unsigned char>{1,2};
+        c.drivechain_parent_state_proposal_height = 10;
+        c.drivechain_parent_state_activation_height = mode == 4 ? 10 : 20;
+        c.drivechain_parent_state_height = mode == 4 ? 10 : 30;
+        c.drivechain_parent_state_ctip_txid = flags & 2 ? uint256{} : uint256S("bb");
+        c.drivechain_parent_state_ctip_vout = flags & 128 ? UINT32_MAX : 3;
+        c.drivechain_parent_state_ctip_value = flags & 128 ? MAX_MONEY : 42;
+        DrivechainParentReplayState state;
+        if (!(flags & 4)) state.pending_proposals.emplace(uint256S("aa"),
+            DrivechainPendingProposal{flags & 8 ? height+1 : height, flags & 16 ? 1U : 0U});
+        state.active_proposal_hash = flags & 32 ? uint256{} : uint256S("aa");
+        if (!(flags & 4)) state.ctip = Bitcoin::COutPoint(flags & 8 ? uint256S("cc") : uint256S("bb"),
+            flags & 16 ? 4 : c.drivechain_parent_state_ctip_vout);
+        state.ctip_value = flags & 32 ? 0 : c.drivechain_parent_state_ctip_value;
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+        auto payload = ParseHex(mode == 1 ? "d6e1c5df" : "d5e0c4af");
+        payload.push_back(*c.drivechain_slot);
+        if (mode == 1) payload.insert(payload.end(), c.drivechain_parent_state_active_proposal_hash->begin(),
+            c.drivechain_parent_state_active_proposal_hash->end());
+        else payload.insert(payload.end(), c.drivechain_parent_state_active_proposal_description.begin(),
+            c.drivechain_parent_state_active_proposal_description.end());
+        CScript script;
+        script << OP_RETURN;
+        if (envelope == 0) script << payload;
+        else {
+            script.push_back(envelope == 1 ? OP_PUSHDATA1 : envelope == 2 ? OP_PUSHDATA2 : OP_PUSHDATA4);
+            script.push_back(payload.size());
+            for (unsigned i = 1; i < (1U << (envelope-1)); ++i) script.push_back(0);
+            script.insert(script.end(), payload.begin(), payload.end());
+        }
+        coinbase.vout.emplace_back(0, script);
+        if (flags & 64) {
+            switch (flags % 4) {
+            case 0: coinbase.vout.push_back(coinbase.vout.front()); break;
+            case 1: coinbase.vout[0].scriptPubKey << OP_0; break;
+            case 2: coinbase.vout[0].scriptPubKey.pop_back(); break;
+            case 3: coinbase.vin[0].prevout = Bitcoin::COutPoint(uint256::ONE,0); break;
+            }
+        }
+        Bitcoin::CBlock block;
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(coinbase));
+        c.drivechain_parent_state_proposal_block_hash = block.GetHash();
+        c.drivechain_parent_state_activation_block_hash = block.GetHash();
+        c.drivechain_parent_state_hash = flags & 64 ? uint256S("cc") : block.GetHash();
+        for (bool diagnostic : {false,true}) {
+            std::string expected{"unchanged"}, actual{"unchanged"};
+            const auto valid = reference(c,height,block,state,diagnostic ? &expected : nullptr);
+            BOOST_CHECK_EQUAL(CheckDrivechainParentReplayMilestone(c,height,block,state,diagnostic ? &actual : nullptr),valid);
+            BOOST_CHECK_EQUAL(actual,expected);
+        }
     }
 }
 
@@ -7858,6 +9728,49 @@ BOOST_AUTO_TEST_CASE(validates_persisted_v2_evidence_without_external_services)
     BOOST_CHECK_EQUAL(restored.value, 14'402'000);
 }
 
+BOOST_AUTO_TEST_CASE(treasury_workflow_preserves_multiple_deposits_and_exception_prefixes)
+{
+    namespace hs = drivechain::haskell;
+    using Event = std::pair<uint32_t,uint64_t>;
+    const auto reply = [](uint32_t step,uint64_t index) -> int64_t {
+        switch (step) {
+        case 0:
+            switch (index) {
+            case 0: return 1;
+            case 1: case 2: return 2;
+            case 3: case 6: return 0;
+            case 4: return 100;
+            case 5: return 120;
+            case 7: return 7;
+            default: throw std::logic_error("unexpected treasury fact");
+            }
+        case 102: case 503: return 100;
+        case 304: case 505: return 120;
+        case 302: return index % 2 == 0;
+        case 704: return 32;
+        default: return 1;
+        }
+    };
+    std::vector<Event> trace;
+    BOOST_CHECK_EQUAL(hs::ReplayTreasuryTransaction(1,1,4,1000,100,true,[&](uint32_t s,uint64_t i) {
+        trace.emplace_back(s,i);
+        return reply(s,i);
+    }),0);
+    BOOST_CHECK_EQUAL(std::count(trace.begin(),trace.end(),Event{705,20}),2);
+    BOOST_CHECK_EQUAL(std::count(trace.begin(),trace.end(),Event{800,1}),1);
+    struct NativeFailure : std::logic_error { NativeFailure() : std::logic_error("native marker") {} };
+    for (size_t fault = 0; fault < trace.size(); ++fault) {
+        std::vector<Event> observed;
+        BOOST_CHECK_THROW(hs::ReplayTreasuryTransaction(1,1,4,1000,100,true,[&](uint32_t s,uint64_t i) {
+            observed.emplace_back(s,i);
+            if (observed.size() == fault+1) throw NativeFailure{};
+            return reply(s,i);
+        }),NativeFailure);
+        BOOST_CHECK_EQUAL(observed.size(),fault+1);
+        BOOST_CHECK(std::equal(observed.begin(),observed.end(),trace.begin()));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(deposit_verification_preserves_native_branch_transcript)
 {
     using Step = drivechain::haskell::DepositVerifyStep;
@@ -8087,6 +10000,61 @@ BOOST_AUTO_TEST_CASE(deposit_projection_preserves_shape_gates_and_output_reads)
             }
         });
         BOOST_CHECK(actual == expected);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(deposit_claim_workflow_matches_original_native_projection)
+{
+    const auto base = LegacyPublicDeposit();
+    for (unsigned mutation = 0; mutation <= 30; ++mutation) {
+        BOOST_TEST_CONTEXT("claim mutation " << mutation) {
+            CMutableTransaction tx(base);
+            drivechain::AuthenticatedDeposit authenticated;
+            authenticated.outpoint = base.vin[0].prevout;
+            authenticated.value = 2000;
+            authenticated.destination_script = base.vout[0].scriptPubKey;
+            size_t index{0};
+            auto& stack = tx.witness.vtxinwit[0].m_pegin_witness.stack;
+            switch (mutation) {
+            case 1: tx.vin.clear(); tx.witness.vtxinwit.clear(); break;
+            case 2: tx.vin.resize(2); break;
+            case 3: index = 1; break;
+            case 4: tx.witness.vtxinwit.clear(); break;
+            case 5: tx.vin.resize(2); tx.witness.vtxinwit.resize(2); break;
+            case 6: tx.vin[0].m_is_pegin = false; break;
+            case 7: authenticated.outpoint.n = 1; break;
+            case 8: tx.vin[0].scriptSig << OP_TRUE; break;
+            case 9: tx.vin[0].assetIssuance.nAmount = CConfidentialValue(1); break;
+            case 10: stack[0] = Serialize(int64_t{2001}); break;
+            case 11: stack[1].assign(32,0); break;
+            case 12: stack[2].assign(32,0); break;
+            case 13: stack[3] = {OP_FALSE}; break;
+            case 14: stack[4] = {}; break;
+            case 15: stack[5].assign(32,0); break;
+            case 16: authenticated.value = 2001; break;
+            case 17: tx.vout.clear(); tx.witness.vtxoutwit.clear(); break;
+            case 18: tx.vout.push_back(tx.vout[0]); break;
+            case 19: tx.vout[0].nAsset = CConfidentialAsset(CAsset()); break;
+            case 20: tx.vout[0].nValue = CConfidentialValue(0); break;
+            case 21: tx.vout[0].scriptPubKey = CScript() << OP_TRUE; break;
+            case 22: tx.vout[1].nValue = CConfidentialValue(-1); break;
+            case 23: std::swap(tx.vout[0],tx.vout[1]); break;
+            case 24: tx.vout.resize(1); tx.witness.vtxoutwit.resize(1); tx.vout[0].nValue = CConfidentialValue(2000); break;
+            case 25: tx.vout[1].scriptPubKey = tx.vout[0].scriptPubKey; break;
+            case 26: tx.vout[0].scriptPubKey.clear(); break;
+            case 27: tx.vout[0].nValue = CConfidentialValue(1999); tx.vout[1].nValue = CConfidentialValue(1); break;
+            case 28: authenticated.outpoint.hash = Txid{}; stack[0].clear(); break;
+            case 29: stack.resize(8); break;
+            case 30: index = SIZE_MAX; break;
+            }
+            const CTransaction changed(tx);
+            std::string wanted_error{"unchanged"}, actual_error{"unchanged"};
+            const bool wanted = ReferenceVerifyDepositTransaction(changed,index,authenticated,wanted_error);
+            const bool actual = drivechain::VerifyDepositTransaction(changed,index,authenticated,actual_error);
+            if (mutation == 0) BOOST_REQUIRE(wanted);
+            BOOST_CHECK_EQUAL(actual,wanted);
+            BOOST_CHECK_EQUAL(actual_error,wanted_error);
+        }
     }
 }
 
@@ -8430,7 +10398,8 @@ BOOST_AUTO_TEST_CASE(deposit_proof_ffi_preserves_native_authentication_and_error
         "slot-24 CTIP", "slot-24 CTIP", "exactly one authenticated prior CTIP",
         "exactly one authenticated prior CTIP", "CTIP increase", "CTIP increase",
         "CTIP increase", "CTIP increase", "merkle proof", "outpoint is absent",
-        "proof-of-work", "contiguous", "CTIP increase", "slot-24 CTIP", "", ""};
+        "proof-of-work", "contiguous", "CTIP increase", "slot-24 CTIP", "", "",
+        "slot-24 CTIP", "slot-24 CTIP", "exactly one authenticated prior CTIP"};
     const auto mine = [](Sidechain::Bitcoin::CBlockHeader& header) {
         while (!CheckParentProofOfWork(header.GetHash(), header.nBits, Params().GetConsensus())) ++header.nNonce;
     };
@@ -8458,6 +10427,12 @@ BOOST_AUTO_TEST_CASE(deposit_proof_ffi_preserves_native_authentication_and_error
                 previous.vout.insert(previous.vout.begin(), Sidechain::Bitcoin::CTxOut(0, CScript() << OP_RETURN));
                 deposit.vin[0].prevout = Sidechain::Bitcoin::COutPoint(previous.GetHash(), 1);
                 deposit.vout.insert(deposit.vout.begin(), Sidechain::Bitcoin::CTxOut(0, CScript() << OP_RETURN));
+                break;
+            case 22: deposit.vout[0].scriptPubKey << OP_TRUE; break;
+            case 23: deposit.vout[0].scriptPubKey.resize(100000); break;
+            case 24:
+                previous.vout[0].scriptPubKey.resize(100000);
+                deposit.vin[0].prevout.hash = previous.GetHash();
                 break;
             }
             Sidechain::Bitcoin::CMerkleBlock proof;

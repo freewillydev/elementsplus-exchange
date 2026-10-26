@@ -17,11 +17,13 @@
 #include <drivechain_peg.h>
 #include <elements_drivechain_identity.h>
 #include <elements_drivechain_bootstrap.h>
+#include <cstdlib>
 #include <limits>
 #include <type_traits>
 #include <set>
 #include <hash.h>
 #include <haskell/bridge.h>
+#include <test/util/haskell_reference.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
 #include <drivechain_withdrawal.h>
@@ -41,6 +43,93 @@
 #include <boost/test/unit_test.hpp>
 
 namespace Bitcoin = Sidechain::Bitcoin;
+
+namespace {
+// Retired production entries retained only as the differential-test predecessor.
+class DrivechainParentRecoveryDeadline {
+    std::optional<std::chrono::steady_clock::time_point>& m_current;
+    const std::optional<std::chrono::steady_clock::time_point> m_previous;
+public:
+    DrivechainParentRecoveryDeadline(std::optional<std::chrono::steady_clock::time_point>& current,
+        const std::function<std::chrono::steady_clock::time_point()>& now);
+    ~DrivechainParentRecoveryDeadline() noexcept;
+    DrivechainParentRecoveryDeadline(const DrivechainParentRecoveryDeadline&) = delete;
+    DrivechainParentRecoveryDeadline& operator=(const DrivechainParentRecoveryDeadline&) = delete;
+};
+
+DrivechainParentRecoveryDeadline::DrivechainParentRecoveryDeadline(
+    std::optional<std::chrono::steady_clock::time_point>& current,
+    const std::function<std::chrono::steady_clock::time_point()>& now)
+    : m_current(current), m_previous(current)
+{
+    std::chrono::steady_clock::time_point limit;
+    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::RECOVERY_DEADLINE,
+        [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: limit = now() + std::chrono::seconds{drivechain::PARENT_RECOVERY_SECONDS}; return 1;
+            case 2: return m_previous.has_value();
+            case 3: return limit < *m_previous;
+            case 4: m_current = limit; return 1;
+            default: throw std::logic_error("invalid parent recovery deadline action");
+            }
+        });
+}
+
+DrivechainParentRecoveryDeadline::~DrivechainParentRecoveryDeadline() noexcept
+{
+    m_current = m_previous;
+}
+
+bool VerifyDrivechainParentBlock(const uint256& hash, int min_confirmations,
+    Bitcoin::CBlock& block, VerifiedMainchainHeader& verified, std::string* error,
+    const std::function<bool(const uint256&, int, VerifiedMainchainHeader&, std::string*)>& read_header,
+    const std::function<bool(const uint256&, Bitcoin::CBlock&, std::string*)>& read_block)
+{
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::VERIFIED_BLOCK,
+        [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return read_header(hash, min_confirmations, verified, error);
+            case 2: return read_block(hash, block, error);
+            case 3: return block.GetBlockHeader().GetHash() == verified.header.GetHash();
+            case 4: if (error) *error = "raw parent block header does not match authenticated header"; return 0;
+            default: throw std::logic_error("invalid verified parent block action");
+            }
+        });
+}
+
+// Standalone adapter for replay fixtures; production composes the workflow in Haskell.
+bool ApplyDrivechainParentBlockState(
+    const Bitcoin::CBlock& block,
+    const uint32_t height,
+    const int sidechain_slot,
+    const uint256& required_active_proposal,
+    const uint16_t unused_slot_proposal_max_age,
+    const uint16_t unused_slot_activation_threshold,
+    const uint16_t used_slot_proposal_max_age,
+    const uint16_t used_slot_activation_threshold,
+    const uint16_t withdrawal_bundle_max_age,
+    const uint16_t withdrawal_bundle_inclusion_threshold,
+    DrivechainParentReplayState& state,
+    std::vector<DrivechainMintableDeposit>* deposits = nullptr,
+    std::string* error = nullptr,
+    std::vector<DrivechainSuccessfulWithdrawal>* successful_withdrawals = nullptr,
+    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals = nullptr,
+    drivechain::TreasuryOpcode treasury_opcode = drivechain::TreasuryOpcode::NOP5,
+    DrivechainM6ReplayRule m6_rule = DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6)
+{
+    const auto native = MakeDrivechainParentBlockEffects(
+        block, height, sidechain_slot, required_active_proposal,
+        unused_slot_proposal_max_age, unused_slot_activation_threshold,
+        used_slot_proposal_max_age, used_slot_activation_threshold,
+        withdrawal_bundle_max_age, withdrawal_bundle_inclusion_threshold,
+        state, deposits, error, successful_withdrawals, withdrawal_proposals, treasury_opcode, m6_rule);
+    return drivechain::haskell::ReplayParentBlock(height,
+        {unused_slot_proposal_max_age,unused_slot_activation_threshold,used_slot_proposal_max_age,used_slot_activation_threshold},
+        withdrawal_bundle_max_age,withdrawal_bundle_inclusion_threshold,static_cast<uint32_t>(treasury_opcode),
+        m6_rule == DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6,
+        native) == 0;
+}
+} // namespace
 
 std::vector<std::vector<unsigned char> > witness_stack = {
     ParseHex("00ca9a3b00000000"),
@@ -379,6 +468,25 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_validates_pinned_enforcer_m8)
     BOOST_CHECK(apply(make_block(
         {make_m7(sidechain_hash)},
         make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/false)), error));
+    // Coinbase messages accept nonminimal pushes, but only one complete push.
+    const auto m7 = make_m7(sidechain_hash);
+    for (unsigned width : {1U,2U,4U}) {
+        CScript pushed;
+        pushed.push_back(OP_RETURN);
+        pushed.push_back(width == 1 ? OP_PUSHDATA1 : width == 2 ? OP_PUSHDATA2 : OP_PUSHDATA4);
+        pushed.push_back(37);
+        pushed.insert(pushed.end(),width-1,0);
+        pushed.insert(pushed.end(),m7.begin()+2,m7.end());
+        BOOST_CHECK(apply(make_block({pushed},make_m8_script(sidechain_hash,previous_parent,false)),error));
+        pushed.push_back(OP_NOP);
+        BOOST_CHECK(!apply(make_block({pushed},make_m8_script(sidechain_hash,previous_parent,false)),error));
+        BOOST_CHECK_EQUAL(error,"BIP301 M8 for slot 24 was not accepted by this block's M7");
+    }
+    for (size_t size = 0; size < m7.size(); ++size) {
+        BOOST_CHECK(!apply(make_block({CScript(m7.begin(),m7.begin()+size)},
+            make_m8_script(sidechain_hash,previous_parent,false)),error));
+        BOOST_CHECK_EQUAL(error,"BIP301 M8 for slot 24 was not accepted by this block's M7");
+    }
     BOOST_CHECK(!apply(make_block(
         {}, make_m8_script(sidechain_hash, previous_parent, /*nonminimal=*/false)), error));
     // M1 would add a proposal and no M4 would clear the previous actions, but
@@ -1361,6 +1469,194 @@ BOOST_AUTO_TEST_CASE(parent_block_transactions_match_original_merkle_and_deadlin
     }
 }
 
+BOOST_AUTO_TEST_CASE(parent_raw_block_workflow_matches_separate_authentication_stages)
+{
+    Bitcoin::CMutableTransaction reward;
+    reward.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+    reward.vout.emplace_back(50, CScript() << OP_TRUE);
+    std::vector<Bitcoin::CBlock> blocks;
+    for (unsigned count : {0U,1U,3U,258U}) {
+        Bitcoin::CBlock block;
+        block.nBits = 0x207fffff;
+        for (unsigned i = 0; i < count; ++i) {
+            auto tx = reward;
+            if (i) { tx.vin[0].prevout = Bitcoin::COutPoint(uint256::ONE,i); tx.vin[0].scriptWitness.stack = {{1,2},{3}}; }
+            block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(tx)));
+        }
+        blocks.push_back(std::move(block));
+    }
+    for (unsigned shape = 0; shape < 5; ++shape) {
+        auto block = blocks[2];
+        if (shape == 0) block.vtx[0] = block.vtx[1];
+        if (shape == 1) block.vtx[2] = block.vtx[0];
+        if (shape == 2) block.vtx.push_back(block.vtx.back());
+        if (shape == 3) block.nBits = 0;
+        if (shape == 4) block.hashMerkleRoot = uint256::ONE;
+        blocks.push_back(std::move(block));
+    }
+    const auto snapshot = [](const Bitcoin::CBlock& value) {
+        DataStream stream;
+        stream << value.GetBlockHeader() << value.fChecked << uint64_t{value.vtx.size()};
+        for (const auto& tx : value.vtx) { stream << bool(tx); if (tx) stream << TX_WITH_WITNESS(*tx); }
+        return stream.str();
+    };
+    std::vector<std::pair<UniValue,uint256>> cases;
+    for (auto& block : blocks) {
+        if (block.hashMerkleRoot.IsNull()) {
+            std::vector<uint256> hashes;
+            for (const auto& tx : block.vtx) hashes.push_back(tx->GetHash());
+            block.hashMerkleRoot = ComputeMerkleRoot(std::move(hashes));
+        }
+        if (block.nBits) while (!CheckDrivechainParentProofOfWork(block.GetHash(),block.nBits,nullptr)) ++block.nNonce;
+        DataStream stream;
+        stream << TX_WITH_WITNESS(block);
+        const auto bytes = stream.str();
+        const auto hex = HexStr(Span<const unsigned char>{reinterpret_cast<const unsigned char*>(bytes.data()),bytes.size()});
+        cases.emplace_back(UniValue(hex),block.GetHash());
+    }
+    cases.emplace_back(UniValue(cases[2].first.get_str() + "00"),cases[2].second);
+    cases.emplace_back(UniValue(cases[2].first.get_str().substr(0,180)),cases[2].second);
+    cases.emplace_back(UniValue("gg"),cases[2].second);
+    cases.emplace_back(cases[2].first,uint256{});
+    struct Outcome { Bitcoin::CBlock block; bool accepted{false}; std::string error{"unchanged"}, exception, trace; };
+    std::array<unsigned,2> accepted{}, rejected{};
+    for (const auto& [raw,hash] : cases)
+    for (unsigned script = 0; script < 3; ++script)
+    for (bool pinned : {false,true})
+    for (bool diagnostic : {false,true})
+    for (bool native_deadline : {false,true})
+    for (unsigned fault = 0; fault < 9; ++fault) {
+        const std::vector<uint8_t> challenge = script == 0 ? std::vector<uint8_t>{} :
+            std::vector<uint8_t>{uint8_t(script == 1 ? OP_TRUE : OP_0)};
+        const auto genesis = pinned ? hash : uint256::ONE;
+        const auto run = [&](bool composed) {
+            Outcome out;
+            out.block.nNonce = 77; out.block.fChecked = true;
+            const auto event = [&](char step) { out.trace += step; if (out.trace.size()-1 == fault) throw std::runtime_error("block source fault"); };
+            const auto deadline = [&] { event('D'); };
+            const auto read_challenge = [&]() -> const std::vector<uint8_t>& { event('C'); return challenge; };
+            const auto read_genesis = [&]() -> const uint256& { event('G'); return genesis; };
+            const std::function<uint32_t(uint32_t)> action = [&](uint32_t step) {
+                if (step == 1) deadline(); else if (step != 7) throw std::logic_error("invalid block deadline phase");
+                return 0U;
+            };
+            try {
+                if (composed) out.accepted = AuthenticateDrivechainRawParentBlock(raw,hash,out.block,
+                    diagnostic ? &out.error : nullptr,read_challenge,read_genesis,deadline,
+                    native_deadline ? action : std::function<uint32_t(uint32_t)>{});
+                else out.accepted = DecodeDrivechainRawParentBlock(raw,hash,out.block,diagnostic ? &out.error : nullptr,deadline,
+                    native_deadline ? action : std::function<uint32_t(uint32_t)>{}) &&
+                    CheckDrivechainParentBlockTransactions(out.block,diagnostic ? &out.error : nullptr,deadline) &&
+                    CheckDrivechainParentBlockSignet(out.block,diagnostic ? &out.error : nullptr,read_challenge,read_genesis,deadline);
+            } catch (const std::exception& e) { out.exception = e.what(); }
+            return out;
+        };
+        const auto expected = run(false), actual = run(true);
+        ++(actual.accepted ? accepted : rejected)[native_deadline];
+        BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+        BOOST_CHECK_EQUAL(actual.error,expected.error);
+        BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+        BOOST_CHECK_EQUAL(actual.trace,expected.trace);
+        BOOST_CHECK(snapshot(actual.block) == snapshot(expected.block));
+    }
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        BOOST_CHECK_GT(accepted[mode],0U);
+        BOOST_CHECK_GT(rejected[mode],0U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_block_signet_prepared_context_matches_standalone_checker)
+{
+    unsigned accepted{0}, rejected{0}, exceptions{0};
+    for (unsigned shape = 0; shape < 7; ++shape)
+    for (unsigned script = 0; script < 3; ++script)
+    for (bool pinned : {false,true})
+    for (bool diagnostic : {false,true})
+    for (unsigned fault = 0; fault < 4; ++fault) {
+        Bitcoin::CBlock block;
+        Bitcoin::CMutableTransaction coinbase;
+        coinbase.vin.emplace_back(Bitcoin::COutPoint(),CScript() << OP_0);
+        std::vector<unsigned char> commitment{0xaa,0x21,0xa9,0xed};
+        commitment.resize(36,0x42);
+        std::vector<unsigned char> section{0xec,0xc7,0xda,0xa2,0,0};
+        if (shape == 1) section.push_back(0); // Trailing solution byte.
+        if (shape == 2) section = {0xec,0xc7,0xda,0xa2,0xfd}; // Truncated CompactSize.
+        coinbase.vout.emplace_back(0,CScript() << OP_RETURN << commitment << section);
+        if (shape == 3) coinbase.vout.clear();
+        if (shape == 4) coinbase.vin[0].prevout = Bitcoin::COutPoint(uint256::ONE,0);
+        if (shape != 5) block.vtx.push_back(Bitcoin::MakeTransactionRef(coinbase));
+        if (shape == 6) for (unsigned i = 1; i < 258; ++i) {
+            auto tx = coinbase;
+            tx.vin[0].prevout = Bitcoin::COutPoint(uint256::ONE,i);
+            block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(tx)));
+        }
+        const std::vector<uint8_t> challenge = script == 0 ? std::vector<uint8_t>{} :
+            std::vector<uint8_t>{uint8_t(script == 1 ? OP_TRUE : OP_0)};
+        const uint256 genesis = pinned ? block.GetHash() : uint256::ONE;
+        struct Result { bool accepted{false}; std::string trace, error{"unchanged"}, exception; };
+        const auto run = [&](bool composed) {
+            Result out;
+            const auto event = [&](char part) { out.trace += part; if (out.trace.size()-1 == fault) throw std::runtime_error("signet source fault"); };
+            const auto read_challenge = [&]() -> const std::vector<uint8_t>& { event('C'); return challenge; };
+            const auto read_genesis = [&]() -> const uint256& { event('G'); return genesis; };
+            const auto deadline = [&] { event('D'); };
+            auto* error = diagnostic ? &out.error : nullptr;
+            try {
+                if (composed) out.accepted = CheckDrivechainParentBlockSignet(block,error,read_challenge,read_genesis,deadline);
+                else {
+                    const auto& bytes = read_challenge();
+                    if (bytes.empty()) out.accepted = true;
+                    else if (CheckBitcoinSignetBlockSolution(block,CScript(bytes.begin(),bytes.end()),read_genesis(),error)) {
+                        deadline();
+                        out.accepted = true;
+                    }
+                }
+            } catch (const std::exception& e) { out.exception = e.what(); }
+            return out;
+        };
+        const auto expected = run(false), actual = run(true);
+        BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+        BOOST_CHECK_EQUAL(actual.trace,expected.trace);
+        BOOST_CHECK_EQUAL(actual.error,expected.error);
+        BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+        if (!actual.exception.empty()) ++exceptions;
+        else if (actual.accepted) ++accepted;
+        else ++rejected;
+    }
+    BOOST_CHECK_GT(accepted,0U);
+    BOOST_CHECK_GT(rejected,0U);
+    BOOST_CHECK_GT(exceptions,0U);
+    const std::vector<uint32_t> expected_trace{109,110,111,112,2400,113,108};
+    for (size_t failure = 0; failure < expected_trace.size(); ++failure)
+    for (bool standard : {false,true}) {
+        std::vector<uint32_t> trace;
+        try {
+            drivechain::haskell::RunParentHeader(drivechain::haskell::ParentHeaderWorkflow::BLOCK_SIGNET,0,
+                [&](uint32_t step,uint64_t index,std::span<const unsigned char> input) {
+                    trace.push_back(step);
+                    BOOST_CHECK_EQUAL(index,0U);
+                    BOOST_CHECK(input.empty());
+                    if (trace.size()-1 == failure) {
+                        if (standard) throw std::logic_error("original Signet callback failure");
+                        throw 37;
+                    }
+                    // A prepared genesis context bypasses transaction effects.
+                    std::vector<unsigned char> reply(8,0);
+                    reply[0] = step == 110 ? 0 : step == 112 ? 2 : 1;
+                    return reply;
+                });
+            BOOST_FAIL("native callback failure was lost");
+        } catch (const std::logic_error& e) {
+            BOOST_CHECK(standard);
+            BOOST_CHECK_EQUAL(e.what(),"original Signet callback failure");
+        } catch (int code) {
+            BOOST_CHECK(!standard);
+            BOOST_CHECK_EQUAL(code,37);
+        }
+        BOOST_CHECK(trace == std::vector<uint32_t>(expected_trace.begin(),expected_trace.begin()+failure+1));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(parent_raw_blocks_preserve_witness_decode_mutation_and_deadlines)
 {
     Bitcoin::CBlock block;
@@ -1417,6 +1713,7 @@ BOOST_AUTO_TEST_CASE(parent_raw_blocks_preserve_witness_decode_mutation_and_dead
         std::string error{"unchanged"}, exception;
     };
     for (const auto& [raw,hash] : cases)
+    for (bool native_deadlines : {false,true})
     for (bool diagnostic : {false,true})
     for (unsigned fault = 0; fault < 3; ++fault) {
         const auto run = [&](bool migrated) {
@@ -1428,7 +1725,15 @@ BOOST_AUTO_TEST_CASE(parent_raw_blocks_preserve_witness_decode_mutation_and_dead
             const auto reject = [&](const std::string& message) { if (diagnostic) out.error = message; return false; };
             const auto deadline = [&] { if (out.deadlines++ == fault) throw std::runtime_error("fixture deadline"); };
             try {
-                if (migrated) out.accepted = DecodeDrivechainRawParentBlock(raw, hash, out.value, diagnostic ? &out.error : nullptr, deadline);
+                if (migrated) {
+                    const std::function<uint32_t(uint32_t)> action = [&](uint32_t step) {
+                        if (step == 1) deadline();
+                        else if (step != 7) throw std::logic_error("invalid raw block deadline phase");
+                        return 0U;
+                    };
+                    out.accepted = DecodeDrivechainRawParentBlock(raw, hash, out.value, diagnostic ? &out.error : nullptr,
+                        deadline,native_deadlines ? action : std::function<uint32_t(uint32_t)>{});
+                }
                 else out.accepted = [&] {
                     if (!raw.isStr() || !IsHex(raw.get_str())) return reject("getblock returned non-hex raw block data");
                     deadline();
@@ -1511,6 +1816,632 @@ BOOST_AUTO_TEST_CASE(parent_raw_headers_preserve_decode_errors_and_partial_mutat
         BOOST_CHECK_EQUAL(DecodeDrivechainRawParentHeader(raw, hash, actual, diagnostics ? &actual_error : nullptr), accepted);
         BOOST_CHECK_EQUAL(actual_error, expected_error);
         BOOST_CHECK(encode(actual) == encode(expected));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_rpc_median_authenticates_ancestors_in_one_workflow)
+{
+    std::vector<Bitcoin::CBlockHeader> headers(11);
+    uint256 hash;
+    arith_uint256 target;
+    target.SetCompact(0x207fffff);
+    for (unsigned i = headers.size(); i-- > 0;) {
+        auto& header = headers[i];
+        header.hashPrevBlock = hash;
+        header.nBits = 0x207fffff;
+        header.nTime = (i*7)%11;
+        while (UintToArith256(header.GetHash()) > target) ++header.nNonce;
+        hash = header.GetHash();
+    }
+    const auto encode = [](const Bitcoin::CBlockHeader& header) {
+        DataStream stream;
+        stream << header;
+        const auto bytes = stream.str();
+        return HexStr(Span<const unsigned char>{reinterpret_cast<const unsigned char*>(bytes.data()),bytes.size()});
+    };
+    struct Outcome {
+        uint64_t median{UINT64_MAX};
+        bool accepted{false};
+        std::string error{"unchanged"}, exception;
+        std::vector<std::string> trace;
+    };
+    for (uint32_t height : {0U,1U,9U,10U,11U,UINT32_MAX})
+    for (bool native_deadlines : {false,true})
+    for (unsigned scenario = 0; scenario < 6; ++scenario)
+    for (unsigned failed_header : {0U,3U,10U})
+    for (unsigned fault : {0U,1U,2U,4U,15U,44U,99U})
+    for (bool diagnostic : {false,true}) {
+        const auto run = [&](bool migrated) {
+            Outcome out;
+            unsigned requests{0};
+            const auto event = [&](const std::string& text) {
+                out.trace.push_back(text);
+                if (out.trace.size()-1 == fault) throw std::runtime_error("ancestor source failure");
+            };
+            const auto reject = [&](const std::string& message) { if (diagnostic) out.error = message; return false; };
+            const auto deadline = [&] { event("deadline"); };
+            const auto request = [&](const std::string& method, const UniValue& params) {
+                event(method + ":" + params.write());
+                auto bytes = encode(headers.at(requests));
+                if (requests++ == failed_header) {
+                    if (scenario == 1) return UniValue{};
+                    if (scenario == 2) bytes += "00";
+                    if (scenario == 3) bytes.resize(100);
+                    if (scenario == 4) bytes = encode(headers.at((failed_header+1)%headers.size()));
+                    if (scenario == 5) bytes = "gg";
+                }
+                return UniValue(bytes);
+            };
+            try {
+                if (migrated) {
+                    const std::function<uint32_t(uint32_t)> action = [&](uint32_t step) {
+                        if (step == 1) deadline();
+                        else if (step != 7) throw std::logic_error("invalid median deadline phase");
+                        return 0U;
+                    };
+                    out.accepted = ComputeDrivechainRpcMedianTimePast(hash,height,out.median,
+                        diagnostic ? &out.error : nullptr,request,deadline,
+                        native_deadlines ? action : std::function<uint32_t(uint32_t)>{});
+                }
+                else out.accepted = [&] {
+                    std::vector<uint32_t> times;
+                    uint256 expected = hash;
+                    for (uint64_t i = 0; i < std::min<uint64_t>(11,uint64_t{height}+1); ++i) {
+                        deadline();
+                        Bitcoin::CBlockHeader header;
+                        UniValue params{UniValue::VARR};
+                        params.push_back(expected.GetHex());
+                        params.push_back(false);
+                        const auto raw = request("getblockheader",params);
+                        if (!raw.isStr() || !IsHex(raw.get_str())) return reject("getblockheader returned non-hex raw header data");
+                        deadline();
+                        try {
+                            DataStream stream{ParseHex(raw.get_str())};
+                            stream >> header;
+                            if (!stream.empty()) return reject("raw parent header has trailing bytes");
+                        } catch (const std::exception& e) {
+                            return reject(strprintf("cannot decode raw parent header: %s",e.what()));
+                        }
+                        deadline();
+                        if (header.GetHash() != expected) return reject(strprintf("raw parent header hashes to %s, expected %s",
+                            header.GetHash().GetHex(),expected.GetHex()));
+                        if (!CheckDrivechainParentProofOfWork(expected,header.nBits,diagnostic ? &out.error : nullptr)) return false;
+                        times.push_back(header.nTime);
+                        expected = header.hashPrevBlock;
+                    }
+                    std::sort(times.begin(),times.end());
+                    deadline();
+                    out.median = times[times.size()/2];
+                    return true;
+                }();
+            } catch (const std::exception& e) { out.exception = e.what(); }
+            return out;
+        };
+        const auto expected = run(false), actual = run(true);
+        BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+        BOOST_CHECK_EQUAL(actual.median,expected.median);
+        BOOST_CHECK_EQUAL(actual.error,expected.error);
+        BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+        BOOST_CHECK(actual.trace == expected.trace);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_rpc_authentication_composes_without_nested_header_entries)
+{
+    std::vector<Bitcoin::CBlockHeader> headers(11);
+    uint256 hash;
+    arith_uint256 target;
+    target.SetCompact(0x207fffff);
+    for (unsigned i = headers.size(); i-- > 0;) {
+        auto& header = headers[i];
+        header.hashPrevBlock = hash;
+        header.nBits = 0x207fffff;
+        header.nTime = (i*7)%11;
+        while (UintToArith256(header.GetHash()) > target) ++header.nNonce;
+        hash = header.GetHash();
+    }
+    const auto pinned = uint256S("1234"), prior_work = uint256S("5678");
+    const auto chainwork = ArithToUint256(UintToArith256(prior_work) + GetDrivechainParentBlockProof(headers[0].nBits));
+    const auto encode = [](const Bitcoin::CBlockHeader& header) {
+        DataStream stream;
+        stream << header;
+        const auto bytes = stream.str();
+        return HexStr(Span<const unsigned char>{reinterpret_cast<const unsigned char*>(bytes.data()),bytes.size()});
+    };
+    const auto state = [](const VerifiedMainchainHeader& verified) {
+        DataStream stream;
+        stream << verified.header << verified.chainwork << verified.height << verified.confirmations << verified.median_time_past;
+        return stream.str();
+    };
+    struct Outcome {
+        VerifiedMainchainHeader verified;
+        bool accepted{false};
+        std::string error{"unchanged"}, exception;
+        std::vector<std::string> trace;
+    };
+    for (unsigned deadline_case = 0; deadline_case < 8; ++deadline_case)
+    for (unsigned scenario = 0; scenario < 12; ++scenario)
+    for (unsigned fault = 0; fault < (deadline_case == 0 ? 55U : 250U); ++fault)
+    for (bool diagnostic : {false,true}) {
+        const auto run = [&](bool migrated) {
+            Outcome out;
+            out.verified.header.nNonce = 99;
+            out.verified.chainwork = uint256S("77");
+            out.verified.height = 88;
+            out.verified.confirmations = 99;
+            out.verified.median_time_past = 111;
+            unsigned raw_requests{0};
+            const auto event = [&](std::string text) {
+                out.trace.push_back(std::move(text));
+                if (out.trace.size()-1 == fault) throw std::runtime_error("authentication source failure");
+            };
+            const auto reject = [&](const std::string& message) { if (diagnostic) out.error = message; return false; };
+            const auto deadline_action = [&](uint32_t step) -> uint32_t {
+                event("deadline:" + std::to_string(step));
+                switch (step) {
+                case 1: return deadline_case == 2 || deadline_case == 3 || deadline_case == 4 || deadline_case == 7;
+                case 2: return deadline_case == 3 || deadline_case == 7;
+                case 3: return deadline_case == 3;
+                case 4: throw std::runtime_error("authentication interrupted");
+                case 5: return deadline_case == 4;
+                case 6: throw std::runtime_error("authentication deadline exhausted");
+                case 7: return deadline_case >= 5;
+                case 8: return deadline_case == 6;
+                case 9: throw std::runtime_error("authentication budget exhausted");
+                default: throw std::logic_error("invalid authentication deadline observation");
+                }
+            };
+            const auto deadline = [&] {
+                if (deadline_case == 0) { event("deadline"); return; }
+                if (migrated) throw std::logic_error("RPC workflow called nested deadline helper");
+                if (deadline_action(1)) {
+                    if (deadline_action(2) && deadline_action(3)) deadline_action(4);
+                    if (deadline_action(5)) deadline_action(6);
+                }
+                if (deadline_action(7) && deadline_action(8)) deadline_action(9);
+            };
+            const auto request = [&](const std::string& method, const UniValue& params) {
+                event(method + ":" + params.write());
+                if (method == "getblockhash") {
+                    if (params[0].getInt<int>() == 0) return UniValue(scenario == 1 ? "bad" : pinned.GetHex());
+                    return UniValue(scenario == 2 ? pinned.GetHex() : hash.GetHex());
+                }
+                if (params[1].get_bool()) {
+                    const bool current = params[0].get_str() == hash.GetHex();
+                    UniValue metadata(UniValue::VOBJ);
+                    metadata.pushKV("hash",current ? hash.GetHex() : headers[1].GetHash().GetHex());
+                    metadata.pushKV("height",current ? (scenario == 3 ? -1 : 10) : (scenario == 4 ? 8 : 9));
+                    metadata.pushKV("confirmations",6);
+                    metadata.pushKV("chainwork",current
+                        ? chainwork.GetHex()
+                        : (scenario == 5 ? uint256{}.GetHex() : prior_work.GetHex()));
+                    metadata.pushKV("previousblockhash",headers[1].GetHash().GetHex());
+                    return metadata;
+                }
+                const unsigned index = raw_requests == 0 ? 0 : raw_requests-1;
+                auto bytes = encode(headers.at(index));
+                const bool damage = raw_requests == (scenario >= 9 ? 5U : 0U);
+                ++raw_requests;
+                if (damage) {
+                    if (scenario == 6 || scenario == 9) bytes += "00";
+                    if (scenario == 7 || scenario == 10) bytes.resize(100);
+                    if (scenario == 8 || scenario == 11) bytes = encode(headers[10]);
+                }
+                return UniValue(bytes);
+            };
+            DrivechainParentHeaderSource source{
+                [&]() -> const uint256& { event("pinned genesis"); return pinned; },
+                request,
+                [&](const uint256& expected, Bitcoin::CBlockHeader& header, std::string*) {
+                    if (migrated) throw std::logic_error("RPC workflow called nested raw helper");
+                    UniValue params(UniValue::VARR);
+                    params.push_back(expected.GetHex()); params.push_back(false);
+                    const auto raw = request("getblockheader",params);
+                    if (!raw.isStr() || !IsHex(raw.get_str())) return reject("getblockheader returned non-hex raw header data");
+                    deadline();
+                    try {
+                        DataStream stream{ParseHex(raw.get_str())};
+                        stream >> header;
+                        if (!stream.empty()) return reject("raw parent header has trailing bytes");
+                    } catch (const std::exception& e) {
+                        return reject(strprintf("cannot decode raw parent header: %s",e.what()));
+                    }
+                    deadline();
+                    if (header.GetHash() != expected) return reject(strprintf("raw parent header hashes to %s, expected %s",
+                        header.GetHash().GetHex(),expected.GetHex()));
+                    return CheckDrivechainParentProofOfWork(expected,header.nBits,diagnostic ? &out.error : nullptr);
+                },
+                [&](const uint256& expected, uint32_t height, uint64_t& median, std::string* error) {
+                    if (migrated) throw std::logic_error("RPC workflow called nested median helper");
+                    return ComputeDrivechainRpcMedianTimePast(expected,height,median,error,request,deadline);
+                },deadline};
+            if (migrated && deadline_case != 0) source.deadline_action = deadline_action;
+            try {
+                out.accepted = VerifyDrivechainParentHeader(hash,6,out.verified,diagnostic ? &out.error : nullptr,source,migrated);
+            } catch (const std::exception& e) { out.exception = e.what(); }
+            return out;
+        };
+        const auto expected = run(false), actual = run(true);
+        BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+        BOOST_CHECK_EQUAL(actual.error,expected.error);
+        BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+        BOOST_CHECK(actual.trace == expected.trace);
+        BOOST_CHECK(state(actual.verified) == state(expected.verified));
+        if (scenario == 0 && ((deadline_case == 0 && fault == 54) ||
+            ((deadline_case == 1 || deadline_case == 2 || deadline_case == 5 || deadline_case == 7) && fault == 249))) {
+            BOOST_CHECK(actual.accepted);
+            BOOST_CHECK_EQUAL(actual.verified.height,10U);
+            BOOST_CHECK_EQUAL(actual.verified.median_time_past,5U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_network_header_composition_preserves_failure_order_and_revocation)
+{
+    Bitcoin::CBlockHeader header;
+    header.nBits = 0x207fffff;
+    header.nTime = 1001;
+    arith_uint256 target;
+    target.SetCompact(header.nBits);
+    while (UintToArith256(header.GetHash()) > target) ++header.nNonce;
+    const auto hash = header.GetHash();
+    const auto work = ArithToUint256(GetDrivechainParentBlockProof(header.nBits));
+    const auto state = [](const auto& value) {
+        DataStream stream;
+        stream << value.header << value.chainwork << value.height << value.confirmations << value.median_time_past;
+        return stream.str();
+    };
+    DataStream stream;
+    stream << header;
+    const auto serialized = stream.str();
+    const auto raw = HexStr(Span<const unsigned char>{reinterpret_cast<const unsigned char*>(serialized.data()),serialized.size()});
+    struct Outcome {
+        VerifiedMainchainHeader verified;
+        bool accepted{false};
+        uint64_t epoch{77};
+        std::string error{"unchanged"}, exception;
+        std::vector<std::string> trace;
+    };
+    for (bool selected : {false,true})
+    for (bool deadlines : {false,true})
+    for (bool diagnostic : {false,true})
+    for (unsigned scenario = 0; scenario < 10; ++scenario)
+    for (unsigned fault = 0; fault <= 50; ++fault)
+    for (bool nonstandard : {false,true}) {
+        const auto run = [&](bool composed) {
+            Outcome out;
+            out.verified.height = 99;
+            out.verified.header.nNonce = 77;
+            out.verified.chainwork = uint256::ONE;
+            std::atomic<uint64_t> epoch{out.epoch};
+            auto consensus = Params().GetConsensus();
+            consensus.hashGenesisBlock = selected ? uint256S(ElementsDrivechainIdentity::GENESIS_HASH) : uint256::ONE;
+            const auto event = [&](std::string text) {
+                out.trace.push_back(std::move(text));
+                if (out.trace.size()-1 == fault) {
+                    if (nonstandard) throw 73;
+                    throw std::runtime_error("network/header source failure");
+                }
+            };
+            unsigned hash_reads{0};
+            const auto request = [&](const std::string& method,const UniValue& params) {
+                event(method + ":" + params.write());
+                if (method == "getblockhash" && params[0].getInt<int>() == 967680) {
+                    if (scenario == 1) return UniValue(uint256::ONE.GetHex());
+                    if (scenario == 2) throw std::runtime_error("identity unavailable");
+                    if (scenario == 3) return UniValue{};
+                    return UniValue("00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042");
+                }
+                if (method == "getblockhash") {
+                    const bool genesis = hash_reads++ == 0;
+                    return UniValue((scenario == 4 && genesis) || (scenario == 5 && !genesis) ? uint256::ONE.GetHex() : hash.GetHex());
+                }
+                if (params[1].get_bool()) {
+                    UniValue metadata(UniValue::VOBJ);
+                    metadata.pushKV("hash",hash.GetHex());
+                    metadata.pushKV("height",0);
+                    metadata.pushKV("confirmations",scenario == 6 ? 1 : 6);
+                    metadata.pushKV("chainwork",work.GetHex());
+                    return metadata;
+                }
+                return UniValue(scenario == 7 ? raw + "00" : scenario == 8 ? raw.substr(0,100) : raw);
+            };
+            DrivechainParentHeaderSource source{
+                [&]() -> const uint256& { event("pinned genesis"); return hash; }, request, {}, {},
+                [&] { event("deadline"); }};
+            if (deadlines) source.deadline_action = [&](uint32_t step) {
+                event("deadline:" + std::to_string(step));
+                if (step != 1 && step != 7) throw std::logic_error("invalid deadline observation");
+                return 0U;
+            };
+            try {
+                auto* error = diagnostic ? &out.error : nullptr;
+                const int minimum = scenario == 9 ? 0 : 6;
+                out.accepted = composed ? VerifyDrivechainNetworkHeader(consensus,epoch,hash,minimum,out.verified,error,source)
+                    : VerifyDrivechainParentRpcNetwork(consensus,request,epoch,error) &&
+                      VerifyDrivechainParentHeader(hash,minimum,out.verified,error,source,true);
+            } catch (const std::exception& e) { out.exception = e.what(); }
+            catch (int value) { out.exception = "nonstandard:" + std::to_string(value); }
+            out.epoch = epoch.load();
+            return out;
+        };
+        const auto expected = run(false), actual = run(true);
+        BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+        BOOST_CHECK_EQUAL(actual.error,expected.error);
+        BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+        BOOST_CHECK_EQUAL(actual.epoch,expected.epoch);
+        BOOST_CHECK(actual.trace == expected.trace);
+        BOOST_CHECK(state(actual.verified) == state(expected.verified));
+        if (fault == 50) {
+            BOOST_CHECK_EQUAL(actual.accepted,scenario == 0 || (!selected && scenario <= 3));
+            BOOST_CHECK_EQUAL(actual.epoch,selected && scenario >= 1 && scenario <= 3 ? 0U : 77U);
+            if (selected && scenario >= 1 && scenario <= 3) BOOST_CHECK_EQUAL(actual.trace.size(),1U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(parent_complete_block_workflow_preserves_recovery_authentication_and_lifetimes)
+{
+    using Clock = std::chrono::steady_clock;
+    using Point = Clock::time_point;
+    const auto point = [](int seconds) { return Point{std::chrono::seconds{seconds}}; };
+    const auto encode = [](const auto& value) {
+        DataStream bytes;
+        bytes << value;
+        const auto data = bytes.str();
+        return HexStr(Span<const unsigned char>{reinterpret_cast<const unsigned char*>(data.data()),data.size()});
+    };
+    const auto envelope = [](const UniValue& result, const UniValue& error = UniValue{}) {
+        UniValue reply{UniValue::VOBJ};
+        reply.pushKV("result",result); reply.pushKV("error",error);
+        return reply;
+    };
+    struct Outcome {
+        Bitcoin::CBlock block;
+        VerifiedMainchainHeader verified;
+        bool accepted{false};
+        uint64_t epoch{77};
+        std::optional<Point> budget;
+        std::string error{"unchanged"}, exception;
+        std::vector<std::string> trace;
+        std::vector<std::optional<Point>> observed;
+    };
+    unsigned accepted{0}, rejected{0}, exceptions{0};
+    for (unsigned scenario = 0; scenario < 23; ++scenario) {
+        Bitcoin::CBlock input;
+        Bitcoin::CMutableTransaction reward;
+        reward.vin.emplace_back(Bitcoin::COutPoint(),CScript() << OP_0);
+        reward.vout.emplace_back(50,CScript() << OP_TRUE);
+        if (scenario != 15) input.vtx.push_back(Bitcoin::MakeTransactionRef(reward));
+        input.hashMerkleRoot = scenario == 15 ? uint256{} : input.vtx.front()->GetHash();
+        if (scenario == 14) input.hashMerkleRoot = uint256::ONE;
+        input.nBits = 0x207fffff; input.nTime = 1001;
+        arith_uint256 target; target.SetCompact(input.nBits);
+        while (UintToArith256(input.GetHash()) > target) ++input.nNonce;
+        const auto hash = input.GetHash();
+        const auto work = ArithToUint256(GetDrivechainParentBlockProof(input.nBits));
+        const auto raw_header = encode(input.GetBlockHeader());
+        const auto raw = encode(TX_WITH_WITNESS(input));
+        const bool pruned = scenario == 10 || scenario == 11 || scenario == 12 || scenario >= 19;
+        const std::vector<uint8_t> challenge = scenario == 16 ? std::vector<uint8_t>{OP_TRUE} : std::vector<uint8_t>{};
+        for (bool full : {false,true})
+        for (bool deadlines : {false,true})
+        for (bool diagnostic : {false,true})
+        for (unsigned fault = 0; fault <= 50; ++fault)
+        for (bool nonstandard : {false,true}) {
+            const auto run = [&](bool composed) {
+                Outcome out;
+                if (scenario % 3) out.budget = point(scenario % 3 == 1 ? 99 : 150);
+                out.block.nNonce = 77; out.block.fChecked = true;
+                out.verified.height = 99; out.verified.header.nNonce = 88;
+                std::atomic<uint64_t> epoch{77};
+                auto consensus = Params().GetConsensus();
+                consensus.hashGenesisBlock = uint256S(ElementsDrivechainIdentity::GENESIS_HASH);
+                const auto event = [&](std::string name) {
+                    out.trace.push_back(std::move(name));
+                    out.observed.push_back(out.budget);
+                    if (out.trace.size()-1 == fault) {
+                        if (nonstandard) throw 73;
+                        throw std::runtime_error("parent block source failure");
+                    }
+                };
+                const std::function<uint32_t(uint32_t)> deadline_action = [&](uint32_t step) {
+                    event("deadline:" + std::to_string(step));
+                    if (step != 1 && step != 7) throw std::logic_error("unexpected deadline action");
+                    return 0U;
+                };
+                const auto deadline = [&] {
+                    if (deadlines) drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_DEADLINE,deadline_action);
+                    else event("deadline");
+                };
+                unsigned hash_reads{0}, body_reads{0}, recovery_headers{0};
+                DrivechainParentHeaderSource header{
+                    [&]() -> const uint256& { event("genesis"); return hash; },
+                    [&](const std::string& method,const UniValue& params) {
+                        event("header:" + method + ":" + params.write());
+                        if (method == "getblockhash" && params[0].getInt<int>() == 967680)
+                            return UniValue(scenario == 1 ? uint256::ONE.GetHex() : "00000000000000030101ba5cfea54b22becc79f95dc6040beb76e01dd9d04042");
+                        if (method == "getblockhash") {
+                            const bool genesis = hash_reads++ == 0;
+                            return UniValue(((scenario == 2 && genesis) || (scenario == 3 && !genesis)) ? uint256::ONE.GetHex() : hash.GetHex());
+                        }
+                        if (!params[1].get_bool()) return UniValue(raw_header);
+                        UniValue metadata{UniValue::VOBJ};
+                        metadata.pushKV("hash",hash.GetHex()); metadata.pushKV("height",0);
+                        metadata.pushKV("confirmations",scenario == 5 ? 1 : 6); metadata.pushKV("chainwork",work.GetHex());
+                        return metadata;
+                    },{},{},deadline};
+                if (deadlines) header.deadline_action = deadline_action;
+                DrivechainParentBodySource source{header,out.budget,
+                    [&] {
+                        event("clock");
+                        if (scenario == 17) { out.budget = point(999); throw std::runtime_error("clock changed then failed"); }
+                        return point(100);
+                    },
+                    [&] { event("allow recovery"); return scenario != 11; },
+                    [&](const std::string& method,const UniValue& params) {
+                        event("body:" + method + ":" + params.write());
+                        if (method == "getblock") {
+                            if (pruned && ++body_reads <= 2) {
+                                UniValue error{UniValue::VOBJ};
+                                error.pushKV("code",-1); error.pushKV("message","Block not available (pruned data)");
+                                return envelope(UniValue{},error);
+                            }
+                            if (scenario == 13) return envelope(UniValue{},UniValue("unavailable"));
+                            if (scenario == 20) return envelope(UniValue{});
+                            if (scenario == 6) return envelope(UniValue(raw + "00"));
+                            if (scenario == 7) return envelope(UniValue(raw.substr(0,100)));
+                            if (scenario == 8) return envelope(UniValue("gg"));
+                            if (scenario == 9) { auto changed=input; ++changed.nNonce; return envelope(UniValue(encode(TX_WITH_WITNESS(changed)))); }
+                            return envelope(UniValue(raw));
+                        }
+                        if (method == "getblockheader") {
+                            if (scenario == 22) return envelope(UniValue{},UniValue("header unavailable"));
+                            UniValue metadata{UniValue::VOBJ};
+                            metadata.pushKV("hash",hash.GetHex());
+                            metadata.pushKV("height",scenario == 19 && recovery_headers++ ? 43 : 42);
+                            metadata.pushKV("confirmations",scenario == 21 ? 0 : 6);
+                            return envelope(metadata);
+                        }
+                        if (method == "getblockhash") return envelope(UniValue(hash.GetHex()));
+                        if (method == "getpeerinfo") {
+                            UniValue peers{UniValue::VARR}, peer{UniValue::VOBJ}, services{UniValue::VARR};
+                            services.push_back(scenario == 12 ? "NETWORK_LIMITED" : "NETWORK");
+                            peer.pushKV("id",1); peer.pushKV("servicesnames",services); peers.push_back(peer);
+                            return envelope(peers);
+                        }
+                        if (method == "getblockfrompeer") return envelope(UniValue(UniValue::VOBJ));
+                        throw std::logic_error("unexpected body RPC");
+                    },deadline,[&] { event("wait"); },
+                    [&]() -> const std::vector<uint8_t>& {
+                        event("challenge");
+                        if (scenario == 18) out.budget = point(888);
+                        return challenge;
+                    }};
+                auto* error = diagnostic ? &out.error : nullptr;
+                const int minimum = scenario == 4 ? 0 : 6;
+                const auto body = [&](const uint256& expected, Bitcoin::CBlock& result, std::string* message) {
+                    DrivechainParentRecoveryDeadline budget(out.budget,source.now);
+                    const UniValue fetched = drivechain::FetchParentBlockBody(expected.GetHex(),source.allow_recovery(),
+                        source.request,source.check_deadline,source.wait);
+                    return AuthenticateDrivechainRawParentBlock(fetched,expected,result,message,source.challenge,header.genesis,
+                        header.deadline,header.deadline_action);
+                };
+                try {
+                    if (composed) out.accepted = ReadDrivechainParentBlock(consensus,epoch,hash,minimum,out.block,
+                        full ? &out.verified : nullptr,error,source);
+                    else if (!full) out.accepted = body(hash,out.block,error);
+                    else out.accepted = VerifyDrivechainParentBlock(hash,minimum,out.block,out.verified,error,
+                        [&](const uint256& expected,int confirmations,VerifiedMainchainHeader& result,std::string* message) {
+                            return VerifyDrivechainNetworkHeader(consensus,epoch,expected,confirmations,result,message,header);
+                        },body);
+                } catch (const std::exception& e) { out.exception = e.what(); }
+                catch (int value) { out.exception = "nonstandard:" + std::to_string(value); }
+                out.epoch = epoch.load();
+                return out;
+            };
+            const auto expected = run(false), actual = run(true);
+            BOOST_TEST_CONTEXT("scenario=" << scenario << " full=" << full << " deadline=" << deadlines << " fault=" << fault) {
+                BOOST_CHECK_EQUAL(actual.accepted,expected.accepted);
+                BOOST_CHECK_EQUAL(actual.error,expected.error);
+                BOOST_CHECK_EQUAL(actual.exception,expected.exception);
+                BOOST_CHECK_EQUAL(actual.epoch,expected.epoch);
+                BOOST_CHECK(actual.trace == expected.trace);
+                BOOST_CHECK(actual.observed == expected.observed);
+                BOOST_CHECK(actual.budget == expected.budget);
+                BOOST_CHECK_EQUAL(encode(TX_WITH_WITNESS(actual.block)),encode(TX_WITH_WITNESS(expected.block)));
+                BOOST_CHECK_EQUAL(actual.block.fChecked,expected.block.fChecked);
+                BOOST_CHECK_EQUAL(encode(actual.verified.header),encode(expected.verified.header));
+                BOOST_CHECK(actual.verified.chainwork == expected.verified.chainwork);
+                BOOST_CHECK_EQUAL(actual.verified.height,expected.verified.height);
+                BOOST_CHECK_EQUAL(actual.verified.confirmations,expected.verified.confirmations);
+                BOOST_CHECK_EQUAL(actual.verified.median_time_past,expected.verified.median_time_past);
+            }
+            ++(actual.accepted ? accepted : rejected);
+            if (!actual.exception.empty()) ++exceptions;
+        }
+    }
+    BOOST_CHECK_GT(accepted,0U);
+    BOOST_CHECK_GT(rejected,0U);
+    BOOST_CHECK_GT(exceptions,0U);
+}
+
+BOOST_AUTO_TEST_CASE(parent_header_native_http_transport)
+{
+    VerifiedMainchainHeader verified;
+    verified.height = 99;
+    std::string error;
+    DrivechainParentHeaderSource source{};
+    source.native_rpc = true;
+    BOOST_CHECK(!VerifyDrivechainParentHeader(uint256::ONE, 0, verified, &error, source, true));
+    BOOST_CHECK_EQUAL(error, "minimum parent confirmations must be positive");
+    BOOST_CHECK_EQUAL(verified.height, 99U);
+
+    // Synthetic local HTTP fixtures only; normal unit runs have no endpoint.
+    const char* port = std::getenv("ELEMENTS_TEST_HEADER_RPC_PORT");
+    if (!port) return;
+    const char* expected_hash = std::getenv("ELEMENTS_TEST_HEADER_HASH");
+    const char* genesis_hash = std::getenv("ELEMENTS_TEST_HEADER_GENESIS");
+    const char* expected_error = std::getenv("ELEMENTS_TEST_HEADER_ERROR");
+    BOOST_REQUIRE(expected_hash && genesis_hash && expected_error);
+    const auto hash = uint256S(expected_hash), genesis = uint256S(genesis_hash);
+    gArgs.ForceSetArg("-mainchainrpchost", "127.0.0.1");
+    gArgs.ForceSetArg("-mainchainrpcport", port);
+    gArgs.ForceSetArg("-mainchainrpctimeout", "1");
+    if (const char* cookie = std::getenv("ELEMENTS_TEST_HEADER_COOKIE")) {
+        gArgs.ForceSetArg("-mainchainrpccookiefile", cookie);
+    } else {
+        gArgs.ForceSetArg("-mainchainrpcuser", "fixture");
+        gArgs.ForceSetArg("-mainchainrpcpassword", "fixture");
+    }
+    source.genesis = [&]() -> const uint256& { return genesis; };
+    source.request = [](const std::string&, const UniValue&) -> UniValue {
+        throw std::logic_error("native header path used injected RPC hook");
+    };
+    source.deadline_action = [](uint32_t step) -> uint32_t {
+        BOOST_CHECK(step == 1 || step == 7);
+        return 0;
+    };
+    bool accepted{false};
+    error.clear();
+    std::atomic<uint64_t> epoch{77};
+    const bool composed = std::getenv("ELEMENTS_TEST_NETWORK_HEADER") != nullptr;
+    const char* body_mode = std::getenv("ELEMENTS_TEST_PARENT_BODY");
+    Bitcoin::CBlock block;
+    std::optional<std::chrono::steady_clock::time_point> recovery_budget;
+    const std::vector<uint8_t> challenge;
+    try {
+        if (body_mode) {
+            auto consensus = Params().GetConsensus();
+            consensus.hashGenesisBlock = uint256S(ElementsDrivechainIdentity::GENESIS_HASH);
+            accepted = ReadDrivechainParentBlock(consensus,epoch,hash,6,block,
+                std::string{body_mode} == "raw" ? nullptr : &verified,&error,
+                {source,recovery_budget,std::chrono::steady_clock::now,[] { return true; },
+                 source.request,[] { throw std::logic_error("native recovery used deadline hook"); },[] {},
+                 [&]() -> const std::vector<uint8_t>& { return challenge; }});
+        } else if (composed) {
+            auto consensus = Params().GetConsensus();
+            consensus.hashGenesisBlock = uint256S(ElementsDrivechainIdentity::GENESIS_HASH);
+            accepted = VerifyDrivechainNetworkHeader(consensus,epoch,hash,6,verified,&error,source);
+        } else accepted = VerifyDrivechainParentHeader(hash,6,verified,&error,source,true);
+    }
+    catch (const std::exception& e) { error = e.what(); }
+    if (composed) BOOST_CHECK_EQUAL(epoch.load(), std::getenv("ELEMENTS_TEST_NETWORK_REVOKED") ? 0U : 77U);
+    const bool expected = std::string{expected_error}.empty();
+    BOOST_CHECK_EQUAL(accepted, expected);
+    if (body_mode) {
+        BOOST_CHECK(!recovery_budget);
+        if (expected) BOOST_CHECK(block.GetHash() == hash);
+    }
+    if (expected && (!body_mode || std::string{body_mode} != "raw")) {
+        BOOST_CHECK_EQUAL(verified.header.GetHash().GetHex(), hash.GetHex());
+        BOOST_CHECK_EQUAL(verified.height, 2U);
+        BOOST_CHECK_EQUAL(verified.confirmations, 6);
+        BOOST_CHECK_EQUAL(verified.median_time_past, 1001U);
+        BOOST_CHECK_EQUAL(verified.chainwork.GetHex(), uint256S("6").GetHex());
+    } else if (!expected) {
+        BOOST_CHECK_MESSAGE(error.find(expected_error) != std::string::npos, error);
+        BOOST_CHECK_EQUAL(verified.height, std::getenv("ELEMENTS_TEST_BODY_HEADER_PUBLISHED") ? 2U : 99U);
     }
 }
 
@@ -2793,6 +3724,60 @@ BOOST_AUTO_TEST_CASE(parent_replay_expiry_boundaries_match_original)
     BOOST_REQUIRE_EQUAL(state.pending_withdrawals.size(), 1U);
     BOOST_CHECK_EQUAL(state.pending_withdrawals.front().m6id, required);
     BOOST_CHECK_EQUAL(error, "M3 proposal height is ahead of replay height");
+}
+
+BOOST_AUTO_TEST_CASE(parent_replay_maintenance_preserves_order_and_width)
+{
+    const uint256 required = uint256S("11");
+    const std::array<uint256,5> ids{uint256{}, uint256S("01"), uint256S("02"), uint256S("03"), uint256S("04")};
+    Bitcoin::CMutableTransaction cb;
+    cb.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0);
+    cb.vout.emplace_back(0, CScript() << OP_RETURN);
+    Bitcoin::CBlock block;
+    block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(cb)));
+    std::string error;
+    const auto apply = [&](DrivechainParentReplayState& state) {
+        return ApplyDrivechainParentBlockState(block, 100, 24, required,
+            10, 5, 10, 5, 10, 5, state, nullptr, &error);
+    };
+
+    DrivechainParentReplayState state;
+    for (size_t i = 0; i < ids.size(); ++i)
+        state.pending_proposals.emplace(ids[i], DrivechainPendingProposal{i == 1 ? 100U : i == 3 ? 101U : 0U, 0});
+    state.other_slots[0].pending_proposals.emplace(ids[0], DrivechainPendingProposal{0, 0});
+    BOOST_CHECK(!apply(state));
+    BOOST_CHECK_EQUAL(error, "parent proposal height is ahead of replay height for slot 24");
+    BOOST_REQUIRE_EQUAL(state.pending_proposals.size(), 3U);
+    for (size_t i : {1,3,4}) BOOST_CHECK_EQUAL(state.pending_proposals.count(ids[i]), 1U);
+    // Configured-slot failure precedes other slots, even lower-numbered ones.
+    BOOST_CHECK_EQUAL(state.other_slots.at(0).pending_proposals.size(), 1U);
+
+    for (uint32_t votes : {65536U, std::numeric_limits<uint32_t>::max()}) {
+        state = {};
+        state.pending_proposals.emplace(ids[0], DrivechainPendingProposal{0, 0});
+        state.pending_proposals.emplace(ids[1], DrivechainPendingProposal{100, votes});
+        BOOST_CHECK_THROW(apply(state), std::runtime_error);
+        BOOST_REQUIRE_EQUAL(state.pending_proposals.size(), 1U);
+        BOOST_CHECK_EQUAL(state.pending_proposals.at(ids[1]).votes, votes);
+    }
+
+    state = {};
+    state.active_proposal_hash = required;
+    state.pending_withdrawals.push_back({ids[0], 0, 1});
+    auto& lower = state.other_slots[0];
+    lower.active_proposal_hash = required;
+    for (size_t i = 0; i < ids.size(); ++i)
+        lower.pending_withdrawals.push_back({ids[i], i == 1 ? 100U : i == 3 ? 101U : 0U, 1});
+    state.other_slots[25].active_proposal_hash = required;
+    state.other_slots[25].pending_withdrawals.push_back({ids[0], 0, 1});
+    BOOST_CHECK(!apply(state));
+    BOOST_CHECK_EQUAL(error, "M3 proposal height is ahead of replay height");
+    BOOST_REQUIRE_EQUAL(lower.pending_withdrawals.size(), 3U);
+    BOOST_CHECK(lower.pending_withdrawals[0].m6id == ids[1]);
+    BOOST_CHECK(lower.pending_withdrawals[1].m6id == ids[3]);
+    BOOST_CHECK(lower.pending_withdrawals[2].m6id == ids[4]);
+    BOOST_CHECK_EQUAL(state.pending_withdrawals.size(), 1U);
+    BOOST_CHECK_EQUAL(state.other_slots.at(25).pending_withdrawals.size(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(parent_replay_m4_dispatch_preserves_partial_slot_mutations)
@@ -4429,6 +5414,342 @@ BOOST_AUTO_TEST_CASE(drivechain_activation_block_deposit_is_mintable)
     BOOST_CHECK_EQUAL(deposits[0].block_height, activation_height);
 }
 
+namespace NativeDepositReference {
+bool Decode(const std::string& payload, CScript& recipient, CAmount& fee)
+{
+    recipient.clear();
+    fee = 0;
+    if (payload.empty() || payload.size() > 128) return false;
+    std::string address = payload;
+    CAmount committed_fee{0};
+    if (payload.starts_with("dcfee1:")) {
+        const auto separator = payload.find(':', 7);
+        if (separator == std::string::npos) return false;
+        const auto encoded_fee = payload.substr(7, separator - 7);
+        if (!ParseInt64(encoded_fee, &committed_fee) || !MoneyRange(committed_fee) ||
+            committed_fee == 0 || std::to_string(committed_fee) != encoded_fee) return false;
+        address = payload.substr(separator + 1);
+    }
+    const auto destination = DecodeDestination(address);
+    if (!IsValidDestination(destination)) return false;
+    recipient = GetScriptForDestination(destination);
+    fee = committed_fee;
+    return true;
+}
+
+std::string Encode(const std::string& address, CAmount fee)
+{
+    if (!IsValidDestination(DecodeDestination(address)) || !MoneyRange(fee))
+        throw std::invalid_argument("invalid drivechain deposit address or fee");
+    const std::string payload = fee ? "dcfee1:" + std::to_string(fee) + ":" + address : address;
+    if (payload.size() > 128) throw std::invalid_argument("drivechain deposit destination exceeds 128 bytes");
+    return payload;
+}
+
+CTransactionRef Create(const DrivechainMintableDeposit& deposit)
+{
+    CScript recipient;
+    CAmount fee{0};
+    if (!Decode(std::string(deposit.address.begin(), deposit.address.end()), recipient, fee) ||
+        !MoneyRange(deposit.value) || deposit.value <= fee)
+        throw std::invalid_argument("invalid native deposit destination or value");
+    CMutableTransaction tx;
+    const COutPoint outpoint(Txid::FromUint256(deposit.outpoint.hash), deposit.outpoint.n);
+    tx.vin.emplace_back(outpoint);
+    tx.vin[0].m_is_pegin = true;
+    tx.vout.emplace_back(Params().GetConsensus().pegged_asset, deposit.value - fee, recipient);
+    if (fee) tx.vout.emplace_back(Params().GetConsensus().pegged_asset, fee, CScript());
+    tx.witness.vtxinwit.resize(1);
+    tx.witness.vtxoutwit.resize(tx.vout.size());
+    tx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
+        deposit.value, Params().GetConsensus().pegged_asset, Params().ParentGenesisBlockHash(),
+        CScript() << OP_TRUE, outpoint, deposit.block_hash, deposit.address);
+    return MakeTransactionRef(std::move(tx));
+}
+
+bool Check(const CTransaction& tx, const unsigned int pegin_index, std::string& err_msg)
+{
+    if (pegin_index >= tx.vin.size() || pegin_index >= tx.witness.vtxinwit.size()) {
+        err_msg = "Drivechain deposit input or witness index is out of range.";
+        return false;
+    }
+    std::vector<unsigned char> inputs, outputs;
+    std::vector<int64_t> amounts;
+    for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+        const bool recognized = i < tx.witness.vtxinwit.size() &&
+            IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[i].m_pegin_witness, tx.vin[i].prevout);
+        inputs.push_back(recognized | (tx.vin[i].m_is_pegin << 1));
+    }
+
+    CAmount deposit_value{0};
+    CScript claim_script;
+    std::vector<unsigned char> address_bytes;
+    const bool native = IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_index].m_pegin_witness,
+        tx.vin[pegin_index].prevout, &deposit_value, &claim_script, nullptr, &address_bytes);
+    const std::string address(address_bytes.begin(), address_bytes.end());
+    CScript expected_script;
+    CAmount committed_fee{0};
+    const bool valid_destination = Decode(address, expected_script, committed_fee);
+    for (const CTxOut& output : tx.vout) {
+        outputs.push_back((output.scriptPubKey == expected_script) |
+            ((output.nAsset.IsExplicit() && output.nAsset.GetAsset() == Params().GetConsensus().pegged_asset) << 1) |
+            (output.nValue.IsExplicit() << 2) | (output.nNonce.IsCommitment() << 3));
+        amounts.push_back(output.nValue.IsExplicit() ? output.nValue.GetAmount() : 0);
+    }
+    const uint32_t facts = !tx.vin[pegin_index].assetIssuance.IsNull() | (native << 1) |
+        ((claim_script == (CScript() << OP_TRUE)) << 2) | (valid_destination << 3);
+    if (committed_fee > 0 && committed_fee >= deposit_value) {
+        err_msg = "Committed Elements fee must be less than the authenticated deposit value.";
+        return false;
+    }
+    if (!drivechain::haskell::DepositOutputs(facts, deposit_value - committed_fee, inputs, outputs, amounts, err_msg)) return false;
+    if (!committed_fee) return true;
+
+    // Reuse the existing exact one-credit/one-fee Haskell validator. The first
+    // check fixes the net credit; conservation then fixes the fee to the L1
+    // commitment. No sponsor inputs, redirected change or extra outputs exist.
+    std::array<unsigned char, 2> flags{};
+    std::array<int64_t, 2> values{};
+    for (size_t i = 0; i < std::min(tx.vout.size(), flags.size()); ++i) {
+        const auto& output = tx.vout[i];
+        flags[i] = ((outputs[i] & 2) != 0) | (output.nValue.IsExplicit() << 1) |
+            (output.nNonce.IsNull() << 2) | (output.scriptPubKey.empty() << 3) |
+            ((output.scriptPubKey == expected_script) << 4);
+        values[i] = amounts[i];
+    }
+    const uint32_t input_facts = tx.vin[pegin_index].m_is_pegin | (1 << 1) |
+        (tx.vin[pegin_index].scriptSig.empty() << 2) | (tx.vin[pegin_index].assetIssuance.IsNull() << 3) |
+        (native << 4) | (1 << 5) | ((claim_script == (CScript() << OP_TRUE)) << 6);
+    return drivechain::haskell::AuthenticatedDeposit(tx.vin.size(), pegin_index, tx.witness.vtxinwit.size(),
+        input_facts, deposit_value, deposit_value, tx.vout.size(), flags, values, err_msg);
+}
+
+bool Canonical(const CTransaction& tx)
+{
+    std::string error;
+    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::FEE_FREE_DEPOSIT,
+        [&](uint32_t step) -> uint32_t {
+            switch (step) {
+            case 1: return tx.vin.size() == 1;
+            case 2: return tx.vout.size() == 1;
+            case 3: return tx.witness.vtxinwit.size() == 1;
+            case 4: return tx.vin[0].m_is_pegin;
+            case 5: return tx.vin[0].assetIssuance.IsNull();
+            case 6: return IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[0].m_pegin_witness, tx.vin[0].prevout);
+            case 7: return Check(tx, 0, error);
+            default: return 0;
+            }
+        });
+}
+} // namespace NativeDepositReference
+
+BOOST_AUTO_TEST_CASE(native_deposit_workflow_parity)
+{
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40,'7'))}));
+    for (const CAmount fee : {CAmount{0},CAmount{1},CAmount{1000},MAX_MONEY}) {
+        BOOST_CHECK_EQUAL(EncodeDrivechainDepositDestination(address,fee),NativeDepositReference::Encode(address,fee));
+        const auto payload = NativeDepositReference::Encode(address,fee);
+        for (const CAmount amount : {CAmount{-1},CAmount{0},fee,fee+1,MAX_MONEY,MAX_MONEY+1}) {
+            const DrivechainMintableDeposit deposit{Bitcoin::COutPoint(uint256S("ab"),2),uint256S("cd"),
+                1,amount,{payload.begin(),payload.end()}};
+            std::string expected_error, actual_error;
+            CTransactionRef expected, actual;
+            try { expected = NativeDepositReference::Create(deposit); }
+            catch (const std::invalid_argument& e) { expected_error = e.what(); }
+            try { actual = CreateNativeDrivechainDeposit(deposit); }
+            catch (const std::invalid_argument& e) { actual_error = e.what(); }
+            BOOST_CHECK_EQUAL(actual_error,expected_error);
+            BOOST_REQUIRE(bool(actual) == bool(expected));
+            if (actual) BOOST_CHECK_EQUAL(EncodeHexTx(*actual),EncodeHexTx(*expected));
+        }
+    }
+    for (const auto& prefix : {"","dcfee1:1:","dcfee1:0:","dcfee1:01:","dcfee1:+1:","dcfee1:-1:",
+            "dcfee1:9223372036854775808:","dcfee1:1e2:","dcfee1:1.0:","dcfee1: 1:","dcfee1::","dcfee2:1:"}) {
+        for (const auto& suffix : {address,std::string{},std::string(129,'x'),std::string("x\0y",3)}) {
+            CScript expected_script = CScript() << OP_TRUE, actual_script = expected_script;
+            CAmount expected_fee{42}, actual_fee{42};
+            const auto payload = prefix + suffix;
+            BOOST_CHECK_EQUAL(DecodeDrivechainDepositDestination(payload,actual_script,actual_fee),
+                NativeDepositReference::Decode(payload,expected_script,expected_fee));
+            BOOST_CHECK(actual_script == expected_script);
+            BOOST_CHECK_EQUAL(actual_fee,expected_fee);
+        }
+    }
+    for (const CAmount fee : {CAmount{0},CAmount{1},CAmount{1000}}) {
+        const auto payload = NativeDepositReference::Encode(address,fee);
+        const DrivechainMintableDeposit deposit{Bitcoin::COutPoint(uint256S("ab"),2),uint256S("cd"),
+            1,100000,{payload.begin(),payload.end()}};
+        const auto original = NativeDepositReference::Create(deposit);
+        for (unsigned mutation = 0; mutation < 23; ++mutation) {
+            CMutableTransaction tx(*original);
+            auto& stack = tx.witness.vtxinwit[0].m_pegin_witness.stack;
+            switch (mutation) {
+            case 1: tx.vin.clear(); tx.witness.vtxinwit.clear(); break;
+            case 2: tx.witness.vtxinwit.clear(); break;
+            case 3: tx.vin[0].m_is_pegin = false; break;
+            case 4: tx.vin[0].scriptSig = CScript() << OP_TRUE; break;
+            case 5: tx.vin[0].assetIssuance.nAmount = CConfidentialValue(1); break;
+            case 6: stack.clear(); break;
+            case 7: stack[0].clear(); break;
+            case 8: stack[1][0] ^= 1; break;
+            case 9: stack[2][0] ^= 1; break;
+            case 10: stack[3] = {OP_FALSE}; break;
+            case 11: stack[4][0] ^= 1; break;
+            case 12: stack[5][0] ^= 1; break;
+            case 13: stack[7] = {'x'}; break;
+            case 14: {
+                const auto too_large = NativeDepositReference::Encode(address,100000);
+                stack[7].assign(too_large.begin(),too_large.end()); break;
+            }
+            case 15: tx.vout[0].nValue = CConfidentialValue(1); break;
+            case 16: tx.vout[0].scriptPubKey = CScript() << OP_TRUE; break;
+            case 17: tx.vout.push_back(tx.vout[0]); break;
+            case 18: tx.vout.clear(); tx.witness.vtxoutwit.clear(); break;
+            case 19: tx.vin.push_back(tx.vin[0]); tx.witness.vtxinwit.push_back(tx.witness.vtxinwit[0]); break;
+            case 20: tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("ee")),0)); break;
+            case 21: tx.vout.emplace_back(Params().GetConsensus().pegged_asset,10,CScript()); break;
+            case 22: std::reverse(tx.vout.begin(),tx.vout.end()); break;
+            }
+            const CTransaction changed(tx);
+            for (const unsigned index : {0U,1U,100U}) {
+                std::string want = "untouched", got = want;
+                const bool expected = NativeDepositReference::Check(changed,index,want);
+                const bool actual = CheckDrivechainDepositOutputs(changed,index,got);
+                BOOST_CHECK_EQUAL(actual,expected);
+                BOOST_CHECK_EQUAL(got,want);
+                if (mutation == 0 && index == 0) BOOST_CHECK(actual);
+            }
+            BOOST_CHECK_EQUAL(IsCanonicalFeeFreeDrivechainDeposit(changed),NativeDepositReference::Canonical(changed));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(native_deposit_fee_destination_codec)
+{
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40, '1'))}));
+    const auto expected = GetScriptForDestination(DecodeDestination(address));
+    for (const CAmount fee : {CAmount{0}, CAmount{1}, CAmount{1000}, MAX_MONEY}) {
+        const auto payload = EncodeDrivechainDepositDestination(address, fee);
+        CScript script;
+        CAmount decoded{-1};
+        BOOST_REQUIRE(DecodeDrivechainDepositDestination(payload, script, decoded));
+        BOOST_CHECK(script == expected);
+        BOOST_CHECK_EQUAL(decoded, fee);
+        if (!fee) BOOST_CHECK_EQUAL(payload, address);
+    }
+    for (const auto& prefix : {"dcfee1:0:", "dcfee1:01:", "dcfee1:+1:", "dcfee1:-1:",
+             "dcfee1: 1:", "dcfee1:1.0:", "dcfee1:2100000000000001:",
+             "dcfee1:9223372036854775808:", "dcfee2:1000:", "dcfee1::"}) {
+        CScript script;
+        CAmount fee{42};
+        BOOST_CHECK(!DecodeDrivechainDepositDestination(std::string(prefix) + address, script, fee));
+        BOOST_CHECK(script.empty());
+        BOOST_CHECK_EQUAL(fee, 0);
+    }
+    CScript script;
+    CAmount fee{0};
+    BOOST_CHECK(!DecodeDrivechainDepositDestination("dcfee1:1:not-an-address", script, fee));
+    BOOST_CHECK(!DecodeDrivechainDepositDestination(std::string(129, 'x'), script, fee));
+    BOOST_CHECK_THROW(EncodeDrivechainDepositDestination(address, -1), std::invalid_argument);
+    BOOST_CHECK_THROW(EncodeDrivechainDepositDestination(address, MAX_MONEY + 1), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(native_deposit_committed_fee_outputs)
+{
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40, '2'))}));
+    const auto payload = EncodeDrivechainDepositDestination(address, 1000);
+    const DrivechainMintableDeposit deposit{Bitcoin::COutPoint(uint256S("dd"), 2), uint256S("ee"),
+        1, 100000, {payload.begin(), payload.end()}};
+    const auto tx = CreateNativeDrivechainDeposit(deposit);
+    std::string error;
+    BOOST_REQUIRE(CheckDrivechainDepositOutputs(*tx, 0, error));
+    BOOST_CHECK_EQUAL(tx->vout[0].nValue.GetAmount(), 99000);
+    BOOST_CHECK_EQUAL(tx->vout[1].nValue.GetAmount(), 1000);
+    BOOST_CHECK(tx->vout[1].IsFee());
+    BOOST_CHECK(!IsCanonicalFeeFreeDrivechainDeposit(*tx));
+    const auto key = GetPeginSpentKey(tx->witness.vtxinwit[0].m_pegin_witness, tx->vin[0].prevout);
+    for (unsigned mutation = 0; mutation < 13; ++mutation) {
+        CMutableTransaction changed(*tx);
+        switch (mutation) {
+        case 0: changed.vout[0].nValue = CConfidentialValue(98999); changed.vout[1].nValue = CConfidentialValue(1001); break;
+        case 1: changed.vout[0].nValue = CConfidentialValue(99001); changed.vout[1].nValue = CConfidentialValue(999); break;
+        case 2: changed.vout[1].nValue = CConfidentialValue(999); break;
+        case 3: changed.vout[1].nValue = CConfidentialValue(1001); break;
+        case 4: changed.vout[0].scriptPubKey = CScript() << OP_TRUE; break;
+        case 5: changed.vout[1].scriptPubKey = CScript() << OP_TRUE; break;
+        case 6: changed.vout.push_back(changed.vout[1]); break;
+        case 7: changed.vout.pop_back(); break;
+        case 8: changed.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("cc")), 0)); changed.witness.vtxinwit.resize(2); break;
+        case 9: changed.vout[1].nAsset = CConfidentialAsset(CAsset(uint256S("aa"))); break;
+        case 10: changed.vout[1].nValue.vchCommitment.assign(33, 8); break;
+        case 11: changed.vout[1].nNonce.vchCommitment.assign(33, 2); break;
+        case 12: changed.witness.vtxinwit[0].m_pegin_witness.stack[7] = {address.begin(), address.end()}; break;
+        }
+        changed.witness.vtxoutwit.resize(changed.vout.size());
+        BOOST_CHECK_MESSAGE(!CheckDrivechainDepositOutputs(CTransaction(changed), 0, error), mutation);
+        BOOST_CHECK(GetPeginSpentKey(changed.witness.vtxinwit[0].m_pegin_witness, changed.vin[0].prevout) == key);
+    }
+    CMutableTransaction reordered(*tx);
+    std::swap(reordered.vout[0], reordered.vout[1]);
+    BOOST_CHECK(CheckDrivechainDepositOutputs(CTransaction(reordered), 0, error));
+    auto too_small = deposit;
+    too_small.value = 1000;
+    BOOST_CHECK_THROW(CreateNativeDrivechainDeposit(too_small), std::invalid_argument);
+    auto legacy = deposit;
+    legacy.address = {address.begin(), address.end()};
+    const auto free_tx = CreateNativeDrivechainDeposit(legacy);
+    BOOST_CHECK(IsCanonicalFeeFreeDrivechainDeposit(*free_tx));
+    BOOST_CHECK_EQUAL(free_tx->vout[0].nValue.GetAmount(), deposit.value);
+    BOOST_CHECK(GetPeginSpentKey(free_tx->witness.vtxinwit[0].m_pegin_witness, free_tx->vin[0].prevout) == key);
+}
+
+BOOST_AUTO_TEST_CASE(parent_deposit_scan_paging_restart_and_corruption)
+{
+    const auto path = m_args.GetDataDirBase() / "deposit_scan";
+    const auto id = uint256S("01");
+    DrivechainParentReplayTip tip;
+    tip.hash = uint256S("02");
+    std::string error;
+    {
+        DrivechainParentReplayStore store(path, 1 << 20, true);
+        BOOST_REQUIRE(store.Reset(id, tip, &error));
+    }
+    std::vector<DrivechainMintableDeposit> records;
+    // Exercise the on-disk reader with bounded synthetic records, not an
+    // authenticated parent-chain or minting fixture.
+    {
+        CDBWrapper db(DBParams{.path=path, .cache_bytes=1 << 20});
+        for (unsigned i = 1; i <= 3; ++i) {
+            auto record = DrivechainMintableDeposit{Bitcoin::COutPoint(uint256S(strprintf("%02x", i)), 0),
+                uint256S("03"), 1, 1000, {'x'}};
+            records.push_back(record);
+            db.Write(std::make_pair(drivechain::DB_REPLAY_DEPOSIT, record.outpoint), record);
+        }
+    }
+    std::optional<Bitcoin::COutPoint> cursor;
+    std::vector<DrivechainMintableDeposit> page;
+    for (unsigned i = 0; i < 3; ++i) {
+        DrivechainParentReplayStore reopened(path, 1 << 20, false);
+        std::optional<Bitcoin::COutPoint> next;
+        BOOST_REQUIRE(reopened.ListDeposits(cursor, 1, page, next, &error));
+        BOOST_REQUIRE_EQUAL(page.size(), 1U);
+        BOOST_CHECK(page[0].outpoint == records[i].outpoint);
+        BOOST_CHECK_EQUAL(next.has_value(), i < 2);
+        cursor = next;
+    }
+    {
+        CDBWrapper db(DBParams{.path=path, .cache_bytes=1 << 20});
+        auto bad = records[1]; bad.value = -1;
+        db.Write(std::make_pair(drivechain::DB_REPLAY_DEPOSIT, bad.outpoint), bad);
+    }
+    DrivechainParentReplayStore reopened(path, 1 << 20, false);
+    BOOST_CHECK(!reopened.ListDeposits({}, 64, page, cursor, &error));
+    BOOST_CHECK(page.empty());
+    BOOST_CHECK(!cursor);
+    BOOST_CHECK(!reopened.ListDeposits({}, 0, page, cursor, &error));
+    BOOST_CHECK(!reopened.ListDeposits({}, 65, page, cursor, &error));
+}
+
 BOOST_AUTO_TEST_CASE(drivechain_deposit_outputs_are_bound_to_mainchain_address)
 {
     const COutPoint deposit_outpoint(
@@ -4788,6 +6109,119 @@ BOOST_AUTO_TEST_CASE(drivechain_bmm_m7_requires_exact_canonical_commitment)
     internal_endian << internal_payload;
     BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(make_block({internal_endian}),
                                                      24, sidechain_hash, nullptr, &err));
+}
+
+BOOST_AUTO_TEST_CASE(drivechain_bmm_scan_matches_independent_script_reference)
+{
+    const auto reference = [](const Bitcoin::CBlock& block, int slot, uint256& hash,
+                              uint32_t& index, std::string& error) {
+        hash.SetNull();
+        index = 0;
+        const auto fail = [&](const std::string& message) { error = message; return false; };
+        if (slot < 0 || slot > 255) return fail("BIP301 M7 sidechain slot is outside the uint8 range");
+        if (block.vtx.empty() || !block.vtx[0] || !block.vtx[0]->IsCoinBase())
+            return fail("raw BMM block has no coinbase transaction");
+        size_t matches{0};
+        uint256 selected;
+        uint32_t selected_index{0};
+        for (size_t i = 0; i < block.vtx[0]->vout.size(); ++i) {
+            const auto& script = block.vtx[0]->vout[i].scriptPubKey;
+            auto pc = script.begin();
+            opcodetype opcode{};
+            std::vector<unsigned char> payload;
+            if (!script.GetOp(pc, opcode, payload) || opcode != OP_RETURN ||
+                !script.GetOp(pc, opcode, payload) || opcode > OP_PUSHDATA4 || pc != script.end() ||
+                payload.size() != 37 || payload[0] != 0xd1 || payload[1] != 0x61 ||
+                payload[2] != 0x73 || payload[3] != 0x68 || payload[4] != slot) continue;
+            std::reverse_copy(payload.begin()+5, payload.end(), selected.begin());
+            selected_index = static_cast<uint32_t>(i);
+            ++matches;
+        }
+        if (matches == 0) return fail(strprintf("BMM successor has no enforcer-recognized M7 for sidechain slot %d", slot));
+        if (matches != 1) return fail(strprintf("BMM successor has %u enforcer-recognized M7 outputs for sidechain slot %d", matches, slot));
+        hash = selected;
+        index = selected_index;
+        return true;
+    };
+    const auto make_block = [](const std::vector<CScript>& scripts, int shape) {
+        Bitcoin::CBlock block;
+        if (shape == 1) return block;
+        if (shape == 2) { block.vtx.emplace_back(); return block; }
+        Bitcoin::CMutableTransaction tx;
+        tx.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0, 0);
+        if (shape == 3) tx.vin[0].prevout.n = 0;
+        for (const auto& script : scripts) tx.vout.emplace_back(0, script);
+        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(tx)));
+        return block;
+    };
+    size_t scenarios{0};
+    for (int slot = 0; slot < 256; ++slot) {
+        std::vector<unsigned char> payload{0xd1, 0x61, 0x73, 0x68, static_cast<unsigned char>(slot)};
+        for (int i = 0; i < 32; ++i) payload.push_back(static_cast<unsigned char>(slot+i));
+        const CScript canonical = CScript() << OP_RETURN << payload;
+        auto wrong_slot = payload;
+        ++wrong_slot[4];
+        auto wrong_tag = payload;
+        ++wrong_tag[0];
+        auto zeros = payload;
+        std::fill(zeros.begin()+5, zeros.end(), 0);
+        auto short_payload = payload;
+        short_payload.pop_back();
+        auto long_payload = payload;
+        long_payload.push_back(0);
+        CScript trailing = canonical;
+        trailing << OP_TRUE;
+        std::vector<std::vector<CScript>> samples{
+            {}, {canonical}, {CScript() << OP_TRUE, canonical}, {canonical, canonical},
+            {CScript() << OP_RETURN << wrong_slot}, {CScript() << OP_RETURN << wrong_tag},
+            {trailing}, {CScript()}, {CScript() << OP_RETURN}, {CScript() << OP_RETURN << OP_TRUE},
+            {CScript() << OP_RETURN << zeros}, {CScript() << OP_RETURN << short_payload},
+            {CScript() << OP_RETURN << long_payload}, {CScript() << payload << OP_RETURN},
+        };
+        for (unsigned int size : {1U, 2U, 4U}) {
+            CScript pushed;
+            pushed.push_back(OP_RETURN);
+            pushed.push_back(size == 1 ? OP_PUSHDATA1 : size == 2 ? OP_PUSHDATA2 : OP_PUSHDATA4);
+            for (unsigned int i = 0; i < size; ++i) pushed.push_back(i == 0 ? payload.size() : 0);
+            pushed.insert(pushed.end(), payload.begin(), payload.end());
+            samples.push_back({CScript() << OP_TRUE, pushed});
+            samples.push_back({canonical, pushed});
+            pushed.pop_back();
+            samples.push_back({pushed});
+        }
+        for (const auto& scripts : samples) for (int shape = 0; shape < 4; ++shape) {
+            const auto block = make_block(scripts, shape);
+            for (int requested : {slot, -1, 256}) {
+                uint256 expected;
+                uint32_t expected_index{99};
+                std::string expected_error{"unchanged"};
+                const bool accepted = reference(block, requested, expected, expected_index, expected_error);
+                for (int optional = 0; optional < 4; ++optional) {
+                    uint256 actual = uint256::ONE;
+                    uint32_t index{99};
+                    std::string error{"unchanged"};
+                    BOOST_CHECK_EQUAL(ExtractCanonicalDrivechainBmmCommitmentInBlock(block, requested, actual,
+                        optional & 1 ? &index : nullptr, optional & 2 ? &error : nullptr), accepted);
+                    BOOST_CHECK(actual == expected);
+                    BOOST_CHECK_EQUAL(index, optional & 1 ? expected_index : 99);
+                    BOOST_CHECK_EQUAL(error, optional & 2 ? expected_error : "unchanged");
+                    for (const uint256 wanted : {expected, uint256::ONE}) {
+                        index = 99;
+                        error = "unchanged";
+                        const bool matched = accepted && expected == wanted;
+                        const std::string diagnostic = accepted && !matched ? strprintf(
+                            "BMM successor commits to critical hash %s, expected %s", expected.GetHex(), wanted.GetHex()) : expected_error;
+                        BOOST_CHECK_EQUAL(MatchDrivechainBmmCommitmentInBlock(block, requested, wanted,
+                            optional & 1 ? &index : nullptr, optional & 2 ? &error : nullptr), matched);
+                        BOOST_CHECK_EQUAL(index, optional & 1 ? expected_index : 99);
+                        BOOST_CHECK_EQUAL(error, optional & 2 ? diagnostic : "unchanged");
+                    }
+                }
+                ++scenarios;
+            }
+        }
+    }
+    BOOST_CHECK_EQUAL(scenarios, 256U * 23 * 4 * 3);
 }
 
 BOOST_AUTO_TEST_CASE(drivechain_parent_withdrawal_replay_requires_approved_m6)

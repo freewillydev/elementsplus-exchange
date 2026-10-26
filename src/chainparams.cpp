@@ -8,7 +8,6 @@
 #endif
 
 #include <chainparams.h>
-#include <haskell/pegin_identity.h>
 
 #include <chainparamsbase.h>
 #include <haskell/bridge.h>
@@ -19,6 +18,7 @@
 #include <issuance.h>
 #include <primitives/transaction.h>
 #include <logging.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <util/chaintype.h>
 #include <util/moneystr.h>
@@ -113,26 +113,31 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
 
 static std::unique_ptr<const CChainParams> globalChainParams;
 
-static uint32_t PeginConfirmationPolicy(const CChainParams& params, int height, bool alpha_only)
+std::vector<unsigned char> PeginConfirmationSnapshot(const CChainParams& params, int height)
 {
     static_assert(ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT == 64);
     const auto& consensus = params.GetConsensus();
-    return drivechain::haskell::PeginConfirmationPolicy(alpha_only, height, consensus.pegin_min_depth,
-        [&](uint32_t step) {
-            switch (step) {
-            case 0: return params.NetworkIDString() == drivechain::PEGIN_IDENTITY_NETWORK;
-            case 1: return consensus.elements_mode;
-            case 2: return consensus.has_parent_chain;
-            case 3: return consensus.drivechain_slot == drivechain::PEGIN_IDENTITY_SLOT;
-            case 4: return consensus.hashGenesisBlock == uint256S(drivechain::PEGIN_ALPHA_GENESIS);
-            case 5: return params.ParentGenesisBlockHash() == uint256S(drivechain::PEGIN_PARENT_GENESIS);
-            case 6: return consensus.drivechain_protocol_manifest_hash == uint256S(drivechain::PEGIN_ALPHA_MANIFEST);
-            case 7: return consensus.pegin_min_depth == drivechain::PEGIN_IDENTITY_DEPTH;
-            case 8: return consensus.hashGenesisBlock == uint256S(drivechain::PEGIN_BETA_GENESIS);
-            case 9: return consensus.drivechain_protocol_manifest_hash == uint256S(drivechain::PEGIN_BETA_MANIFEST);
-            default: throw std::logic_error("Unknown pegin identity fact");
-            }
-        });
+    std::vector<unsigned char> snapshot;
+    VectorWriter writer{snapshot, 0};
+    SerializeMany(writer, int64_t{height}, params.NetworkIDString(), consensus.elements_mode,
+        consensus.has_parent_chain, consensus.drivechain_slot.has_value(), consensus.drivechain_slot.value_or(0),
+        consensus.hashGenesisBlock, params.ParentGenesisBlockHash(), consensus.drivechain_protocol_manifest_hash,
+        consensus.pegin_min_depth);
+    return snapshot;
+}
+
+static uint32_t PeginConfirmationPolicy(const CChainParams& params, int height, bool alpha_only)
+{
+    namespace hs = drivechain::haskell;
+    uint32_t depth{0};
+    if (!hs::RunReplayStore(alpha_only ? hs::ReplayStoreWorkflow::ALPHA_PEGIN_IDENTITY : hs::ReplayStoreWorkflow::CONFIRMATION_DEPTH,
+        [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) -> std::vector<unsigned char> {
+            if (step == 0 && index == 0 && input.empty()) return PeginConfirmationSnapshot(params, height);
+            if (step != 1 || index > UINT32_MAX || !input.empty()) throw std::logic_error("invalid confirmation depth publication");
+            depth = static_cast<uint32_t>(index);
+            return {};
+        })) throw std::runtime_error("Haskell pegin confirmation policy failed");
+    return depth;
 }
 
 bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params)

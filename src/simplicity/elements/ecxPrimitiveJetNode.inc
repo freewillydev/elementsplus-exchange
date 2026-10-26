@@ -192,3 +192,19 @@
 , .targetIx = ty_b
 , .cost = 1000000000 /* milliweight */
 }
+,[ECX_VERIFY_SP1_GROTH16_V7_SWAP_SUCCESSOR_SHA256] =
+{ .tag = JET
+, .jet = simplicity_verify_sp1_groth16_v7_swap_successor_sha256
+, .cmr = {{0xe3f953afu, 0xdd015f0bu, 0x98dfc56du, 0x595dbe68u, 0xa1d16021u, 0x602b3a5au, 0x45c7a9aeu, 0x484c1cc4u}}
+, .sourceIx = ty_w512
+, .targetIx = ty_b
+, .cost = 1000000000 /* milliweight */
+}
+,[ECX_VERIFY_SP1_GROTH16_V8_CUSTODY_SUCCESSOR_SHA256] =
+{ .tag = JET
+, .jet = simplicity_verify_sp1_groth16_v8_custody_successor_sha256
+, .cmr = {{0x937f563bu, 0xe85f9c9bu, 0xe99ff529u, 0x88614dc4u, 0x9ae32b2du, 0x326641b0u, 0xc140ef22u, 0x1e12d9f1u}}
+, .sourceIx = ty_w512
+, .targetIx = ty_b
+, .cost = 1000000000 /* milliweight */
+}

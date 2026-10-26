@@ -62,6 +62,7 @@ lazyWorkflows = conjoin $
   , absent (undefined :: DSL Bmm.StateWrite)
   , absent (undefined :: DSL Bmm.FingerprintRequest)
   , absent (undefined :: DSL Bmm.SignetRequest)
+  , absent (undefined :: DSL Bmm.BodyRecovery)
   , absent (undefined :: DSL Exchange.GenesisRequest)
   , absent (undefined :: DSL Exchange.FrozenRequest)
   , absent (undefined :: DSL Exchange.CapitalRequest)
@@ -74,6 +75,7 @@ lazyWorkflows = conjoin $
   , cold (undefined :: Bmm.StateEncode) Bmm.encodeState
   , cold (undefined :: Bmm.StateWrite) Bmm.replaceState
   , cold (undefined :: Bmm.SignetRequest) Bmm.extractSignetRequest
+  , cold (undefined :: Bmm.BodyRecovery) Bmm.RecoverBody
   , cold (undefined :: Exchange.GenesisRequest) Exchange.buildGenesisRoots
   , cold (undefined :: Exchange.FrozenRequest) Exchange.decodeFrozenRequest
   , cold (undefined :: Exchange.CapitalRequest) Exchange.bindAndProject
@@ -199,7 +201,7 @@ dispatchMatrix = forAllShrink arbitrary shrink $ \(d,t,n,script,opcode,burn,fee,
        interpret op (Validate @Bmm.Lifecycle) === expected i 32 2,
        interpret op (Validate @Bmm.StateFlow) === expected i 33 1,
        fingerprintResult === expected i 34 ([0,0,0,4] ++ replicate 95 0),
-       exchangeFingerprintResult === expected i 34 (replicate 266 0),
+       exchangeFingerprintResult === expected i 34 (replicate 267 0),
        interpret op (Validate @Bmm.TargetScale) === expected i 35 (replicate 32 0),
        storageResult === expected i 36 (), encodingResult === expected i 37 (),
        interpret op (Validate @Bmm.PrivateTemplate) === expected i 38

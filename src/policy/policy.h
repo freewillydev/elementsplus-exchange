@@ -207,7 +207,7 @@ int64_t GetVirtualTransactionSize(const CTransaction& tx, int64_t nSigOpCost, un
  * milliweight. This is an upper bound on work a peer may be required to do and
  * is therefore the resource quantity used for fee quoting.
  */
-uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx);
+uint64_t GetSimplicityValidationMilliweight(const CTransaction& tx, uint64_t* cumulative = nullptr);
 
 struct BmmWorkFeeQuote {
     CAmount verification_fee{0};

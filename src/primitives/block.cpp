@@ -13,6 +13,7 @@
 bool g_con_blockheightinheader = false;
 bool g_signed_blocks = false;
 bool g_con_utreexo = false;
+bool g_con_ecx_swap_v3 = false;
 
 std::string CProof::ToString() const
 {
@@ -26,15 +27,15 @@ CBlockHeader::HeaderLayout CBlockHeader::GetLayout(int32_t version, bool withdra
         BMM_PROOF_HF_MASK == (1U << 20) && EXCHANGE_STATE_HF_MASK == (1U << 19) &&
         FORCED_INBOX_HF_MASK == (1U << 18) && DEPOSIT_INBOX_HF_MASK == (1U << 17) && INBOX_CURSOR_HF_MASK == (1U << 16));
     const auto layout = drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(version),
-        uint32_t(g_con_elementsmode) | (reading << 1) | (withdrawal << 2) | (dynamic << 3) | (critical << 5));
+        uint32_t(g_con_elementsmode) | (reading << 1) | (withdrawal << 2) | (dynamic << 3) | (critical << 5) | (g_con_ecx_swap_v3 << 6));
     const auto fields = layout[1];
     return {static_cast<int32_t>(layout[0]), bool(fields & 1), bool(fields & 2), bool(fields & 4),
-        bool(fields & 8), bool(fields & 16), bool(fields & 32), bool(fields & 64), bool(fields & 128), bool(fields & 256)};
+        bool(fields & 8), bool(fields & 16), bool(fields & 32), bool(fields & 64), bool(fields & 128), bool(fields & 256), bool(fields & 512)};
 }
 
 uint32_t CBlockHeader::GetRawExtensionFlags() const
 {
-    return drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(nVersion),16)[1];
+    return drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(nVersion),16 | (g_con_ecx_swap_v3 << 6))[1];
 }
 
 // ELEMENTS: GetHash manually implemented for CBlockHeader.
@@ -44,7 +45,7 @@ uint256 CBlockHeader::ComputeHash(bool critical) const
 {
     HashWriter s{};
     const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, has_exchange_state,
-        has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm] =
+        has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm, has_swap_forced] =
         GetLayout(this->nVersion, !hashWithdrawalBundle.IsNull(), !m_dynafed_params.IsNull(), false, critical);
     s << (nVersion);
     s << hashPrevBlock;
@@ -76,6 +77,7 @@ uint256 CBlockHeader::ComputeHash(bool critical) const
         s << depositProcessedCursor;
         s << sourceBacklogOldestParentHeight;
     }
+    if (has_swap_forced) s << swapForcedState;
     if (HasUtreexo()) s << utreexo;
     return s.GetHash();
 }

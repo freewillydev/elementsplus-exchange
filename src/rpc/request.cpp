@@ -11,6 +11,7 @@
 #include <haskell/bridge.h>
 
 #include <common/args.h>
+#include <crypto/common.h>
 #include <logging.h>
 #include <random.h>
 #include <rpc/protocol.h>
@@ -187,39 +188,63 @@ std::string GetDefaultMainchainAuthCookieFile(const std::string& chain)
 }
 
 /** Get name mainchain RPC authentication cookie file */
-fs::path GetMainchainAuthCookieFile()
+fs::path GetMainchainAuthCookieFile(const std::string& cookie_file)
 {
-    const std::string cookie_file =
-        GetDefaultMainchainAuthCookieFile(gArgs.GetChainName());
     fs::path cookie_path = fs::PathFromString(gArgs.GetArg("-mainchainrpccookiefile", cookie_file));
     if (cookie_path.is_absolute())
         return cookie_path;
     return fsbridge::AbsPathJoin(GetMainchainDefaultDataDir(), cookie_path);
 }
 
-bool ReadPrivateRpcAuthFile(
-    const fs::path& path,
-    std::string& cookie,
-    std::string* error)
+fs::path GetMainchainAuthCookieFile()
 {
-    cookie.clear();
-    if (error) error->clear();
-    const std::string native_path = fs::PathToString(path);
+    return GetMainchainAuthCookieFile(GetDefaultMainchainAuthCookieFile(gArgs.GetChainName()));
+}
+
+namespace {
+struct RpcAuthFileState {
+    fs::path path;
+    std::string& cookie;
+    std::string* error;
+    bool rotating;
+    std::string native_path;
     std::array<char,4097> contents{};
 #ifndef WIN32
     int descriptor=-1, saved_errno=0;
-    const auto close_descriptor = [](int* fd) noexcept {
+    static void Close(int* fd) noexcept {
         if (*fd>=0) close(*fd);
         *fd=-1;
-    };
-    std::unique_ptr<int,decltype(close_descriptor)> descriptor_guard(&descriptor,close_descriptor);
+    }
+    std::unique_ptr<int,decltype(&Close)> descriptor_guard{&descriptor,Close};
     struct stat metadata {};
-    uint64_t used=0;
-    uint32_t read_status=0;
 #else
     std::ifstream input;
 #endif
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CREDENTIAL_FILE,[&](uint32_t step) -> uint32_t {
+    RpcAuthFileState(const fs::path& source, std::string& output, std::string* failure, bool cookie_mode)
+        : path(source), cookie(output), error(failure), rotating(cookie_mode)
+    {
+        cookie.clear();
+        if (error) error->clear();
+        native_path = fs::PathToString(path);
+    }
+
+    std::vector<unsigned char> Read(uint32_t step,uint64_t index,std::span<const unsigned char> request) {
+        if (step==50) {
+            if (index || !request.empty()) throw std::logic_error("invalid credential record request");
+            return std::vector<unsigned char>(cookie.begin(),cookie.end());
+        }
+        const auto scalar = [&]() -> uint64_t {
+#ifndef WIN32
+        if (step==40) {
+            if (request.size()!=8 || index>contents.size()) throw std::logic_error("invalid credential read request");
+            const uint64_t available=ReadLE64(request.data());
+            if (!available || available>contents.size()-index) throw std::logic_error("invalid credential read bounds");
+            const ssize_t count=read(descriptor,contents.data()+index,available);
+            saved_errno=errno;
+            return count>=0 ? static_cast<uint64_t>(count) : saved_errno==EINTR ? UINT64_MAX : UINT64_MAX-1;
+        }
+#endif
+        if (!request.empty() || (step!=11 && index)) throw std::logic_error("invalid credential file request");
         switch (step) {
         case 1: return path.is_absolute();
         case 2: if (error) *error="RPC authentication file path must be absolute"; return 1;
@@ -231,37 +256,24 @@ bool ReadPrivateRpcAuthFile(
         case 5:
             if (error) *error=strprintf("cannot securely open mainchain RPC cookie %s: %s",native_path,std::strerror(saved_errno));
             return 1;
-        case 6:
-            return drivechain::haskell::AdmitPrivateCredentialFile([&](uint32_t action) -> int64_t {
-                switch (action) {
-                case 1: return drivechain::haskell::ParentReplayAll<2>({
-                    [&] { return fstat(descriptor,&metadata)==0; },
-                    [&] { return S_ISREG(metadata.st_mode); },
-                });
-                case 3: return metadata.st_uid;
-                case 4: return geteuid();
-                case 6: return metadata.st_mode & (S_IRWXG | S_IRWXO);
-                case 2: case 5: case 7:
-                    if (error) *error=std::string(action==2 ? "mainchain RPC cookie is not a regular file: " :
-                        action==5 ? "mainchain RPC cookie must be owned by the Elements process user: " :
-                        "mainchain RPC cookie permissions must deny all group and other access: ")+native_path;
-                    descriptor_guard.reset(); return 1;
-                default: throw std::logic_error("invalid private credential admission action");
-                }
-            });
-        case 7:
-            read_status=drivechain::haskell::ReadCredentialBytes(contents.size(),[&](uint64_t offset,uint64_t available) {
-                const ssize_t count=read(descriptor,contents.data()+offset,available);
-                saved_errno=errno;
-                return count>=0 ? static_cast<uint64_t>(count) : saved_errno==EINTR ? UINT64_MAX : UINT64_MAX-1;
-            },used);
-            return read_status;
+        case 31: return fstat(descriptor,&metadata)==0;
+        case 38: return S_ISREG(metadata.st_mode);
+        case 33: return metadata.st_uid;
+        case 34: return geteuid();
+        case 36: return metadata.st_mode & (S_IRWXG | S_IRWXO);
+        case 32: case 35: case 37:
+            if (error) *error=std::string(step==32 ? "mainchain RPC cookie is not a regular file: " :
+                step==35 ? "mainchain RPC cookie must be owned by the Elements process user: " :
+                "mainchain RPC cookie permissions must deny all group and other access: ")+native_path;
+            descriptor_guard.reset(); return 1;
         case 8:
             if (error) *error=strprintf("cannot read mainchain RPC cookie %s: %s",native_path,std::strerror(saved_errno));
             descriptor_guard.reset(); return 1;
-        case 9: descriptor_guard.reset(); return read_status;
+        case 9: descriptor_guard.reset(); return 1;
         case 10: if (error) *error="mainchain RPC cookie file is unexpectedly large"; return 1;
-        case 11: cookie.assign(contents.data(),used); return 1;
+        case 11:
+            if (index>contents.size()) throw std::logic_error("invalid credential publication size");
+            cookie.assign(contents.data(),index); return 1;
 #else
         case 3: return 0;
         case 12: return fs::is_symlink(path);
@@ -280,34 +292,50 @@ bool ReadPrivateRpcAuthFile(
 #endif
         case 23: case 25: return cookie.empty() ? 256 : static_cast<unsigned char>(cookie.back());
         case 24: case 26: cookie.pop_back(); return 1;
-        default: throw std::logic_error("invalid credential file action");
-        }
-    })!=0;
-}
-
-static bool ReadRpcAuthRecord(
-    const fs::path& path, std::string& record, bool rotating_cookie, std::string* error)
-{
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CREDENTIAL_RECORD,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return ReadPrivateRpcAuthFile(path, record, error);
-        case 2: return drivechain::haskell::IsRpcCredentialRecord(record,rotating_cookie);
-        case 3:
-            record.clear();
-            if (error) *error = rotating_cookie
+        case 60:
+            cookie.clear();
+            if (error) *error = rotating
                 ? "mainchain RPC cookie is not a canonical rotating Bitcoin Core cookie"
                 : "parent credential file must contain one bounded username:password record";
             return 1;
-        default: throw std::logic_error("invalid credential record action");
+        default: throw std::logic_error("invalid credential file action");
         }
-    }) != 0;
+        };
+        std::vector<unsigned char> reply(8);
+        WriteLE64(reply.data(),scalar());
+        return reply;
+    }
+};
+} // namespace
+
+RpcAuthFileReader MakeRpcAuthFileReader(
+    const fs::path& path, std::string& contents, std::string* error, bool rotating)
+{
+    auto state = std::make_shared<RpcAuthFileState>(path, contents, error, rotating);
+    return [state = std::move(state)](uint32_t step, uint64_t index, std::span<const unsigned char> request) {
+        return state->Read(step, index, request);
+    };
+}
+
+static bool ReadRpcAuthFile(
+    const fs::path& path,
+    std::string& cookie,
+    std::string* error,
+    drivechain::haskell::AuthFileMode mode)
+{
+    return drivechain::haskell::ReadAuthFile(mode,
+        MakeRpcAuthFileReader(path, cookie, error, mode==drivechain::haskell::AuthFileMode::ROTATING_COOKIE));
+}
+
+bool ReadPrivateRpcAuthFile(const fs::path& path,std::string& record,std::string* error)
+{
+    return ReadRpcAuthFile(path,record,error,drivechain::haskell::AuthFileMode::RAW);
 }
 
 bool ReadMainchainAuthCookieFile(
     const fs::path& path, std::string& cookie, std::string* error)
 {
-    return ReadRpcAuthRecord(path,cookie,true,error);
+    return ReadRpcAuthFile(path,cookie,error,drivechain::haskell::AuthFileMode::ROTATING_COOKIE);
 }
 
 bool ReadNativeDrivechainCookieFile(
@@ -326,7 +354,7 @@ bool ReadMainchainRpcCredentialFile(
     if (error) *error = "private static parent credential files require POSIX file permissions";
     return false;
 #else
-    return ReadRpcAuthRecord(path,credentials,false,error);
+    return ReadRpcAuthFile(path,credentials,error,drivechain::haskell::AuthFileMode::STATIC_RECORD);
 #endif
 }
 

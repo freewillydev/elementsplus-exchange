@@ -1,14 +1,31 @@
 {-# LANGUAGE FlexibleInstances, MultiParamTypeClasses, TypeFamilies, TypeOperators, UndecidableInstances #-}
 {-# LANGUAGE ConstraintKinds, FlexibleContexts, GADTs, PolyKinds, BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE AllowAmbiguousTypes, KindSignatures, UndecidableSuperClasses #-}
 -- Copyright (c) 2026 The Elements Core developers
 -- Distributed under the MIT software license.
-module Workflow (Finalize(..), CommandFlow(..), PredicateFlow(..), orderedFacts, runRequiredEffects, runReportedEffects, countMatches) where
+module Workflow (FoldOperation(..), Continue(..), Finalize(..), CommandFlow(..), PredicateFlow(..), NativeBytes, orderedFacts, runRequiredEffects, runReportedEffects, countMatches) where
 
+import Control.Operation (Operation(Outcome))
 import Control.Operation.Validation
+import Data.Kind (Type)
 import Data.Bits ((.&.), clearBit, shiftR, testBit)
 import Data.Int (Int32, Int64)
 import Data.Word (Word32, Word64)
+import qualified Data.ByteString as B
+
+-- A synchronous native read/effect. Returned bytes are copied by the ABI before
+-- the next call; each domain owns its framing and publication protocol.
+type NativeBytes = Word32 -> Word64 -> B.ByteString -> IO B.ByteString
+
+-- Indexed algebras preserve each constructor's intermediate result type.
+class FoldOperation (operation :: Type -> Type) where
+  data Algebra operation (result :: Type -> Type)
+  foldOperation :: Algebra operation result -> DSL (operation a) -> result a
+
+class (output ~ Outcome op) => Continue op output consumer where
+  type Continued op consumer
+  continue :: consumer -> output -> Continued op consumer
 
 -- Terminal actions ignore their reply; committing actions finish only on 1.
 -- The wider callback result reserves negative values for adapter exceptions.

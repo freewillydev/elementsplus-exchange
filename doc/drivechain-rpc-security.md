@@ -1,17 +1,18 @@
 # Secure native Drivechain RPC setup
 
-The current network is `-chain=elements`, data subdirectory `elements-v11`,
-slot 24. It is not the historical Liquid-signet chain. See
+The current network is `-chain=elements`, data subdirectory `elements-betanet-slot24-v1`,
+ECX Betanet slot 24. It is not production eCash mainnet or the historical Liquid-signet chain.
+See the [generated identity table](drivechain-network-identity.md) and
 [identity and peg operations](drivechain-peg-operations.md).
 
 ## Parent and wallet RPC
 
 Run the fully validating parent on the same trusted host, with `txindex`
-enabled and RPC bound only to loopback. The native default port is 18302:
+enabled and RPC bound only to loopback. The native default port is 28532:
 
 ```ini
 mainchainrpchost=127.0.0.1
-mainchainrpcport=18302
+mainchainrpcport=28532
 mainchainrpccookiefile=/absolute/path/to/parent-bitcoin/.cookie
 drivechainl1blocksync=0
 ```
@@ -20,6 +21,9 @@ Do not configure `mainchainrpcuser` or `mainchainrpcpassword`. On POSIX the
 rotating cookie must be a regular non-symlink file owned by the Elements user,
 mode 0600, containing the canonical `__cookie__:` plus 64 hex characters.
 The native default cookie location has no `signet/` suffix.
+The inherited `contrib/assets_tutorial` uses isolated tutorial chains and random
+inline credentials. Its tests do not define the native `-chain=elements` policy;
+do not copy tutorial authentication settings into a native deployment.
 DNS names (including `localhost`), LAN addresses and inline parent credentials
 are rejected. An explicit `mainchainrpccredentialfile` is also supported for a
 trusted same-host bridge: it must be an owner-only, non-symlink private file
@@ -100,12 +104,12 @@ plaintext on the trusted host; this is not end-to-end TLS inside the enforcer.
 Do not forward that plaintext listener to another host or an untrusted network.
 
 ```sh
-contrib/drivechain-mtls/generate-certs.sh /absolute/path/to/elements-v11/enforcer-tls
-contrib/drivechain-mtls/run-mtls-proxy.sh /absolute/path/to/elements-v11/enforcer-tls
+contrib/drivechain-mtls/generate-certs.sh /absolute/path/to/enforcer-tls /offline/issuer-ca elements-node-01
+contrib/drivechain-mtls/run-mtls-proxy.sh /absolute/path/to/enforcer-tls 127.0.0.1:55051 127.0.0.1:50051 elements-node-01
 ```
 
 Install HAProxy (`brew install haproxy` on macOS). The helper verifies client
-certificates and the `elements-client` identity, requires TLS 1.2 or later, and
+certificates and the exact configured client identity, requires TLS 1.2 or later, and
 negotiates HTTP/2 using ALPN `h2`. A TLS tunnel without ALPN is not compatible
 with the gRPC C core, even if a grpcurl probe succeeds. The old
 `run-stunnel-proxy.sh` name delegates to this helper for compatibility.
@@ -115,9 +119,9 @@ data directory):
 
 ```ini
 drivechainbmmgrpcaddr=127.0.0.1:55051
-drivechainbmmgrpcca=/absolute/path/to/elements-v11/enforcer-tls/ca.pem
-drivechainbmmgrpccert=/absolute/path/to/elements-v11/enforcer-tls/elements-client.pem
-drivechainbmmgrpckey=/absolute/path/to/elements-v11/enforcer-tls/elements-client-key.pem
+drivechainbmmgrpcca=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/ca.pem
+drivechainbmmgrpccert=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/elements-client.pem
+drivechainbmmgrpckey=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/elements-client-key.pem
 drivechainbmmgrpcauthority=enforcer.local
 ```
 
@@ -150,6 +154,14 @@ to the intended release OS; locally installed libraries are not portable release
 Missing/wrong client credentials must fail the TLS handshake. No plaintext or
 insecure-certificate fallback is provided.
 
+The generator's optional client identity is a lowercase DNS label. Its default
+is `elements-client` for existing installations; filenames remain unchanged.
+Use a separate key/identity for each operator and an exact identity allowlist
+at the miner endpoint. The helper allows one identity, not per-method access
+control or certificate revocation. A holder of an allowed certificate **and
+private key** receives that identity's endpoint access. Do not share the key
+among operators. CA compromise permits impersonation regardless of CN naming.
+
 Daemon startup re-executes the node after detaching, retaining the initialization
 pipe for `-daemonwait`. Configuration parsing already uses the threaded Haskell
 runtime; using that runtime after a raw fork loses its worker threads and can
@@ -159,15 +171,54 @@ fixtures. No live transactions are created.
 
 ## Production and rotation
 
-Automatic `drivechainl1blocksync` currently defaults **on**. Explicitly set it
-to 0 during read-only setup. Enforcer calls fail closed at use when credentials
+Automatic `drivechainl1blocksync` defaults **off**. A named parent wallet does not
+enable spending; `drivechainl1blocksync=1` is a separate explicit opt-in. The bid
+is `max(configured bid, selected candidate fees)` and the replacement allowance
+is per transaction, **not a lifetime spending cap**. Use only a dedicated wallet
+with a finite authorized balance and no automatic refill. Disabling the bidder
+cannot cancel transactions already in the parent mempool. Explicit manual bid
+RPCs still spend when requested. Keep the bidder off during read-only setup.
+
+The built-in identity also requires `acceptbetanettestprofile=1`; this acknowledges
+the [existing-proposal test limitation](betanet-slot24-test.md), not a production
+activation or spending permission. Enforcer calls fail closed at use when credentials
 are invalid; this is not a guarantee of a startup TLS probe.
 A native `sendtomainchain` burn can be created without an available enforcer,
-so verify the submission path before burning coins.
+so verify the submission path before burning coins. Explicit bundle submission
+returns an error on transport failure; creating a burn is not successful
+submission or payment, and a later endpoint outage cannot undo a burn.
+
+For withdrawal-service startup and recurring monitoring, install Python grpcio
+and openssl and run the read-only preflight under the credential owner:
+
+```sh
+python3 contrib/drivechain-mtls/check_enforcer_tls.py \
+  /absolute/path/to/enforcer-tls 127.0.0.1:55051 enforcer.local
+```
+
+Configure the deployment supervisor to require exit 0 before enabling withdrawal
+workflows, and its monitoring system to run this hourly and alert on exit 1
+(failure) or 2 (rotation due within 14 days). `--remote` is required for a remote
+miner endpoint. This authenticates a bounded, read-only `GetChainInfo` request;
+it does not propose a bundle, spend funds or treat the reply as consensus data.
+It checks local CA/client expiry and the server certificate if present locally.
+The remote server certificate is authenticated by gRPC at each probe; advance
+expiry monitoring of an unprovided remote server certificate is the miner's
+responsibility. A successful probe is only point-in-time readiness, not a
+guarantee that a later withdrawal can be submitted or mined.
+
+The helper is an operator integration point, **not automatically installed as
+a system service or a mandatory node startup gate**. Nodes doing validation,
+deposits or native BMM must remain usable without the optional enforcer.
 
 The helper issues a 365-day CA and 90-day server/client certificates and refuses
-to overwrite existing credentials. Move the CA private key offline. Monitor
-expiry in advance:
+to overwrite existing credentials. The CA key and serial are written to the
+separate non-nested CA directory (default: `<credential-directory>-ca`), never
+the runtime directory. Generate on the issuer host and deploy only runtime
+credentials; a separate directory on the same host is not offline protection.
+The proxy refuses to start if `ca-key.pem` remains in its runtime directory.
+For old installations, preserve and move that key to secure offline storage
+before restarting the proxy; do not delete the issuer key. Monitor expiry:
 
 ```sh
 openssl x509 -checkend 1209600 -noout -in /absolute/path/to/enforcer-tls/elements-client.pem
@@ -180,8 +231,9 @@ start the proxy, verify authentication, then restart Elements. Do not delete
 working credentials before verification. Stop the foreground proxy with its
 supervisor or Ctrl-C.
 
-Check listeners with `lsof -nP -iTCP -sTCP:LISTEN`: ports 18302, 7065, 50051
+Check listeners with `lsof -nP -iTCP -sTCP:LISTEN`: ports 28532, 7065, 50051
 and 55051 must not listen publicly. No environment variables may bypass
 withdrawal event verification or silently select another fee/slot/endpoint.
-The legacy ECX-only `drivechainpegoutmainfeesats` option is not the native
+The legacy ECX-only `drivechainpegoutmainfeesats` option is deprecated and unused
+now that its unsafe burn-and-submit path is disabled. It never sets the native
 `sendtomainchain` RPC's explicit coin-denominated `mainchainfee` argument.

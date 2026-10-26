@@ -163,7 +163,6 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   asset.cpp
   consensus/merkle.cpp
   consensus/tx_check.cpp
-  drivechain_withdrawal.cpp
   hash.cpp
   primitives/block.cpp
   primitives/confidential.cpp
@@ -306,12 +305,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   dynafed.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
-  drivechain_bmm.cpp
-  utreexo.cpp
-  drivechain_peg.cpp
-  drivechain_parent_replay.cpp
-  drivechain_rpc_security.cpp
-  ecx_exchange_state.cpp
   flatfile.cpp
   headerssync.cpp
   httprpc.cpp
@@ -326,8 +319,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   kernel/checks.cpp
   kernel/coinstats.cpp
   mainchainrpc.cpp
-  mainchainrpc_ecx.cpp
-  drivechain_bid_wallet.cpp
   kernel/context.cpp
   kernel/cs_main.cpp
   kernel/disconnected_transactions.cpp
@@ -347,8 +338,6 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/connection_types.cpp
   node/context.cpp
   node/database_args.cpp
-  node/drivechain_withdrawal_journal.cpp
-  node/ecx_deployment_identity.cpp
   node/eviction.cpp
   node/interface_ui.cpp
   node/interfaces.cpp

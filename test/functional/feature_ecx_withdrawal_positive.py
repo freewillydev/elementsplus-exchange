@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 The Elements Core developers
 # Distributed under the MIT software license.
-"""Bind a real drivechain withdrawal to an activated ECX header checkpoint.
+"""Reject the retired burn-and-submit RPC even with an activated ECX checkpoint.
 
 Requires grpcio, protobuf, protoc, bash, and openssl. The local mTLS server uses
 the pinned enforcer schema but mocks L1 acceptance, not real miner votes or payout.
@@ -19,7 +19,7 @@ import threading
 
 from feature_fedpeg import FedPegTest, get_new_unconfidential_address
 from test_framework.test_framework import SkipTest
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 from test_framework.enforcer_protocol import load_protocol
 
 
@@ -259,80 +259,20 @@ class EcxWithdrawalPositiveTest(FedPegTest):
         assert_equal(checkpoint["withdrawalbundlehash"], "0" * 64)
 
         destination = get_new_unconfidential_address(parent, "legacy")
-        result = sidechain.sendtomainchain(destination, 0.1, False, True)
-        pegout = result["drivechain_pegout"]
-        assert_equal(pegout["checkpoint_height"], checkpoint_height)
-        assert_equal(pegout["sidechain_height"], checkpoint_height)
-        assert_equal(pegout["checkpoint_block_hash"], checkpoint_hash)
-        assert_equal(pegout["previous_child_hash"], checkpoint["previousblockhash"])
-        assert_equal(pegout["exchange_state_root"], checkpoint["exchangestateroot"])
-        assert_equal(pegout["sidechain_id"], 24)
-        assert_equal(pegout["l1_event_verification"]["event_status"], "submitted")
-        assert_equal(
-            pegout["broadcast_response"],
-            {},  # The official BroadcastWithdrawalBundleResponse is empty.
-        )
-
-        wire = bytes.fromhex(pegout["withdrawal_bundle_hex"])
-        no_witness = wire[:4] + wire[6:]
-        assert_equal(sha256d(no_witness)[::-1].hex(), pegout["m6id"])
-        outputs = parse_bundle_outputs(wire)
-        withdrawal_outpoint = (
-            bytes.fromhex(result["txid"])[::-1]
-            + pegout["sidechain_withdrawal_vout"].to_bytes(4, "little")
-        )
-        commitment_preimage = (
-            b"\x02"
-            + withdrawal_outpoint
-            + b"\x00" * 32
-            + checkpoint_height.to_bytes(4, "little")
-        )
-        withdrawal_commitment = sha256d(commitment_preimage)
-        assert_equal(outputs[1], (0, b"\x6a\x20" + withdrawal_commitment))
-        anchor_preimage = (
-            b"\x01\x18"
-            + bytes.fromhex(sidechain.getblockhash(0))[::-1]
-            + checkpoint_height.to_bytes(4, "big")
-            + bytes.fromhex(checkpoint["previousblockhash"])[::-1]
-            + withdrawal_commitment
-            + bytes.fromhex(checkpoint["exchangestateroot"])[::-1]
-        )
-        state_anchor = tagged_hash("ECX/perps-m6-state/v1", anchor_preimage)
-        assert_equal(outputs[3], (0, b"\x6a\x25PXST\x01" + state_anchor))
-
-        with open(self.mock_state_path, encoding="utf-8") as mock_state_file:
-            mock_state = json.load(mock_state_file)
-        assert_equal(
-            mock_state["calls"],
-            [
-                "cusf.mainchain.v1.BlockProducerService/ProposeWithdrawalBundle",
-                "cusf.mainchain.v1.ValidatorService/GetTwoWayPegData",
-            ],
-        )
-        assert_equal(mock_state["m6_consensus_hex"], sha256d(no_witness).hex())
-
-        self.generatetoaddress(
-            sidechain, 1, sidechain.getnewaddress(), sync_fun=self.no_op)
-        committed = sidechain.getblock(sidechain.getbestblockhash())
-        assert_equal(committed["withdrawalbundlehash"], pegout["m6id"])
-        assert_equal(committed["exchangestateroot"], state_root)
-        assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 1)
-        committed_hash = sidechain.getbestblockhash()
-        self.restart_node(2, extra_args=replacement_args)
-        sidechain = self.nodes[2]
-        assert_equal(sidechain.getbestblockhash(), committed_hash)
-        restored = sidechain.getblock(committed_hash)
-        assert_equal(restored["withdrawalbundlehash"], pegout["m6id"])
-        assert_equal(restored["exchangestateroot"], state_root)
-        assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 1)
-        # A new template must use the restored in-memory bundle, not merely
-        # return the persisted header of the block loaded from disk.
-        self.generatetoaddress(
-            sidechain, 1, sidechain.getnewaddress(), sync_fun=self.no_op)
-        successor = sidechain.getblock(sidechain.getbestblockhash())
-        assert_equal(successor["previousblockhash"], committed_hash)
-        assert_equal(successor["withdrawalbundlehash"], pegout["m6id"])
-        assert_equal(sidechain.gettransaction(result["txid"])["confirmations"], 2)
+        before = sidechain.getwalletinfo()
+        mempool = sidechain.getrawmempool()
+        for subtract in (False, True):
+            for verbose in (False, True):
+                assert_raises_rpc_error(
+                    -32601, "no funds were burned",
+                    sidechain.sendtomainchain, destination, 0.1, subtract, verbose)
+        assert_equal(sidechain.getwalletinfo(), before)
+        assert_equal(sidechain.getrawmempool(), mempool)
+        assert_equal(sidechain.getbestblockhash(), checkpoint_hash)
+        # Even a configured, reachable enforcer must not receive a proposal.
+        if os.path.exists(self.mock_state_path):
+            with open(self.mock_state_path, encoding="utf-8") as state_file:
+                assert_equal(json.load(state_file).get("calls", []), [])
 
 
 if __name__ == "__main__":

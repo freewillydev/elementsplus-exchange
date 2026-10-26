@@ -26,6 +26,7 @@
 #include <string>
 #include <stdexcept>
 #include <chrono>
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <vector>
@@ -34,17 +35,24 @@
 
 class CBlock;
 class arith_uint256;
+namespace Consensus { struct Params; }
 
-class DrivechainParentRecoveryDeadline {
-    std::optional<std::chrono::steady_clock::time_point>& m_current;
-    const std::optional<std::chrono::steady_clock::time_point> m_previous;
-public:
-    DrivechainParentRecoveryDeadline(std::optional<std::chrono::steady_clock::time_point>& current,
-        const std::function<std::chrono::steady_clock::time_point()>& now);
-    ~DrivechainParentRecoveryDeadline() noexcept;
-    DrivechainParentRecoveryDeadline(const DrivechainParentRecoveryDeadline&) = delete;
-    DrivechainParentRecoveryDeadline& operator=(const DrivechainParentRecoveryDeadline&) = delete;
-};
+/** Operational RPC identity check, separate from the immutable replay bootstrap.
+ * The Betanet/Bitcoin shared genesis and pre-fork checkpoint cannot distinguish
+ * the networks. Never cache this check across changes of the parent RPC source.
+ */
+bool CheckDrivechainParentRpcNetwork(const Consensus::Params& consensus,
+    const std::function<UniValue(const std::string&, const UniValue&)>& request,
+    std::string* error);
+bool CheckDrivechainParentRpcNetwork(const Consensus::Params& consensus, std::string* error);
+/** Same boundary with caller-owned epoch state for isolated validation. A failed
+ * identity read revokes authorization; a successful read never republishes it. */
+bool VerifyDrivechainParentRpcNetwork(const Consensus::Params& consensus,
+    const std::function<UniValue(const std::string&, const UniValue&)>& request,
+    std::atomic<uint64_t>& replay_epoch, std::string* error);
+bool VerifyDrivechainParentRpcNetwork(const Consensus::Params& consensus,
+    std::atomic<uint64_t>& replay_epoch, std::string* error);
+
 
 struct VerifiedMainchainHeader {
     Sidechain::Bitcoin::CBlockHeader header;
@@ -60,31 +68,63 @@ struct DrivechainParentHeaderSource {
     std::function<bool(const uint256&, Sidechain::Bitcoin::CBlockHeader&, std::string*)> raw_header;
     std::function<bool(const uint256&, uint32_t, uint64_t&, std::string*)> median_time;
     std::function<void()> deadline;
+    // Optional native observations/effects for composing deadline policy in Haskell.
+    std::function<uint32_t(uint32_t)> deadline_action{};
+    // Explicit selection preserves the failure behavior of an empty request hook.
+    bool native_rpc{false};
 };
 
 bool VerifyDrivechainParentHeader(const uint256& expected_hash, int min_confirmations,
-    VerifiedMainchainHeader& verified, std::string* error, const DrivechainParentHeaderSource& source);
+    VerifiedMainchainHeader& verified, std::string* error, const DrivechainParentHeaderSource& source,
+    bool authenticate_rpc = false);
+bool VerifyDrivechainNetworkHeader(const Consensus::Params& consensus, std::atomic<uint64_t>& replay_epoch,
+    const uint256& expected_hash, int min_confirmations, VerifiedMainchainHeader& verified,
+    std::string* error, const DrivechainParentHeaderSource& source);
+
+struct DrivechainParentBodySource {
+    const DrivechainParentHeaderSource& header;
+    std::optional<std::chrono::steady_clock::time_point>& recovery_deadline;
+    std::function<std::chrono::steady_clock::time_point()> now;
+    std::function<bool()> allow_recovery;
+    // Unlike the header hook, body retrieval consumes the complete RPC envelope.
+    std::function<UniValue(const std::string&, const UniValue&)> request;
+    std::function<void()> check_deadline, wait;
+    std::function<const std::vector<uint8_t>&()> challenge;
+};
+/** A null verified output selects authenticated body-only retrieval: no network/header gate. */
+bool ReadDrivechainParentBlock(const Consensus::Params& consensus, std::atomic<uint64_t>& replay_epoch,
+    const uint256& hash, int min_confirmations, Sidechain::Bitcoin::CBlock& block,
+    VerifiedMainchainHeader* verified, std::string* error, const DrivechainParentBodySource& source);
 
 bool CheckDrivechainParentProofOfWork(const uint256& hash, uint32_t bits, std::string* error);
 arith_uint256 GetDrivechainParentBlockProof(uint32_t bits);
 bool DecodeDrivechainRawParentHeader(const UniValue& raw, const uint256& hash,
     Sidechain::Bitcoin::CBlockHeader& header, std::string* error);
 bool DecodeDrivechainRawParentBlock(const UniValue& raw, const uint256& hash,
-    Sidechain::Bitcoin::CBlock& block, std::string* error, const std::function<void()>& deadline);
+    Sidechain::Bitcoin::CBlock& block, std::string* error, const std::function<void()>& deadline,
+    const std::function<uint32_t(uint32_t)>& deadline_action = {});
 bool CheckDrivechainParentBlockTransactions(const Sidechain::Bitcoin::CBlock& block,
     std::string* error, const std::function<void()>& deadline);
 /** Transaction shape must already have passed CheckDrivechainParentBlockTransactions. */
 bool CheckDrivechainParentBlockSignet(const Sidechain::Bitcoin::CBlock& block, std::string* error,
     const std::function<const std::vector<uint8_t>&()>& challenge,
     const std::function<const uint256&()>& genesis, const std::function<void()>& deadline);
-bool VerifyDrivechainParentBlock(const uint256& hash, int min_confirmations,
-    Sidechain::Bitcoin::CBlock& block, VerifiedMainchainHeader& verified, std::string* error,
-    const std::function<bool(const uint256&, int, VerifiedMainchainHeader&, std::string*)>& read_header,
-    const std::function<bool(const uint256&, Sidechain::Bitcoin::CBlock&, std::string*)>& read_block);
+/** Decode, authenticate and validate a raw parent block in one workflow. */
+bool AuthenticateDrivechainRawParentBlock(const UniValue& raw, const uint256& hash,
+    Sidechain::Bitcoin::CBlock& block, std::string* error,
+    const std::function<const std::vector<uint8_t>&()>& challenge,
+    const std::function<const uint256&()>& genesis, const std::function<void()>& deadline,
+    const std::function<uint32_t(uint32_t)>& deadline_action = {});
 bool ComputeDrivechainParentMedianTimePast(const uint256& start_hash, uint32_t start_height,
     uint64_t& median_time_past,
     const std::function<bool(const uint256&, Sidechain::Bitcoin::CBlockHeader&)>& read_header,
     const std::function<void()>& check_deadline);
+/** Authenticate every raw ancestor and compute its median in one workflow. */
+bool ComputeDrivechainRpcMedianTimePast(const uint256& start_hash, uint32_t start_height,
+    uint64_t& median_time_past, std::string* error,
+    const std::function<UniValue(const std::string&, const UniValue&)>& request,
+    const std::function<void()>& check_deadline,
+    const std::function<uint32_t(uint32_t)>& deadline_action = {});
 bool CheckDrivechainParentChainwork(const uint256& parent_work, const uint256& successor_work,
     uint32_t successor_bits, std::string* error);
 
@@ -326,6 +366,13 @@ struct DrivechainMintableDeposit {
     }
 };
 
+/** Discover mature candidates from the local authenticated index, without doing parent RPC.
+ * Discovery does not authorize minting: normal transaction validation remains mandatory.
+ */
+bool ListDrivechainDepositCandidates(const std::optional<Sidechain::Bitcoin::COutPoint>& after,
+    int child_height, std::vector<DrivechainMintableDeposit>& deposits,
+    std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error);
+
 /** One authenticated active-parent P -> Q edge derived during replay. */
 struct DrivechainReplayedBmmEdge {
     uint256 successor_hash;
@@ -413,7 +460,10 @@ bool ValidateDrivechainGrpcTLSConfig(
     const ArgsManager& args,
     std::string* error = nullptr);
 
-/** Call an allowlisted enforcer method through the linked Haskell mTLS client. */
+/** Call an allowlisted enforcer method through the linked Haskell mTLS client.
+ * Canonical gRPC status codes (including TLS rejection) use exit_code and output;
+ * negative local failures use error. Interpret both with ClassifyDrivechainGrpcResult.
+ */
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     const ArgsManager& args,
     const std::string& method,
@@ -708,29 +758,6 @@ bool MatchDrivechainDepositInBlock(
     const std::map<Sidechain::Bitcoin::COutPoint, Sidechain::Bitcoin::CTxOut>& previous_outputs,
     std::string* error = nullptr);
 
-/**
- * Apply one already-authenticated active parent block to slot proposal/CTIP
- * state.  This function is pure so the exact replay rules can be unit tested.
- */
-bool ApplyDrivechainParentBlockState(
-    const Sidechain::Bitcoin::CBlock& block,
-    uint32_t height,
-    int sidechain_slot,
-    const uint256& required_active_proposal,
-    uint16_t unused_slot_proposal_max_age,
-    uint16_t unused_slot_activation_threshold,
-    uint16_t used_slot_proposal_max_age,
-    uint16_t used_slot_activation_threshold,
-    uint16_t withdrawal_bundle_max_age,
-    uint16_t withdrawal_bundle_inclusion_threshold,
-    DrivechainParentReplayState& state,
-    std::vector<DrivechainMintableDeposit>* deposits = nullptr,
-    std::string* error = nullptr,
-    std::vector<DrivechainSuccessfulWithdrawal>* successful_withdrawals = nullptr,
-    std::vector<DrivechainWithdrawalProposalIdentity>* withdrawal_proposals = nullptr,
-    drivechain::TreasuryOpcode treasury_opcode = drivechain::TreasuryOpcode::NOP5,
-    DrivechainM6ReplayRule m6_rule = DrivechainM6ReplayRule::SINGLE_CONFIGURED_SLOT_M6);
-
 /** Derive the canonical blinded BIP300 M6 transaction id. */
 bool ComputeDrivechainM6Id(const Sidechain::Bitcoin::CTransaction& transaction,
                            CAmount previous_treasury_value,
@@ -764,10 +791,5 @@ bool IsConfirmedDrivechainDeposit(const uint256& mainchain_block_hash,
                                   const std::vector<unsigned char>& address,
                                   std::string* error = nullptr,
                                   int child_height = -1);
-
-/** Inclusive confirmations through an authenticated parent anchor; never accepts a future deposit. */
-bool HasRequiredDrivechainDepositDepth(uint32_t deposit_height,
-                                      uint32_t confirmed_through_height,
-                                      uint32_t required_depth);
 
 #endif // BITCOIN_MAINCHAINRPC_H

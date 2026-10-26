@@ -369,6 +369,12 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
             }
         });
 
+    if (ecx_consensus.custody_successor.activation_enabled && nHeight>ecx_consensus.activation_height) {
+        const uint64_t source_parent=m_candidate_parent ? m_candidate_parent->parent_height :
+            authenticated_parent_height.value_or(pindexPrev->ecxParentHeight);
+        if (!ecx::CustodySourceAppendBudget(*pindexPrev,source_parent,m_ecx_source_append_budget))
+            throw std::runtime_error("CreateNewBlock(): fresh source admission budget unavailable");
+    }
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
     if (m_mempool) {
@@ -822,8 +828,13 @@ void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpda
                 case 0: {
                     forced_count=deposit_count=0;
                     std::string error;
+                    if (!ecx::CheckCustodyReservedSpendPolicy(sortedEntries[index]->GetTx(),
+                            m_chainstate.m_chain.Tip(),error,ecx::LayerTwoLabsExchangeConsensus(),
+                            [&](const Txid& parent) { return mempool.get(parent.ToUint256()); })) return 0;
                     return ecx::CountSourceTransactionMarkers(sortedEntries[index]->GetTx(),
-                        forced_count,deposit_count,error,ecx::LayerTwoLabsExchangeConsensus());
+                        forced_count,deposit_count,error,ecx::LayerTwoLabsExchangeConsensus(),
+                        m_candidate_parent ? std::optional<uint64_t>{m_candidate_parent->parent_height} :
+                            std::optional<uint64_t>{m_options.authenticated_parent_height.value_or(m_chainstate.m_chain.Tip()->ecxParentHeight)});
                 }
                 case 1: return forced_count;
                 case 2: return deposit_count;

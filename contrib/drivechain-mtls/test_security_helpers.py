@@ -2,6 +2,7 @@
 """Offline operational regressions; no nodes, funds, or existing services are used."""
 
 import hashlib
+import concurrent.futures
 import itertools
 import os
 from pathlib import Path
@@ -19,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[2]
 HELPERS = ROOT / "contrib" / "drivechain-mtls"
 sys.path.insert(0, str(ROOT / "contrib" / "assets_tutorial"))
 from test_framework.daemon import Daemon  # noqa: E402
+sys.path.insert(0, str(HELPERS))
+try:
+    import grpc
+    from check_enforcer_tls import probe
+except ImportError:
+    grpc = None
 
 
 def run(*args, **kwargs):
@@ -32,6 +39,7 @@ class CertificateTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="elements-tls-test-")
         cls.addClassCleanup(cls.directory.cleanup)
         cls.credentials = Path(cls.directory.name) / "credentials"
+        cls.ca_directory = Path(cls.directory.name) / "credentials-ca"
         result = run("bash", str(HELPERS / "generate-certs.sh"), str(cls.credentials))
         if result.returncode:
             raise RuntimeError(result.stderr)
@@ -39,7 +47,10 @@ class CertificateTests(unittest.TestCase):
     def test_certificate_permissions_purposes_and_expiry(self):
         ca = self.credentials / "ca.pem"
         self.assertEqual(self.credentials.stat().st_mode & 0o777, 0o700)
-        for name in ("ca-key.pem", "server-key.pem", "elements-client-key.pem"):
+        self.assertFalse((self.credentials / "ca-key.pem").exists())
+        self.assertEqual((self.ca_directory / "ca-key.pem").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.ca_directory.stat().st_mode & 0o777, 0o700)
+        for name in ("server-key.pem", "elements-client-key.pem"):
             self.assertEqual((self.credentials / name).stat().st_mode & 0o777, 0o600)
         for name, purpose, days in (("ca.pem", None, 365),
                                     ("server.pem", "sslserver", 90),
@@ -71,13 +82,47 @@ class CertificateTests(unittest.TestCase):
         after = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in self.credentials.iterdir() if p.is_file()}
         self.assertEqual(before, after)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as ca_directory:
             path = Path(directory) / "server.pem"
             path.symlink_to("missing.pem")
-            result = run("bash", str(HELPERS / "generate-certs.sh"), directory)
+            result = run("bash", str(HELPERS / "generate-certs.sh"), directory,
+                         ca_directory)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("refusing to overwrite", result.stderr)
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ["server.pem"])
+
+    def test_rejects_nested_ca_and_invalid_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "runtime"
+            for ca in (destination, destination / "ca"):
+                result = run("bash", str(HELPERS / "generate-certs.sh"), str(destination), str(ca))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("non-nested", result.stderr)
+            result = run("bash", str(HELPERS / "generate-certs.sh"), str(destination),
+                         str(Path(directory) / "ca"), "client\npermit-any")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("client identity", result.stderr)
+
+    def test_certificate_destination_aliases(self):
+        for argument in ("runtime/", "."):
+            with self.subTest(argument=argument), tempfile.TemporaryDirectory() as directory:
+                runtime = Path(directory) / "runtime"
+                runtime.mkdir()
+                cwd = runtime if argument == "." else Path(directory)
+                result = run("bash", str(HELPERS / "generate-certs.sh"), argument, cwd=cwd)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((Path(directory) / "runtime-ca/ca-key.pem").is_file())
+                self.assertTrue((runtime / "elements-client.pem").is_file())
+                self.assertFalse((runtime / "ca-key.pem").exists())
+
+    @unittest.skipUnless(shutil.which("haproxy"), "HAProxy required")
+    def test_proxy_refuses_colocated_ca_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = Path(directory)
+            (credentials / "ca-key.pem").symlink_to("missing-private-key")
+            result = run("bash", str(HELPERS / "run-mtls-proxy.sh"), directory)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CA signing key", result.stderr)
 
     def test_mutual_tls_handshake(self):
         # Actual TLS handshakes exercise both directions of authentication.
@@ -133,13 +178,67 @@ class CertificateTests(unittest.TestCase):
                     self.assertEqual(success, expected)
                     self.assertEqual(outcomes, [expected])
 
+    @unittest.skipUnless(grpc, "grpcio required")
+    def test_preflight_health_expiry_authority_and_authentication(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            server = grpc.server(executor)
+            calls = []
+
+            def info(request, context):
+                self.assertEqual(request, b"")
+                self.assertEqual(context.auth_context()["x509_common_name"], [b"elements-client"])
+                calls.append("GetChainInfo")
+                return b"\x08\x01"
+
+            server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
+                "cusf.mainchain.v1.ValidatorService", {"GetChainInfo": grpc.unary_unary_rpc_method_handler(info)}),))
+            credentials = grpc.ssl_server_credentials([
+                ((self.credentials / "server-key.pem").read_bytes(), (self.credentials / "server.pem").read_bytes())],
+                root_certificates=(self.credentials / "ca.pem").read_bytes(), require_client_auth=True)
+            port = server.add_secure_port("127.0.0.1:0", credentials)
+            plain = server.add_insecure_port("127.0.0.1:0")
+            server.start()
+            try:
+                self.assertEqual(probe(self.credentials, f"127.0.0.1:{port}", "enforcer.local"), [])
+                self.assertEqual(calls, ["GetChainInfo"])
+                warnings = probe(self.credentials, f"127.0.0.1:{port}", "enforcer.local", warning_days=100)
+                self.assertEqual(len(warnings), 2)
+                for endpoint, authority in ((f"127.0.0.1:{port}", "wrong.local"),
+                                             (f"127.0.0.1:{plain}", "enforcer.local")):
+                    with self.assertRaises(grpc.RpcError):
+                        probe(self.credentials, endpoint, authority, timeout=1)
+                self.assertEqual(calls, ["GetChainInfo", "GetChainInfo"])
+                with self.assertRaises(ValueError):
+                    probe(self.credentials, "example.com:443", "enforcer.local")
+                with tempfile.TemporaryDirectory() as directory:
+                    copy = Path(directory)
+                    for name in ("ca.pem", "elements-client.pem", "elements-client-key.pem"):
+                        shutil.copy2(self.credentials / name, copy / name)
+                    (copy / "elements-client-key.pem").chmod(0o644)
+                    with self.assertRaises(ValueError):
+                        probe(copy, f"127.0.0.1:{port}", "enforcer.local")
+            finally:
+                server.stop(0).wait(5)
+
     @unittest.skipUnless(shutil.which("haproxy"), "HAProxy required")
     def test_proxy_forwards_authenticated_client(self):
+        self.check_proxy(self.credentials, "elements-client")
+
+    @unittest.skipUnless(shutil.which("haproxy"), "HAProxy required")
+    def test_proxy_custom_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credentials = Path(directory) / "runtime"
+            result = run("bash", str(HELPERS / "generate-certs.sh"), str(credentials),
+                         str(Path(directory) / "ca"), "elements-node-01")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.check_proxy(credentials, "elements-node-01")
+
+    def check_proxy(self, credentials, client_id):
         client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         client.set_alpn_protocols(["h2"])
-        client.load_verify_locations(str(self.credentials / "ca.pem"))
-        client.load_cert_chain(str(self.credentials / "elements-client.pem"),
-                               str(self.credentials / "elements-client-key.pem"))
+        client.load_verify_locations(str(credentials / "ca.pem"))
+        client.load_cert_chain(str(credentials / "elements-client.pem"),
+                               str(credentials / "elements-client-key.pem"))
         with socket.socket() as upstream, socket.socket() as reservation:
             upstream.bind(("127.0.0.1", 0))
             upstream.listen(1)
@@ -162,8 +261,8 @@ class CertificateTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as log:
                 environment = dict(os.environ, TMPDIR=directory)
                 process = subprocess.Popen(
-                    ["bash", str(HELPERS / "run-stunnel-proxy.sh"), str(self.credentials),
-                     f"127.0.0.1:{endpoint[1]}", f"127.0.0.1:{upstream.getsockname()[1]}"],
+                    ["bash", str(HELPERS / "run-stunnel-proxy.sh"), str(credentials),
+                     f"127.0.0.1:{endpoint[1]}", f"127.0.0.1:{upstream.getsockname()[1]}", client_id],
                     env=environment, stdout=log, stderr=log)
                 worker = threading.Thread(target=serve)
                 worker.start()
@@ -186,10 +285,10 @@ class CertificateTests(unittest.TestCase):
                     self.assertEqual(outcomes, [True])
                     for identity, alpn in ((False, True), (True, False)):
                         rejected = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                        rejected.load_verify_locations(str(self.credentials / "ca.pem"))
+                        rejected.load_verify_locations(str(credentials / "ca.pem"))
                         if identity:
-                            rejected.load_cert_chain(str(self.credentials / "elements-client.pem"),
-                                                     str(self.credentials / "elements-client-key.pem"))
+                            rejected.load_cert_chain(str(credentials / "elements-client.pem"),
+                                                     str(credentials / "elements-client-key.pem"))
                         if alpn:
                             rejected.set_alpn_protocols(["h2"])
                         try:

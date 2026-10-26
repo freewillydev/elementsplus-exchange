@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
-  echo "usage: $0 CREDENTIAL_DIRECTORY [LISTEN_HOST:PORT] [UPSTREAM_HOST:PORT]" >&2
+if [[ $# -lt 1 || $# -gt 4 ]]; then
+  echo "usage: $0 CREDENTIAL_DIRECTORY [LISTEN_HOST:PORT] [UPSTREAM_HOST:PORT] [CLIENT_ID]" >&2
   exit 2
 fi
 
@@ -18,6 +18,15 @@ command -v openssl >/dev/null 2>&1 || {
 credentials=$(cd "$1" && pwd -P)
 listen=${2:-127.0.0.1:55051}
 upstream=${3:-127.0.0.1:50051}
+client_id=${4:-elements-client}
+if [[ ! $client_id =~ ^[a-z][a-z0-9-]{0,62}$ ]]; then
+  echo "invalid client identity" >&2
+  exit 1
+fi
+if [[ -e "$credentials/ca-key.pem" || -L "$credentials/ca-key.pem" ]]; then
+  echo "refusing runtime directory containing a CA signing key; move it offline" >&2
+  exit 1
+fi
 for file in ca.pem server.pem server-key.pem; do
   [[ -f "$credentials/$file" && ! -L "$credentials/$file" ]] || {
     echo "missing non-symlink credential: $credentials/$file" >&2
@@ -54,6 +63,11 @@ fi
 
 openssl verify -purpose sslserver -CAfile "$credentials/ca.pem" \
   "$credentials/server.pem" >/dev/null
+for file in ca.pem server.pem; do
+  if ! openssl x509 -checkend 1209600 -noout -in "$credentials/$file" >/dev/null; then
+    echo "WARNING: $file expires within 14 days; rotate credentials before expiry" >&2
+  fi
+done
 openssl pkey -in "$credentials/server-key.pem" -check -noout >/dev/null
 certificate_key=$(openssl x509 -in "$credentials/server.pem" -pubkey -noout | \
   openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256)
@@ -113,7 +127,7 @@ defaults
   timeout server 10m
 frontend enforcer_tls
   bind $listen ssl crt server.pem ca-file ca.pem verify required ssl-min-ver TLSv1.2 alpn h2
-  tcp-request content reject unless { ssl_c_s_dn(cn) -m str elements-client }
+  tcp-request content reject unless { ssl_c_s_dn(cn) -m str $client_id }
   tcp-request content reject unless { ssl_fc_alpn -m str h2 }
   default_backend enforcer_loopback
 backend enforcer_loopback

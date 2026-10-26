@@ -25,7 +25,7 @@ class CatalogueTests(unittest.TestCase):
             return generate.load_rows()
 
     def test_exact_rows(self):
-        self.assertEqual(24, len(self.load(self.raw)))
+        self.assertEqual(26, len(self.load(self.raw)))
 
     def test_compression_independent_standard_vectors(self):
         # Compare the custom compression primitive to hashlib, not to itself.
@@ -35,7 +35,7 @@ class CatalogueTests(unittest.TestCase):
                              hashlib.sha256(payload).digest())
 
     def test_every_consensus_field_mutation_rejected(self):
-        for index in range(24):
+        for index in range(26):
             for field in generate.FIELDS:
                 with self.subTest(index=index, field=field):
                     rows = copy.deepcopy(self.raw)
@@ -50,7 +50,7 @@ class CatalogueTests(unittest.TestCase):
                 self.load(rows)
 
     def test_specification_cannot_be_substituted_for_jet(self):
-        for index in range(24):
+        for index in range(26):
             rows = copy.deepcopy(self.raw)
             rows[index]["cmr"] = rows[index]["specification_cmr"]
             with self.assertRaises(ValueError):
@@ -75,7 +75,7 @@ class CatalogueTests(unittest.TestCase):
         self.assertFalse(registry["production_benchmark_reviewed"])
         self.assertEqual(registry["cost_basis"]["kind"], "user-selected-policy")
         self.assertEqual(sum(j["cost_milliweight"] == 1000 for j in registry["jets"]), 19)
-        self.assertEqual(sum(j["cost_milliweight"] == 1000000000 for j in registry["jets"]), 5)
+        self.assertEqual(sum(j["cost_milliweight"] == 1000000000 for j in registry["jets"]), 7)
 
 
 if __name__ == "__main__":

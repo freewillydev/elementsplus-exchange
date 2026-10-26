@@ -37,6 +37,8 @@ bool HasAlphaPeginOneConfirmationUpgrade(const CChainParams& params);
  * No witness/RPC height override is accepted.
  */
 uint32_t GetDrivechainPeginConfirmationDepth(const CChainParams& params, int child_height = -1);
+/** Copied process-local facts for Haskell confirmation policy; not a chain encoding. */
+std::vector<unsigned char> PeginConfirmationSnapshot(const CChainParams& params, int child_height);
 
 /**
  * Return the currently selected parameters. This won't change after app

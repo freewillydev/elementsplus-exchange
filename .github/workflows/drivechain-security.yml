@@ -1,0 +1,29 @@
+name: Drivechain security helpers (not release qualification)
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install isolated test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ openssl haproxy python3-grpcio
+      - name: Check current-source security boundaries
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 contrib/devtools/check_drivechain_docs.py
+          python3 contrib/devtools/test_verifier_pins.py
+          /usr/bin/python3 contrib/drivechain-mtls/test_security_helpers.py
+          python3 contrib/devtools/test_security_workflows.py

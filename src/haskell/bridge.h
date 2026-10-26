@@ -17,7 +17,44 @@
 #include <string_view>
 #include <utility>
 
+class CTransaction;
+class CScript;
+class uint256;
+namespace Sidechain::Bitcoin { class CBlock; }
+
 namespace drivechain::haskell {
+using NativeWorkflow = std::function<std::vector<unsigned char>(uint32_t, uint64_t, std::span<const unsigned char>)>;
+enum class ExchangeSession : uint32_t {
+    FORCED_CANONICAL, FORCED_ADMISSION, FORCED_CURSOR, FORCED_SOURCE, CUSTODY_RESERVED, CUSTODY_BUDGET,
+    CUSTODY_AVAILABLE, CUSTODY_IDENTITY, CUSTODY_GENESIS, CUSTODY_DECODE,
+};
+bool RunExchangeSession(ExchangeSession mode, const NativeWorkflow& native);
+// Owns transient Signet objects; the supplied block, challenge and genesis must outlive it.
+NativeWorkflow PrepareParentSignet(const Sidechain::Bitcoin::CBlock& block,
+    const CScript& challenge, const uint256& genesis, std::string* error);
+enum class AuthFileMode : uint32_t { RAW, STATIC_RECORD, ROTATING_COOKIE };
+bool ReadAuthFile(AuthFileMode mode, const NativeWorkflow& native);
+enum class ReplayStoreWorkflow : uint32_t { CHECK_TIP, APPEND, DEPOSIT, EDGE, WITHDRAWAL, OCCURRENCE, LIST_DEPOSITS, LOAD, RESET, CACHE, MILESTONE, BMM, LOAD_SESSION, RESET_SESSION, APPEND_SESSION, DEPOSIT_ADMISSION, CONFIRMED_DEPOSIT, DEPOSIT_SESSION, SCAN_SESSION, DEPOSIT_CANDIDATES, PARENT_NETWORK, ACTIVE_HASH, CONFIRMATION_DEPTH, ALPHA_PEGIN_IDENTITY, RPC_TRANSPORT, RPC_TRANSPORT_CHECKED, RPC_HOST, LOCAL_BID, BID_SUBMISSION, BMM_CONTEXT, WALLET_WITHDRAWAL, JOURNAL_VALIDATE, JOURNAL_READ, JOURNAL_WRITE, JOURNAL_CLEAR, BMM_PROOF_REQUIRED, BMM_HEADER_POLICY, BMM_STATE_READ, BMM_STATE_EFFECTIVE, BMM_STATE_CONTEXT, STATE_STORE, STATE_RESTORE, PROOF_ENCODE, PROOF_DECODE, PROOF_ATTACH, PROOF_ENTRIES, PROOF_BLOCK, PROOF_PARENT, CHAIN_CONNECT, CHAIN_DISCONNECT, COMMITMENT };
+uint32_t RunReplayStore(ReplayStoreWorkflow mode, const NativeWorkflow& native);
+enum class ParentHeaderWorkflow : uint32_t { POW, WORK, CHAINWORK, RAW, MEDIAN, RPC_MEDIAN,
+    HASH, METADATA, PREDECESSOR, VERIFY, RPC_VERIFY, RAW_DEADLINE, RPC_MEDIAN_DEADLINE, RPC_VERIFY_DEADLINE,
+    BLOCK_TRANSACTIONS, BLOCK_SIGNET, BLOCK, BLOCK_DEADLINE,
+    SIGNET_VERIFY, SIGNET_MERKLE, SIGNET_BUILD, SIGNET_DATA, SIGNET_COMMITMENT, NETWORK_VERIFY,
+    READ_BODY, READ_BLOCK };
+bool RunParentHeader(ParentHeaderWorkflow kind, uint32_t height,
+    const std::function<uint64_t(uint32_t, uint64_t)>& native);
+bool RunParentHeader(ParentHeaderWorkflow kind, uint32_t height, const NativeWorkflow& native);
+enum class BitcoinSignatureWorkflow : uint32_t { BMM, PARENT, HASH };
+bool RunBitcoinSignature(BitcoinSignatureWorkflow kind, int32_t hash_type, bool witness,
+    uint32_t index, uint64_t inputs, uint64_t outputs, std::span<const unsigned char> signature,
+    const NativeWorkflow& native);
+bool ValidateWithdrawalEnvelope(bool inactive, const NativeWorkflow& native, std::string& error);
+bool MeasureWork(bool saturate, uint64_t count, const std::function<const CTransaction&(uint64_t)>& transaction,
+    uint64_t& total, uint64_t* last = nullptr);
+enum class TransactionAdmission : uint32_t { ORDINARY_INPUTS, EXPLICIT_CREATIONS, PUBLIC_BOND, DEPLOYMENT };
+bool AdmitTransaction(TransactionAdmission kind, const CTransaction& tx,
+    uint64_t issuance = 0, uint64_t inventory = 0, uint64_t burn = 0, uint64_t authority = 0,
+    const std::function<std::array<unsigned char,64>()>& derive = {});
 struct UsddResourceSource;
 enum class StandardnessGate : uint32_t { ANNEX_NETWORK, OUTPUT_EXCEPTIONS, WITNESS_RESOURCES };
 bool AdmitStandardness(StandardnessGate kind, uint32_t facts, uint64_t count = 0, uint64_t limit = 0);
@@ -50,10 +87,8 @@ bool BmmWorkQuote(int64_t fees, uint64_t work, int64_t rate, int64_t reserve, st
 bool BmmWorkQuoteDisplay(int64_t fees, uint64_t work, int64_t rate, int64_t reserve, std::array<int64_t,3>& fields);
 enum class BmmMessageKind : uint32_t { DEFINITIVE_WAIT, DUPLICATE_REQUEST };
 bool BmmMessageMatches(BmmMessageKind kind, const std::string& message);
-int64_t BmmReplacementLimit(int64_t selected, int64_t extra);
 int BmmWorkBid(uint32_t hashes, int64_t height, int64_t fees, int64_t work, int64_t reserve,
     int64_t requested, const std::function<int64_t(uint32_t)>& rate, std::array<int64_t,4>& fields);
-uint64_t BmmWorkBudget(uint64_t count, const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read);
 bool DepositInputLimit(bool enabled, uint64_t count, uint64_t limit,
     const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read);
 bool StartupArgs(uint32_t slot, uint32_t timeout_maximum, const std::function<uint64_t(uint32_t)>& read);
@@ -62,14 +97,12 @@ bool ExchangeTemplateBudget(int64_t height, int64_t activation, const std::funct
     uint64_t& budget, std::string& error);
 bool ExchangeSourcePackage(bool enabled, uint64_t count,
     const std::function<uint64_t(uint32_t,uint64_t)>& action, uint64_t& selected, bool modified=false);
-bool BmmWorkTotal(bool saturate, uint64_t count, const std::function<uint64_t(uint64_t)>& read, uint64_t& total);
 enum class ConfigurationField : uint32_t { RAW_HASH, NONZERO_HASH, OUTPOINT, SPENDABLE_SCRIPT, DISPLAY_HASH, CONFIGURATION_HEX, CUSTODIAN_REGISTRY, PROPOSAL_DESCRIPTION = 9 };
 enum class NetworkSelection : uint32_t { PRODUCTION, CHAIN_NAME, REGTEST_OPTION };
 uint8_t ContextPresence(uint32_t count, uint32_t required);
 void ScriptCacheEncode(bool endpoint_only, std::span<const std::byte> input, std::span<unsigned char> output);
 enum class CtvAction : uint8_t { IGNORE, DISCOURAGE, EMPTY_STACK, CHECK_HASH };
 CtvAction CtvAdmission(uint32_t flags, uint64_t size);
-bool VerifierStartup(bool active, const std::function<bool(uint32_t)>& read, std::string* error);
 bool VerifierIdentity(bool active, uint32_t abi, uint32_t format,
     const std::array<unsigned char,32>& expected, RustVerifierVersion version,
     RustVerifierVersion identity_version, RustVerifierIdentity identity, std::string* error);
@@ -95,12 +128,9 @@ GrpcResponse GrpcRequest(std::span<const std::string, 7> fields, int64_t timeout
     size_t max_output, const std::function<bool()>& should_cancel);
 struct GrpcTextAdmission { bool address_shape, address_characters, authority_characters; };
 GrpcTextAdmission AdmitGrpcText(const std::string& address, const std::string& authority);
-bool IsRpcCredentialRecord(const std::string& text, bool rotating_cookie);
 // Result bits: 1 = identities valid, 2 = evaluator active. Bridge failures throw.
 int EvaluatorIdentity(bool frozen, bool private_catalogue, const std::string& catalogue, const std::string& program);
-bool AdmitPrivateCredentialFile(const std::function<int64_t(uint32_t)>& read);
 bool AdmitTlsCredentialFile(bool private_key, const std::function<uint64_t(uint32_t)>& read);
-uint32_t ReadCredentialBytes(uint64_t capacity, const std::function<uint64_t(uint64_t,uint64_t)>& read, uint64_t& used);
 int UsddExtractBlock(bool zero_genesis, std::span<const unsigned char,69> profile,
     const std::function<int64_t(uint32_t,uint64_t,uint64_t,uint64_t,unsigned char*)>& effect,
     std::span<const unsigned char> state = {}, std::span<const unsigned char> empty_roots = {},
@@ -118,12 +148,18 @@ bool UsddAccumulator(uint32_t mode, uint64_t count, uint8_t prefix, std::span<un
 bool UsddAccumulatorVersion(uint32_t version);
 void UsddFrontierWire(uint64_t count, bool reading, const std::function<bool(uint32_t)>& action);
 int64_t WalletBalanceTotal(int64_t trusted, int64_t pending, int64_t immature);
-std::vector<unsigned char> ExchangeGenesisFunding(uint64_t mtp, uint64_t price);
 enum class GenesisCodec : uint32_t { BOND, PRIVATE_STATE, COVENANT, TAP_LEAF, TAP_BRANCH, AVAILABILITY_SCHEME, CUSTODY_RECEIPT, RISK_PROFILE,
     FINITE_SNAPSHOT, INCREMENTAL_SNAPSHOT, ACTIVATION_SNAPSHOT, GENESIS_SNAPSHOT };
 std::vector<unsigned char> ExchangeGenesisState(GenesisCodec codec, uint64_t height, uint64_t price,
     std::initializer_list<const unsigned char*> hashes, std::span<const unsigned char> bond = {}, std::span<const unsigned char> funding = {});
 enum class InboxCodec : uint32_t { FORCED, DEPOSIT, STEP, WIDE_STEP, BOND, WIDE_BOND, MARKER_CONTEXT, NO_STAGING_AUTH = 9, STAGING_AUTH, REGISTRY, STAGING_DESCRIPTOR = 13, STAGING_HIDDEN, BOND_DEPLOYMENT };
+/** Fresh inactive exact-inbox codecs. These do not authenticate signatures or
+ * source headers. Full-width fields always use (high64, low64). */
+// Internal structural codecs. They never produce a verified execution receipt.
+std::optional<std::vector<unsigned char>> ExchangeForcedV3BlockBytes(
+    uint32_t mode, std::span<const unsigned char> bytes);
+bool ExchangeForcedV3Frame(std::span<const unsigned char> script,
+    std::span<const unsigned char,32> economic_hash, std::vector<unsigned char>& payload);
 std::vector<unsigned char> ExchangeInboxEntry(InboxCodec codec, std::array<uint64_t, 7> fields,
     std::initializer_list<const unsigned char*> hashes, std::span<const unsigned char> body = {});
 bool ExchangeSpendScan(bool unique, uint64_t start, uint64_t end,
@@ -136,14 +172,6 @@ uint32_t PegEventRange(int32_t start, int32_t count, int32_t tip, int32_t& end);
 int32_t PegEventStart(int32_t tip);
 uint32_t ExchangeExportRange(int32_t start, int32_t count, int32_t activation,
     std::optional<int32_t> tip, int32_t& end);
-bool ExchangeOracleProfile(uint32_t confirmations, std::span<const unsigned char> bytes,
-    std::span<const unsigned char* const,4> truth, std::span<uint64_t,2> prices);
-bool ExchangeTruthcoinProfile(std::span<const unsigned char> bytes, std::span<unsigned char,164> fields);
-bool ExchangeCheckpointProfile(bool anchor, std::span<const unsigned char> bytes,
-    std::span<const unsigned char,32> policy, std::span<unsigned char,64> identities);
-bool ExchangeFrozenTail(bool direct_price, std::span<const unsigned char> bytes, std::string& error);
-bool ExchangeBondProfile(std::span<const unsigned char> bytes, std::span<const unsigned char,32> codec);
-bool ExchangeConfigurationIdentities(bool outer, std::span<const unsigned char> bytes, std::string& error);
 void ExchangeDeploymentBlinders(bool public_deployment, std::span<const unsigned char* const,3> identities);
 void ExchangeDeploymentIdentities(bool direct_price, std::span<const unsigned char* const,22> identities);
 bool ExchangeFrozenIdentities(bool direct_price, std::span<const unsigned char* const,22> identities, std::string& error);
@@ -151,7 +179,6 @@ void ExchangeActivationFacts(std::span<const unsigned char* const,40> identities
 void ExchangeRuntimeIdentities(std::span<const unsigned char* const,16> identities);
 bool ExchangeCarryIdentity(uint32_t profile, std::span<const unsigned char* const,15> identities);
 bool ExchangeDistinct(std::span<const unsigned char* const> identities);
-void ExchangeProofIdentities(std::span<const unsigned char* const> identities);
 uint32_t UsddAdmission(uint32_t lane, std::span<const unsigned char> bytes, uint64_t limit,
     std::array<uint32_t, 3> profile, bool bmm, bool active, const std::function<int32_t(uint32_t)>& identity);
 uint32_t UsddAnnex(std::span<const unsigned char> bytes, uint64_t limit, std::array<uint32_t, 3> profile);
@@ -173,23 +200,25 @@ std::pair<uint32_t,uint64_t> UsddResources(uint64_t count,
     std::array<std::span<const unsigned char>,7> fields, std::array<uint32_t,5> profile,
     uint64_t limit, bool parameterized, const std::function<UsddWitness(uint64_t)>& read);
 bool ExchangeAbsent(std::span<const unsigned char* const> identities);
-bool ExchangeIsolated(std::span<const unsigned char* const> identities);
 bool ExchangeRegistry(std::span<const std::array<unsigned char, 32>, 5> encryption,
     std::span<const std::array<unsigned char, 32>, 5> attestation, std::string& error);
 std::vector<unsigned char> ExchangeRegistryEncoding(std::span<const std::array<unsigned char,32>,5> encryption,
     std::span<const std::array<unsigned char,32>,5> attestation);
 void ExchangeRegistryDecoding(std::span<const unsigned char> bytes, std::span<std::array<unsigned char,32>,5> encryption,
     std::span<std::array<unsigned char,32>,5> attestation);
+/** Strict fresh exact-custody codec/pin/lineage checks; no proof authentication. */
+bool ExchangeCustodyCheck(uint32_t mode, std::span<const unsigned char> values,
+    std::span<const unsigned char> context = {});
+
 bool ExchangeCapitalIdentity(uint32_t profile, std::span<const unsigned char, 32> program,
     std::span<const unsigned char> values, std::initializer_list<const unsigned char*> identities,
     std::initializer_list<uint64_t> context = {}, std::initializer_list<const unsigned char*> snapshot_context = {},
     std::span<unsigned char> snapshot = {});
 bool ExchangeSuccessorBinding(bool incremental, std::span<const unsigned char> values,
     std::span<const unsigned char* const,4> identities, std::span<const uint64_t,3> context);
-bool ExchangeEnvelopeHeader(std::span<const unsigned char> payload, std::string& error);
+bool ExchangeSwapSuccessorBinding(std::span<const unsigned char> values,
+    std::span<const unsigned char* const,6> identities, std::span<const uint64_t,4> context);
 std::vector<unsigned char> ExchangeEnvelopePayload(uint32_t height, const unsigned char* checkpoint, std::span<const unsigned char> body);
-bool ExchangeM6Preimage(std::span<const unsigned char> raw,
-    std::span<unsigned char, 64> commitments, std::string& error);
 enum class SourceMarker : uint32_t { FORCED, DEPOSIT, ACTIVATION };
 bool ExchangeSourceMarker(uint32_t& seen, SourceMarker kind, bool present, std::string& error);
 bool ExchangeDeriveInbox(uint64_t count, uint64_t forced, uint64_t deposits,
@@ -198,8 +227,6 @@ bool ExchangeSourceAdmission(const std::function<uint64_t(uint64_t)>& read, std:
 enum class Availability : uint32_t { ROOT, CURSORS, SNAPSHOT, RPC };
 bool ExchangeAvailable(Availability kind, const std::function<bool(uint32_t)>& read);
 bool ExchangeSnapshot(const std::function<bool(uint32_t)>& read, std::string& error);
-bool ExchangeEnvelopeScan(const std::function<int32_t(uint32_t)>& read, std::string& error);
-bool ExchangeCheckpoint(const std::function<bool(uint32_t)>& read, std::string& error);
 bool ExchangeGenesisInitialization(uint32_t version, const std::function<bool(uint32_t)>& read, std::string& error);
 bool ExchangeDeployment(uint32_t version, const std::function<bool(uint32_t)>& read, std::string& error);
 int ExchangeRequiredIdentity(bool public_deployment, bool direct_price, const std::function<bool(uint32_t)>& read);
@@ -220,9 +247,6 @@ enum class HeaderPhase : uint32_t { BEFORE_ACTIVATION, ACTIVE, GENESIS };
 bool ExchangeHeader(HeaderPhase phase, const std::function<bool(uint32_t)>& read, std::string& error);
 bool ExchangeConfiguration(const std::function<bool(uint32_t)>& read, std::string& error);
 bool ProductionIdentity(const std::function<bool(uint32_t)>& read, std::string* error);
-uint32_t PeginConfirmationPolicy(bool alpha_only, int64_t height, uint32_t configured,
-    const std::function<bool(uint32_t)>& read);
-uint32_t RequiredPeginDepth(uint32_t configured);
 enum class TrackerPhase : uint32_t { ENCODING, SCRIPT, PAYLOAD };
 // 0: valid; 1: malformed; 2: missing coin (encoding phase only).
 uint32_t ExchangeTracker(TrackerPhase phase, const std::function<bool(uint32_t)>& read);
@@ -230,13 +254,12 @@ bool ExchangeTranche(std::span<const uint8_t> kinds, uint32_t& work, std::string
 bool ExchangeProfile(bool collateral, const std::function<bool(uint32_t)>& read);
 int ExchangeForcedBody(uint32_t kind, std::span<const unsigned char> body,
     std::span<const unsigned char, 32> chain, std::span<const unsigned char, 16> market);
-int ExchangeAuthority(bool successor, const std::function<bool(uint32_t)>& read);
-bool ExchangeCursors(uint32_t flags, std::span<const uint64_t, 4> fields,
-    uint64_t& forced, uint64_t& deposit, std::string& error);
 bool ExchangeDeriveCursors(uint64_t count, uint32_t flags, uint64_t previous_forced, uint64_t previous_deposit,
     const std::function<int32_t(uint32_t, uint64_t, uint64_t, uint64_t*)>& read,
     uint64_t& forced, uint64_t& deposit, std::string& error);
-bool ExchangeTransition(uint64_t count, const std::function<uint64_t(uint32_t, uint64_t)>& action, std::string& error);
+enum class ExchangeStateWorkflow : uint32_t { AUTHORITY, SUCCESSOR_AUTHORITY, TRACKED_COIN, TRANSITION };
+bool RunExchangeStateWorkflow(ExchangeStateWorkflow kind, uint64_t count,
+    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& action, std::string& error);
 bool ExchangeInbox(std::span<const uint64_t> fields, uint64_t& output, std::string& error);
 std::array<uint64_t, 2> ExchangePending(std::array<uint64_t, 4> fields);
 bool ExchangeTrackSource(bool successor, std::array<uint64_t, 4> fields,
@@ -271,14 +294,6 @@ std::array<unsigned char,32> ExchangeCustodyRoot(uint64_t bundle_length,
 using FingerprintReader = std::function<bool(uint32_t, uint32_t, uint64_t&, const unsigned char*&)>;
 // Profiles: 0 BMM v4, 1 exchange v9, 2 activation. Unknown profiles fail closed.
 std::vector<unsigned char> BmmFingerprint(const FingerprintReader& reader, uint32_t profile = 0);
-// Actions: spend, prepare native coin, publish with normalized height. No Haskell reentry.
-void BmmStoreState(int32_t height, const std::function<void(uint32_t, uint32_t)>& action, bool restore = false);
-void BmmEncodeState(const std::function<void(uint32_t, uint32_t)>& action);
-void BmmPreimage(uint32_t kind, const std::function<void(uint32_t)>& write);
-void BmmSignatureActions(uint32_t plan, const std::function<void(uint32_t)>& action);
-void BmmSignetActions(bool decode, const std::function<void(uint32_t)>& action);
-int BmmSplitSignature(std::vector<unsigned char>& signature);
-std::array<uint32_t, 6> BmmSignetTemplate();
 int64_t BoundedWait(int64_t value, int64_t maximum);
 uint64_t BoundedAppend(uint64_t limit, uint64_t used, int64_t count);
 int64_t BmmDifficultyInterval(int64_t timespan, int64_t spacing);
@@ -287,52 +302,33 @@ void BmmCheckpointPreset(uint32_t mode, std::span<uint32_t, 16> fields,
     std::span<unsigned char, 32> block_hash);
 uint32_t BmmConsensusPreset(uint32_t mode, std::span<uint64_t, 6> fields,
     std::span<unsigned char, 32> pow_limit, std::span<unsigned char, 22> challenge);
-std::array<unsigned char, 32> BmmCommitmentBytes(uint32_t kind, std::span<const unsigned char> payload);
-struct ParentMessage {
-    uint32_t kind, encoding;
-    std::vector<uint16_t> votes;
-};
-ParentMessage ParseParentMessage(std::span<const unsigned char> payload);
 void BmmPrivateTemplate(uint32_t height, uint32_t time, uint32_t median, uint32_t slot,
     std::span<const unsigned char, 32> critical, std::span<uint32_t, 4> fields,
     std::span<unsigned char, 37> commitment);
-bool HasDepositDepth(uint32_t deposit, uint32_t tip, uint32_t required);
 enum class LiveEvidencePhase : uint32_t { NETWORK, CONFIRMATION, CTIP_OUTPUT, CTIP_STATE, SIDECHAIN, DEPOSITS };
 bool BmmState(bool hash, int64_t interval, uint32_t height, uint32_t time, uint32_t bits,
     uint32_t start, uint32_t start_time, uint64_t count, uint32_t latest, std::string& error);
-int32_t BmmHeader(uint32_t facts, std::string& error);
 std::array<uint32_t,2> BmmHeaderLayout(uint32_t version, uint32_t flags);
 bool MerkleReplacement(uint32_t mode, uint32_t index, uint32_t position, uint32_t flags);
-uint32_t BmmSigHashPlan(int32_t hash_type, uint32_t index, uint64_t outputs);
 enum class SignetStep : uint32_t { START, WITNESS, EXTRACT, BUILD, DECODE, MERKLE, COINBASE, VERIFY };
-int32_t SignetValidation(SignetStep step, uint64_t a, uint64_t b, uint64_t c, uint64_t d, std::string& error);
-bool RunSignetValidation(SignetStep start, const std::function<std::array<uint64_t,4>(SignetStep)>& action, std::string& error);
-bool BmmSignatureGate(bool witness, uint64_t size, uint32_t index, uint64_t inputs);
 int32_t BmmActivation(uint32_t phase, uint32_t facts, int64_t height = 0, int64_t activation = 0);
-int64_t BmmRetarget(uint32_t height, int64_t interval, int64_t target, uint32_t time, uint32_t start);
+void RunBmmRetarget(uint32_t height, int64_t interval, int64_t target, uint32_t time, uint32_t start,
+    const NativeWorkflow& native);
 uint32_t BmmMedian(std::span<const uint32_t> times);
-int64_t BmmParentMedian(std::span<const uint32_t> times, std::string& error);
-void BmmScaleTarget(uint64_t factor, uint64_t divisor, std::span<unsigned char, 32> target,
-    std::span<const unsigned char, 32> limit);
 enum class BmmProofPhase : uint32_t { ENVELOPE, BOUNDS, CANONICAL, MERKLE, EXTENSION, PARENT, CRITICAL, BLOCK_BOUNDS, BLOCK_HASH, PRIOR, MERKLE_HASH, POW_TARGET, POW_HASH, COINBASE_PRESENT };
-bool BmmProof(BmmProofPhase phase, uint32_t facts, uint64_t a, uint64_t b, uint64_t c, std::string& error);
-enum class BmmCodecPhase : uint32_t { ENCODE_SIZE, DECODE_SIZE, DECODE_SHAPE, CANONICAL, ATTACH, STATE_ASSET, STATE_PUSH, STATE_DROP, STATE_END, STATE_PAYLOAD, STATE_EXCEPTION };
-bool BmmCodec(BmmCodecPhase phase, uint32_t facts, uint64_t a, uint64_t b, std::string& error);
 enum class BmmTraversalStep : uint32_t {
     START, PREFLIGHT, ENTRY_BOUNDS, MERKLE, COINBASE, EXTENSION, SIGNET, ADVANCE, PARENT, COMMITMENT, CRITICAL,
     BLOCK_START, BLOCK_BOUNDS, BLOCK_HASH, BLOCK_DECODE, BLOCK_PRIOR, BLOCK_PARENT, BLOCK_ENTRIES,
-    INITIALIZE_ENTRIES, PUBLISH_ENTRIES, PREPARE_ENTRY
+    INITIALIZE_ENTRIES, PUBLISH_ENTRIES, PREPARE_ENTRY,
+    PARENT_START, PARENT_COINBASE, PARENT_EXTRACT,
+    VALID_STATE = 147, EXTEND_PARENT = 150, EXTEND_BITS, EXTEND_TIME,
+    POW_TARGET = 154, POW_HASH, RESET_ENTRY = 200, DECODE_COINBASE,
+    DECODE_MERKLE, CANONICAL_COINBASE, CANONICAL_MERKLE, COINBASE_SHAPE
 };
-int32_t BmmTraversal(BmmTraversalStep step, uint64_t a, uint64_t b, std::string& error);
-bool RunBmmTraversal(BmmTraversalStep start, const std::function<std::array<uint64_t,2>(BmmTraversalStep)>& action, std::string& error);
-// Fields: height, time, bits, period height/time, then eleven recent times.
-void BmmAdvance(int64_t interval, uint32_t time, uint32_t bits, std::span<uint32_t, 16> fields);
-int32_t BmmStateSource(uint32_t phase, uint32_t facts, const std::string& state_error, std::string& error);
 enum class BmmLifecyclePhase : uint32_t {
     CONNECT_KIND, NATIVE_STATE, CONNECT_CHECKPOINT, INITIALIZE, REQUIRED, INCOMPLETE,
     DISCONNECT_KIND, REMOVE_CHECKPOINT, REMOVED, DISCONNECT_PROOF, LOAD_CURRENT, RESTORE
 };
-int32_t BmmLifecycle(BmmLifecyclePhase phase, uint32_t facts, const std::string& state_error, std::string& error);
 enum class BmmStateStep : uint32_t {
     CONNECT_START, CONNECT_KIND, NATIVE_HEADER, NATIVE_STATE, CHECKPOINT, INITIALIZE, STORE_INITIAL,
     REQUIRED, INCOMPLETE, EFFECTIVE, VERIFY, STORE_NEXT, DISCONNECT_START, DISCONNECT_KIND,
@@ -359,7 +355,6 @@ enum class BmmStateStep : uint32_t {
     NATIVE_CHECK_START, NATIVE_CHECK_PROOF, NATIVE_CHECK_LOOKUP, NATIVE_CHECK_RESULT,
     PARENT_SIGNATURE_START, PARENT_SIGNATURE_GATE, PARENT_SIGNATURE_ENCODING, SIGNATURE_MODE
 };
-int32_t BmmStateFlow(BmmStateStep step, int32_t reply);
 bool RunBmmStateFlow(BmmStateStep start, const std::function<int32_t(BmmStateStep)>& action);
 enum class PegEventKind : uint32_t { LIFECYCLE, DEPOSIT_NUMBERS, STATUS };
 enum class EventIdentityKind : uint32_t { BUNDLE, DEPOSIT, WITHDRAWAL, L1_DEPOSIT, L1_WITHDRAWAL };
@@ -390,7 +385,6 @@ struct DepositRouting { DepositRoute route; uint32_t expected_stack_size; };
 DepositRouting SelectDepositRoute(uint64_t count, bool legacy_marker, bool native_marker, bool configured_slot);
 OutputTotalMode SelectOutputTotalMode(bool deferred, bool per_asset, bool explicit_asset);
 bool RejectParentResult(bool invalid, bool unavailable);
-bool ParentReplayTip(const std::function<bool(uint32_t)>& read);
 enum class ReplayStoreFlow : uint32_t {
     READ_RECORD, LOAD, LOAD_PREFLIGHT, RESET_PREFLIGHT, RESET,
     READ_PREFLIGHT, OCCURRENCE_PREFLIGHT, DEPOSIT, EDGE, WITHDRAWAL, OCCURRENCE, APPEND, IDENTITY,
@@ -426,9 +420,12 @@ enum class ReplayStoreFlow : uint32_t {
     , STARTUP_PARENT_LOAD, STARTUP_PARENT_VERIFY, STARTUP_BUNDLE
     , CONTEXTUAL_HEADER, CONTEXTUAL_OUTPUTS, CANDIDATE_SELF_CHECK
     , BRANCH_CHOICE, STARTUP_RECONCILE, EXCHANGE_PARENT
-    , FINAL_BMM, BMM_FAILURE, BOND_TREE
+    , FINAL_BMM, BMM_FAILURE, BOND_TREE, BLOCK_REPLAY_COMPOSED, BLOCK_REPLAY_PRELUDE
+    , RPC_CREDENTIALS_COMPOSED, RPC_TIMEOUT_COMPOSED
+    , RPC_CALL, RPC_CALL_CHECKED
+    , CACHE_INITIALIZE, RECOVERY_COMPOSED
 };
-uint32_t ParentReplayStore(ReplayStoreFlow kind, const std::function<uint32_t(uint32_t)>& action);
+uint32_t ParentReplayStore(ReplayStoreFlow kind, const std::function<int64_t(uint32_t)>& action);
 // Condition, true branch, false branch; only the selected branch is evaluated.
 bool ParentReplayChoose(const std::array<std::function<bool()>,3>& actions);
 // Bind lazy facts; Haskell owns their order, short-circuiting and acceptance.
@@ -450,21 +447,14 @@ uint32_t PeerRejectionStrikes(bool complete, bool same_edge, uint32_t count);
 uint32_t NextExtraNonce(bool same_parent, uint32_t current);
 int32_t NextBlockHeight(bool present, int32_t height);
 int32_t ExchangeTrackerHeight(bool previous, int32_t height);
-uint32_t ReplayDistance(uint32_t upper, uint32_t lower);
 uint64_t NextBondContextHeight(int32_t height);
 bool ApprovingParentHeight(int64_t parent, uint64_t& successor);
-bool ChildBehind(int64_t child, int64_t parent);
 int BmmRewardAddress(const std::function<bool(uint32_t)>& read);
 bool BmmWait(const std::function<int32_t(uint32_t)>& action);
-int BmmSubmit(int64_t bid, int64_t maximum, const std::function<int64_t(uint32_t,uint64_t)>& action);
 bool BmmProduction(bool ecx, const std::function<bool(uint32_t)>& action);
-bool BmmSyncTick(const std::function<bool(uint32_t)>& action);
-bool ParentRpcAddress(uint32_t family, uint32_t ipv4, std::span<const unsigned char> ipv6 = {});
+bool BmmSyncTick(int64_t parent, int64_t child, const std::function<bool(uint32_t)>& action);
 void BmmProofBuild(uint64_t previous, int64_t parent, const std::function<bool(uint32_t,uint64_t)>& action);
-void DepositCtipSearch(uint64_t count, const std::function<int32_t(uint32_t,uint64_t)>& action);
-void DepositHeaders(uint64_t first, int64_t tip, const std::function<bool(uint32_t,uint64_t)>& action);
-void DepositBuild(int64_t sequence, int64_t height, uint32_t flags, const std::function<bool(uint32_t)>& action);
-int64_t PreviousDepositSequence(int64_t current);
+void ConstructDepositEvidence(int64_t sequence, int64_t height, uint32_t flags, int32_t slot, const NativeWorkflow& native);
 void DepositVerify(uint64_t index, uint64_t inputs, uint64_t witnesses, const std::function<bool(uint32_t)>& action);
 bool FeeAsset(const std::optional<std::string>& configured, bool canonical,
     std::span<const unsigned char,32> pegged, std::span<unsigned char,32> output, std::string* error);
@@ -491,14 +481,8 @@ bool ParentReplayEach(Range&& range, Action&& action)
         [&] { return bool(action(*entry)); }, [&] { ++entry; });
 }
 using PegFields = int32_t (*)(void*, uint32_t, int64_t*);
-bool ExtractSignet(PegFields step, void* context);
-using BmmScript = int32_t (*)(void*, uint32_t, uint32_t, int64_t*);
-int64_t BmmCommitment(uint32_t kind, int32_t slot, uint32_t count, BmmScript read, void* context, std::string& error);
 bool LiveEvidence(LiveEvidencePhase phase, PegFields read, void* context,
     const std::string& parse_error, std::string& error);
-bool LegacyCheckpoint(bool eligible, const unsigned char* txid, const unsigned char* previous,
-    uint32_t vout, std::vector<unsigned char>& record);
-bool LegacyClaim(bool decoded, bool destination_valid, int64_t actual, int64_t expected, std::string& error);
 bool DepositPreflight(uint32_t rule, int64_t amount, int64_t bound);
 // 0: confirmed broadcast, 1: mempool broadcast, 2: fatal CTIP lookup failure.
 bool DepositMessageMatches(uint32_t kind, const std::string& message);
@@ -507,38 +491,10 @@ uint64_t CountMatches(uint64_t count, const std::function<bool(uint64_t)>& match
 enum class MatchResult { UNIQUE, MISSING, DUPLICATE };
 MatchResult FindUniqueMatch(uint64_t count, const std::function<bool(uint64_t)>& matches, uint64_t& index);
 int DepositMatch(int64_t slot, int64_t amount, int64_t bound, bool has_address, const std::function<int64_t(uint32_t)>& fact);
-int ReplayUpvote(std::span<const unsigned char> hashes, std::span<const unsigned char,32> target, std::span<uint16_t> votes);
-bool ReplayAlarm(std::span<uint16_t> votes);
-int64_t ReplayLeading(std::span<const unsigned char> hashes, std::span<uint16_t> votes);
-// 0: unchanged, 1: upvote, 2: alarm, 3: absent vote index.
-int ReplayExplicit(uint16_t vote, std::span<const unsigned char> hashes, std::span<uint16_t> votes);
-int ExpireProposals(uint64_t count, uint32_t height, uint32_t threshold, uint32_t max_age,
-    const std::function<int64_t(uint32_t)>& action);
-int ExpireWithdrawals(uint64_t count, uint32_t height, uint32_t max_age,
-    const std::function<int64_t(uint32_t)>& action);
-int CtipOwners(uint64_t count, uint64_t maximum, const std::function<int64_t(uint32_t)>& action);
-int CtipSpends(uint64_t count, const std::function<int32_t(uint32_t,uint64_t)>& action);
-int CtipOutputs(uint64_t count, uint64_t maximum, const std::function<int64_t(uint32_t,uint64_t)>& action);
-int CtipReplacements(uint64_t count, const std::function<int32_t(uint32_t)>& action);
-int CtipChanges(uint64_t count, const std::function<int64_t(uint32_t)>& action);
-int M5Deposit(int64_t old_value, int64_t new_value, uint64_t maximum, uint64_t output, uint64_t outputs,
-    uint32_t flags, const std::function<int64_t(uint32_t,uint64_t)>& action);
-void PruneSlots(uint64_t count, const std::function<int64_t(uint32_t)>& action);
-bool BlockPublish(uint32_t flags, const std::function<int32_t(uint32_t)>& action);
-std::vector<unsigned char> ActiveSlots(std::span<const unsigned char> entries);
+enum class ReplayMaintenance : uint32_t { BEFORE_TREASURY, AFTER_TREASURY };
 int M6Id(uint64_t outputs, uint64_t inputs, int64_t previous, int64_t maximum, bool has_slot,
     const std::function<int64_t(uint32_t,uint64_t)>& action);
-int M3Proposal(const std::function<int64_t(uint32_t,uint64_t)>& action);
-int M8Acceptance(uint64_t count, const std::function<int64_t(uint32_t,uint64_t)>& action);
-int M4Repeat(bool upvote, const std::function<int64_t(uint32_t)>& action);
-int CoinbaseMessages(uint64_t count, const std::function<int64_t(uint32_t,uint64_t)>& action);
-int M2Proposal(uint32_t height, uint16_t unused_age, uint16_t unused_threshold,
-    uint16_t used_age, uint16_t used_threshold, const std::function<int64_t(uint32_t,uint64_t)>& action);
-int M4Mode(uint32_t flags, uint64_t votes, const std::function<int64_t(uint32_t)>& action);
-int M6Withdrawal(uint64_t decreases, uint64_t changes, uint64_t inputs, uint32_t threshold, bool single,
-    const std::function<int64_t(uint32_t)>& action);
 using DestinationInspect = int32_t (*)(void*, uint32_t, uint32_t);
-bool DepositDestination(std::size_t count, DestinationInspect inspect, void* context, std::string& error);
 enum class DepositStatePhase : uint32_t {
     CHECK_CHECKPOINT, CHECK_PRIOR, CONNECT_PRIOR, DISCONNECT_PRESENT,
     DISCONNECT_CHECKPOINT, DISCONNECT_CURRENT, CHECK_CHECKPOINT_ANCHOR, CHECK_ANCHOR,
@@ -562,27 +518,26 @@ enum class DepositVerifyStep : uint32_t {
     CLAIM_START, CLAIM_WITNESS, CLAIM_DESTINATION, CLAIM_VERIFY, CLAIM_PUBLISH,
     CTIP_READ_START, CTIP_READ_PRESENT, CTIP_READ_DECODE, CTIP_READ_ERROR_TARGET, CTIP_READ_ERROR, CTIP_READ_PUBLISH,
 };
-bool RunDepositVerification(const std::function<bool(DepositVerifyStep)>& action, bool anchor = false);
-bool RunDepositLifecycle(const std::function<bool(DepositVerifyStep)>& action, bool disconnect);
-bool RunDepositParsing(const std::function<bool(DepositVerifyStep)>& action);
-void RunCtipInputScan(const std::function<bool(DepositVerifyStep)>& action);
-bool RunDepositAuthentication(const std::function<bool(DepositVerifyStep)>& action);
-bool RunCheckpointLookup(const std::function<bool(DepositVerifyStep)>& action);
-bool RunLegacyClaim(const std::function<bool(DepositVerifyStep)>& action);
-bool RunCtipRead(const std::function<bool(DepositVerifyStep)>& action);
-void DepositTransactionFacts(const std::function<uint64_t(uint32_t)>& read);
-bool DepositState(DepositStatePhase phase, bool present, bool matches,
+enum class DepositWorkflow : uint32_t { VERIFY = 0, ANCHOR = 11, CONNECT = 19, DISCONNECT = 27 };
+uint32_t DepositStateFacts(bool present, bool matches, const std::string& decode_error);
+bool RunDepositStateWorkflow(DepositWorkflow kind, const std::function<uint32_t(DepositVerifyStep)>& action,
     const std::string& decode_error, std::string& error);
+bool RunDepositAuthentication(const std::function<bool(DepositVerifyStep)>& action);
+bool RunCtipRead(const std::function<bool(DepositVerifyStep)>& action);
 using TransactionHash = int32_t (*)(const unsigned char*, uint32_t, unsigned char*);
 using EvidenceDecode = int32_t (*)(void*, int64_t*);
-uint32_t CtipScript(const std::function<int32_t(uint32_t)>& read);
-bool PersistedCtip(uint32_t facts, int64_t amount, uint32_t script,
+enum class DepositClaimWorkflow : uint32_t { CHECKPOINT, LEGACY, TRANSACTION };
+bool RunDepositClaim(DepositClaimWorkflow kind, uint64_t inputs, uint64_t index, uint64_t witnesses,
+    uint64_t outputs, std::span<const std::vector<unsigned char>> stack, const unsigned char* asset,
+    const unsigned char* genesis, const unsigned char* prevout, TransactionHash hash_transaction,
+    const NativeWorkflow& native, std::string& error);
+bool ReadPersistedCtip(uint32_t facts, int64_t amount, const std::function<int32_t(uint32_t)>& read,
     EvidenceDecode decode, void* context, std::string& error);
 using ParentHeaderCheck = int32_t (*)(void*, uint32_t);
-bool DepositInclusion(uint32_t facts, uint64_t matches, uint32_t headers,
-    ParentHeaderCheck check_header, void* context, std::string& error);
-bool DepositCtip(uint32_t facts, uint64_t matches, int64_t current, int64_t previous,
-    int64_t witnessed, std::string& error);
+bool ParseDeterministicDeposit(uint64_t inputs, uint64_t index, uint64_t witnesses,
+    std::span<const std::vector<unsigned char>> stack, const unsigned char* asset,
+    const unsigned char* genesis, const unsigned char* prevout, TransactionHash hash_transaction,
+    EvidenceDecode decode, void* context, const NativeWorkflow& native, std::string& error);
 // Callbacks are synchronous upstream codec adapters; no pointer may escape.
 bool DepositEvidence(std::span<const std::vector<unsigned char>> stack, const unsigned char* prevout,
     TransactionHash hash_transaction, EvidenceDecode decode, void* context, std::string& error);
@@ -591,38 +546,24 @@ bool DepositEvidence(std::span<const std::vector<unsigned char>> stack, const un
 int32_t DepositWitness(std::span<const std::vector<unsigned char>> stack, uint32_t mode,
     const unsigned char* asset, const unsigned char* genesis, const unsigned char* prevout,
     TransactionHash hash_transaction, int64_t& value);
-bool DepositOutputs(uint32_t facts, int64_t value, std::span<const unsigned char> inputs,
-    std::span<const unsigned char> flags, std::span<const int64_t> amounts, std::string& error);
-bool AuthenticatedDeposit(uint64_t inputs, uint64_t index, uint64_t witnesses, uint32_t facts,
-    int64_t claimed, int64_t witnessed, uint64_t outputs, const std::array<unsigned char, 2>& flags,
-    const std::array<int64_t, 2>& amounts, std::string& error);
+enum class NativeRecipient : uint32_t { DECODE, ENCODE, CONSTRUCT };
+bool RunNativeRecipient(NativeRecipient kind, int64_t amount, std::string_view source, const NativeWorkflow& native);
+bool CheckNativeDeposit(const CTransaction& tx, uint64_t index, bool canonical,
+    const unsigned char* asset, const unsigned char* genesis, TransactionHash hash_transaction,
+    const NativeWorkflow& native, std::string& error);
 // -1 means invalid script; 0..255 is the decoded slot.
 int32_t TreasurySlot(uint32_t script, uint32_t opcode);
 bool TreasuryMatches(std::span<const unsigned char> script, uint32_t opcode, int32_t expected);
 // Positive payout, or -1 (burn), -2 (fee), -3 (burn <= fee).
-int64_t WithdrawalPayout(int64_t burn, int64_t fee, int64_t maximum_money);
 enum class WithdrawalOp : uint32_t {
     BUILD_SCRIPT = 1, PARSE_SCRIPT, BUILD_REFERENCE, PARSE_REFERENCE, LEGACY_FRAME,
     DECODE_FEE, ENCODE_FEE, BUILD_OUTPUT, PARSE_OUTPUT, BUILD_M6, PARSE_M6, EXTRACT_ETHEREUM_CLAIM, STATE_ANCHOR, WALLET_BUNDLE, WALLET_ANCHOR, STATE_MARKER, WALLET_TRANSPORT, RPC_FEE, EVENT_POLICY, BUNDLE_ADMISSION, NATIVE_AMOUNT, PARENT_DUST, NATIVE_GUARD, NATIVE_GUARD_RESULT, INPUTS_COMMITMENT, NATIVE_PAYOUT, NATIVE_BURN_PLAN, NATIVE_OUTPUT_SELECTION,
     JOURNAL_ADMISSION, PARENT_POLICY, RPC_ADMISSION, SUBMISSION_POLICY, PROOF_BOUNDS, JOURNAL_LEGACY, JOURNAL_IDENTITY,
 };
-struct WithdrawalBundlePlan { int64_t payout; std::vector<unsigned char> fee_script, inputs, marker;
-    int32_t version; std::vector<unsigned char> outputs; };
-struct WithdrawalAnchorError : std::invalid_argument { using std::invalid_argument::invalid_argument; };
-// Construction must not reenter Haskell; returned bytes live until this call returns.
-std::vector<unsigned char> BuildWithdrawalBundle(int64_t amount, int64_t fee, uint64_t script_size,
-    bool known_outpoint, const std::function<const std::vector<unsigned char>&(const WithdrawalBundlePlan&)>& build);
-std::vector<unsigned char> BuildWithdrawalBundle(int64_t amount, int64_t fee, uint64_t script_size,
-    bool known_outpoint, const std::function<const std::vector<unsigned char>&(const WithdrawalBundlePlan&)>& build,
-    std::span<const unsigned char> context, std::span<const unsigned char> anchor_context = {});
 std::vector<unsigned char> WithdrawalTransport(std::span<const unsigned char> transaction, bool strip_marker = false);
-int64_t WithdrawalRpcFee(int64_t amount, int64_t fee);
 struct WithdrawalEventDecision { uint8_t rejection; bool clear; };
-WithdrawalEventDecision ClassifyWithdrawalEvent(std::string_view status);
 struct WithdrawalBundleAdmission { bool begin; bool clear; };
 WithdrawalBundleAdmission AdmitWithdrawalBundle(bool busy, const unsigned char* current, const unsigned char* requested);
-std::vector<unsigned char> WithdrawalAnchorPayload(uint32_t height,
-    const std::array<const unsigned char*, 4>& commitments, bool wallet = false);
 bool WithdrawalBytes(WithdrawalOp op, std::span<const unsigned char> input,
                      std::vector<unsigned char>& output, std::string* error);
 } // namespace drivechain::haskell

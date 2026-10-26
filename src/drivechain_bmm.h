@@ -13,12 +13,14 @@
 #include <haskell/bmm_constants.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
 class CBlockIndex;
 class CCoinsView;
 class CCoinsViewCache;
+class VectorWriter;
 namespace Sidechain::Bitcoin { class CTransaction; struct CMutableTransaction; class CBlockHeader; class CTxOut; }
 
 namespace drivechain {
@@ -40,13 +42,16 @@ private:
     const Mode m_mode;
 };
 
-int BitcoinWitnessCommitmentIndex(const std::vector<Sidechain::Bitcoin::CTxOut>& outputs);
 bool ExtractTaggedParentCommitment(const std::vector<CTxOut>& outputs, uint256& parent, std::string& error);
 // Call with fresh transactions; native serialization follows Haskell action plans.
-void BuildBitcoinSignetTransactions(const CScript& challenge,
-    Sidechain::Bitcoin::CMutableTransaction& spend, Sidechain::Bitcoin::CMutableTransaction& sign);
-std::vector<unsigned char> BitcoinSignetBlockData(const Sidechain::Bitcoin::CBlockHeader& header,
-    const uint256& modified_merkle_root);
+// Native object/codec effects shared by standalone and composed Signet workflows.
+void BitcoinSignetTransactionAction(uint32_t action, std::span<const unsigned char> fields,
+    const CScript& challenge, Sidechain::Bitcoin::CMutableTransaction& spend,
+    Sidechain::Bitcoin::CMutableTransaction& sign);
+void BitcoinSignetDataAction(uint32_t field, const Sidechain::Bitcoin::CBlockHeader& header,
+    const uint256& modified_merkle_root, VectorWriter& writer);
+std::vector<unsigned char> BitcoinWitnessCommitmentNative(
+    const std::vector<Sidechain::Bitcoin::CTxOut>& outputs, int& selected, uint32_t step, uint64_t index);
 
 // Bitcoin witness-v0 preimage for the zero-valued synthetic signet spend.
 // The caller must supply an existing input index.

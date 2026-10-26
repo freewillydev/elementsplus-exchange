@@ -20,6 +20,9 @@ def unused_port():
 
 
 def check_daemon(binary, directory, certs, enforcer_port, calls):
+    class RpcWarmup(Exception):
+        pass
+
     invalid = subprocess.run([str(binary), "-version"],
         env=dict(os.environ, ELEMENTS_DAEMON_PIPE="-1"), capture_output=True, timeout=5)
     assert invalid.returncode != 0 and b"Invalid daemon initialization pipe" in invalid.stderr
@@ -68,6 +71,8 @@ def check_daemon(binary, directory, certs, enforcer_port, calls):
                         reply = json.load(response)
                 except urllib.error.HTTPError as error:
                     reply = json.load(error)
+                if reply["error"] and reply["error"].get("code") == -28:
+                    raise RpcWarmup(reply["error"]["message"])
                 assert reply["error"] is None, reply
                 return reply["result"]
 
@@ -79,7 +84,7 @@ def check_daemon(binary, directory, certs, enforcer_port, calls):
                     try:
                         assert rpc("getblockcount") == 0
                         break
-                    except (OSError, ValueError):
+                    except (OSError, ValueError, RpcWarmup):
                         time.sleep(0.1)
                 else:
                     raise AssertionError("daemon RPC did not become ready")

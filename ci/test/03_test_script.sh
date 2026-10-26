@@ -56,11 +56,24 @@ echo "=== END env ==="
 EOF
 )
 
+QA_ASSETS_REVISION=$(cat "${BASE_ROOT_DIR}/ci/qa-assets-revision")
+if [[ ! "$QA_ASSETS_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Invalid pinned qa-assets revision" >&2
+  exit 1
+fi
+if [ "$RUN_FUZZ_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
+  # Cached Git hooks/config and cached output symlinks are not trusted inputs.
+  export DIR_QA_ASSETS
+  DIR_QA_ASSETS=$(mktemp -d "${BASE_SCRATCH_DIR}/qa-assets.XXXXXX")
+fi
 if [ "$RUN_FUZZ_TESTS" = "true" ]; then
+  git init --template= "${DIR_QA_ASSETS}"
+  ${CI_RETRY_EXE} git -C "${DIR_QA_ASSETS}" fetch --depth=1 https://github.com/ElementsProject/qa-assets "$QA_ASSETS_REVISION"
+  git -C "${DIR_QA_ASSETS}" checkout --detach FETCH_HEAD
+  test "$(git -C "${DIR_QA_ASSETS}" rev-parse HEAD)" = "$QA_ASSETS_REVISION"
+  # Refuse a modified cache rather than silently testing unauthenticated bytes.
+  test -z "$(git -C "${DIR_QA_ASSETS}" status --porcelain --untracked-files=all)"
   export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_corpora/
-  if [ ! -d "$DIR_FUZZ_IN" ]; then
-    ${CI_RETRY_EXE} git clone --depth=1 https://github.com/ElementsProject/qa-assets "${DIR_QA_ASSETS}"
-  fi
   (
     cd "${DIR_QA_ASSETS}"
     echo "Using qa-assets repo from commit ..."
@@ -68,10 +81,12 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
   )
 elif [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
   export DIR_UNIT_TEST_DATA=${DIR_QA_ASSETS}/unit_test_data/
-  if [ ! -d "$DIR_UNIT_TEST_DATA" ]; then
-    mkdir -p "$DIR_UNIT_TEST_DATA"
-    ${CI_RETRY_EXE} curl --location --fail https://github.com/ElementsProject/qa-assets/raw/master/unit_test_data/script_assets_test.json -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
-  fi
+  mkdir -p "$DIR_UNIT_TEST_DATA"
+  # Unit tests need one file, not the much larger fuzz corpus. Refresh a cached
+  # file from the pinned commit rather than trusting an existing mutable cache.
+  ${CI_RETRY_EXE} curl --location --fail --proto '=https' --proto-redir '=https' \
+    "https://raw.githubusercontent.com/ElementsProject/qa-assets/${QA_ASSETS_REVISION}/unit_test_data/script_assets_test.json" \
+    -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
 fi
 
 if [ "$USE_BUSY_BOX" = "true" ]; then

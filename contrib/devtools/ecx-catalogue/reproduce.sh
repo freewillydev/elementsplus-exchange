@@ -64,4 +64,4 @@ ecx_compile semantics EcxPrimitiveCandidateTests.hs
 ./semantics
 cmp jet-identities.tsv "$ecx_tool_dir/jet-identities.tsv"
 python3 "$ecx_tool_dir/generate.py" --upstream-generated "$ecx_work/derived"
-printf '%s\n' 'PASS: fresh pinned Haskell build reproduces all 24 published identities and C/Rust bindings.'
+printf '%s\n' 'PASS: fresh pinned Haskell build reproduces all 25 published identities and C/Rust bindings.'

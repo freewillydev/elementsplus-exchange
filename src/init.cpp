@@ -61,6 +61,7 @@
 #include <node/chainstate.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
+#include <node/drivechain_deposits.h>
 #include <node/drivechain_withdrawal_bundle.h>
 #include <node/ecx_deployment_identity.h>
 #include <node/interface_ui.h>
@@ -853,7 +854,12 @@ static std::unique_ptr<CBlockTemplate> CreateDrivechainBlockTemplate(NodeContext
         options.commit_scripts = commitments;
         options.authenticated_parent_height = authenticated_parent_height;
         result = BlockAssembler(node.chainman->ActiveChainstate(),node.mempool.get(),options).CreateNewBlock();
-        return bool(result);
+        if (!result) return 0;
+        if (result->block.vtx.size() > 1) return 2;
+        // Only pay for transactions actually selected, not just a nonempty mempool.
+        LogDebug(BCLog::MEMPOOL, "drivechain L1 block sync: idle; no mempool transactions selected for a block\n");
+        result.reset();
+        return 1;
     }
     case 4: LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n",parent_height); break;
     default: throw std::logic_error("invalid template creation action");
@@ -983,8 +989,8 @@ static bool MineEcxBlockForParentBlock(NodeContext& node, const int64_t parent_h
     return bool(block_template);
     case 6:
     sidechain_fees = -block_template->vTxFees[0];
-    return drivechain::haskell::BmmWorkTotal(false,block_template->block.vtx.size(),
-        [&](uint64_t index) { return GetSimplicityValidationMilliweight(*block_template->block.vtx.at(index)); },
+    return drivechain::haskell::MeasureWork(false,block_template->block.vtx.size(),
+        [&](uint64_t index) -> const CTransaction& { return *block_template->block.vtx.at(index); },
         simplicity_milliweight);
     case 16:
     return drivechain::haskell::BmmWorkQuoteDisplay(
@@ -1061,27 +1067,21 @@ static void DrivechainL1BlockSyncTick(NodeContext& node)
         case 1: return !ShutdownRequested(node);
         case 2: return Params().GetConsensus().elements_mode;
         case 3: return Params().GetConsensus().has_parent_chain;
-        case 4: return gArgs.GetBoolArg("-drivechainl1blocksync", true);
+        case 4: return IsDrivechainAutomaticBiddingEnabled(gArgs);
         case 5: return Params().GetConsensus().drivechain_slot.has_value();
         default: throw std::logic_error("invalid sync preflight action");
         }
     })) return;
 
     try {
-        int64_t parent_height = 0;
+        const int64_t parent_height = GetMainchainBlockHeight();
         int side_height = 0;
-        drivechain::haskell::BmmSyncTick([&](uint32_t stage) {
-        switch (stage) {
-        case 1:
-            parent_height = GetMainchainBlockHeight();
-            return true;
-        case 2: {
+        {
             LOCK(cs_main);
             side_height = node.chainman ? node.chainman->ActiveChain().Height() : 0;
-            return true;
         }
-        case 3:
-            return drivechain::haskell::ChildBehind(side_height, parent_height);
+        drivechain::haskell::BmmSyncTick(parent_height, side_height, [&](uint32_t stage) {
+        switch (stage) {
         case 4: {
             const uint256 parent_hash = GetMainchainBlockHash(parent_height);
             return MineOneBlockForParentBlock(node, parent_height, parent_hash);
@@ -1804,7 +1804,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-mainchainrpccookiefile=<file>", "Cookie for the fully validating parent node. Relative paths resolve under Bitcoin's data directory. Native Elements uses the frozen mainnet-ancestry parent (default: .cookie), not historical LayerTwoLabs Signet.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpccredentialfile=<file>", "Explicit absolute path to an owner-only POSIX username:password file for a numeric-loopback parent RPC bridge. Mutually exclusive with cookie and inline credential options. Never interprets static credentials as a rotating cookie.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. Native drivechain validation requires 1..2 seconds because these requests may run on consensus paths. (ordinary-network default: %d; drivechain default: 2)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-acceptbetanettestprofile", "Acknowledge that this Betanet-only child uses an existing slot-24 proposal that does not commit its genesis or current rules. Required for this test profile; does not enable spending or permit other proposals. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksync", "Opt in to automatic bids for sidechain blocks containing selected mempool transactions using the explicitly funded -drivechainbmmwallet. Empty candidates do not trigger bids. Bid settings are per-transaction limits, NOT a lifetime budget; use a dedicated wallet with a bounded balance and no automatic refill. Already-submitted bids can still be mined after disabling. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainautodeposit", "Automatically import confirmed native sidechain deposits for all recipients, including external wallets. Fee-free unless L1 explicitly commits an Elements fee; no spending keys required. Uses the authenticated parent index every 30 seconds, independently of block bidding. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the explicit parent RPC wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -1813,7 +1815,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-drivechainenforcerremote", "Allow a remote miner-operated enforcer endpoint. Requires mTLS credentials; does not start a local enforcer or change bid funding/consensus rules (default: 0).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmwallet=<name>", "Explicit parent Bitcoin RPC wallet used to fund and sign BMM requests. Must already exist and be funded. No default wallet or enforcer-wallet fallback.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainpegoutenforcer=<host:port>", "Deprecated compatibility assertion; if supplied, must exactly match -drivechainbmmgrpcaddr.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainpegoutmainfeesats=<sats>", strprintf("Positive L1 fee for historical ECX withdrawals only (default: %d). Must be less than the withdrawal amount; native withdrawals use their RPC fee parameter.", DEFAULT_DRIVECHAIN_PEGOUT_MAIN_FEE_SATS), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainpegoutmainfeesats=<sats>", "Deprecated and unused: the historical ECX burn-and-submit RPC is disabled. Native withdrawals use their RPC fee parameter.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainrewardaddress=<address>", "Unconfidential P2PKH/P2WPKH address owned by a loaded private-key-enabled Elements wallet, paid the automatic BMM candidate's fees and subsidy. Required for automatic bidding; absent, invalid, or unowned addresses pause bidding without stopping the node. No anyone-can-spend fallback. This does not refund the mainchain bid.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmwalletaddr=<host:port>", "Deprecated compatibility assertion; must exactly match -drivechainbmmgrpcaddr. All enforcer calls require mTLS.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmconnectauthcookie=<file>", "Unsupported legacy transport option. Remove and configure enforcer mTLS credentials instead.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
@@ -2024,6 +2026,19 @@ std::set<BlockFilterType> g_enabled_filter_types;
     std::terminate();
 };
 
+bool IsDrivechainAutomaticBiddingEnabled(const ArgsManager& args)
+{
+    return args.GetBoolArg("-drivechainl1blocksync", false);
+}
+
+bool CheckDrivechainTestProfileOptIn(const ArgsManager& args, std::string* error)
+{
+    if (!ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE ||
+        args.GetBoolArg("-acceptbetanettestprofile", false)) return true;
+    if (error) *error = "Set -acceptbetanettestprofile=1 only for Betanet testing. The existing slot-24 proposal does not commit this child's genesis or replay-v5 rules. This is not a production eCash network.";
+    return false;
+}
+
 bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
 {
     // ********************************************************* Step 1: setup
@@ -2032,13 +2047,17 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
     // startup identities for this binary.
 #ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
     std::string identity_error;
-    const char* reason = "This binary only supports the canonical -chain=elements production network";
-    if (!drivechain::haskell::ParentReplayAll<3>({
+    const char* reason = "This binary only supports the built-in -chain=elements Betanet test network";
+    if (!drivechain::haskell::ParentReplayAll<4>({
         [&] { return drivechain::haskell::NetworkSelectionStatus(
             drivechain::haskell::NetworkSelection::PRODUCTION, args.GetChainName()) == 0; },
         [&] {
-            reason = "Refusing to start with a noncanonical Elements production identity: ";
+            reason = "Refusing to start with a noncanonical Elements Betanet identity: ";
             return IsCanonicalElementsProductionIdentity(Params(), BaseParams(), &identity_error);
+        },
+        [&] {
+            reason = "Refusing implicit use of the existing-proposal test profile: ";
+            return CheckDrivechainTestProfileOptIn(args, &identity_error);
         },
         [&] {
             reason = "Refusing to start with an incompatible USDD SP1 verifier: ";
@@ -2082,26 +2101,38 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
     return true;
 }
 
-bool IsMainchainRPCHostAllowed(const std::string& host,
-                               const bool native_drivechain)
+std::vector<unsigned char> ParentRpcHostSnapshot(const std::string& host)
+{
+    const auto address = LookupHost(host, /*fAllowLookup=*/false);
+    if (!address) return {0};
+    if (address->IsIPv4()) {
+        // GetAddrBytes() uses addr-v1 encoding for IPv4, not its canonical value.
+        std::vector<unsigned char> bytes(5, 4);
+        WriteLE32(bytes.data() + 1, address->GetLinkedIPv4());
+        return bytes;
+    }
+    if (address->IsIPv6()) {
+        auto bytes = address->GetAddrBytes();
+        bytes.insert(bytes.begin(), 6);
+        return bytes;
+    }
+    return {0};
+}
+
+bool IsMainchainRPCHostAllowed(const std::string& host, const bool native_drivechain)
 {
     // Consensus authentication uses HTTP Basic credentials. Until the parent
     // connection supports an authenticated local transport (for example a
     // Unix-domain socket), do not permit even numeric LAN addresses: a network
     // attacker could substitute a fork view while learning the credentials.
-    std::optional<CNetAddr> numeric_address;
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_RPC_HOST,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return native_drivechain;
-        case 2: numeric_address = LookupHost(host, /*fAllowLookup=*/false); return numeric_address.has_value();
-        case 3: return numeric_address->IsIPv4();
-        // IPv4 GetAddrBytes() is the 16-byte addr-v1 serialization, not its canonical value.
-        case 4: return drivechain::haskell::ParentRpcAddress(4, numeric_address->GetLinkedIPv4());
-        case 5: return numeric_address->IsIPv6();
-        case 6: return drivechain::haskell::ParentRpcAddress(6, 0, numeric_address->GetAddrBytes());
-        default: throw std::logic_error("invalid parent RPC host action");
-        }
+    return drivechain::haskell::RunReplayStore(drivechain::haskell::ReplayStoreWorkflow::RPC_HOST,
+        [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+            if (index != 0 || !input.empty()) throw std::logic_error("invalid parent RPC host effect");
+            if (step == 2) return ParentRpcHostSnapshot(host);
+            if (step != 1) throw std::logic_error("invalid parent RPC host action");
+            std::vector<unsigned char> bytes(8);
+            WriteLE64(bytes.data(), native_drivechain);
+            return bytes;
     });
 }
 
@@ -3607,8 +3638,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     //     no further blocks arriving for us to validate.
     // Unfortunately, this unusual case happens in the functional test suite.
     ChainstateManager* pchainman = node.chainman.get();
-    node.reverification_scheduler->scheduleEvery([pchainman, native_drivechain] {
+    node.reverification_scheduler->scheduleEvery([pchainman, native_drivechain, &node,
+        deposit_cursor = std::optional<Sidechain::Bitcoin::COutPoint>{}]() mutable {
         PeriodicChainstateReverification(*pchainman, native_drivechain);
+        if (native_drivechain) node::AutoImportDrivechainDeposits(node, deposit_cursor);
     }, std::chrono::seconds{30});
 
     uiInterface.InitMessage(_("Done loading"));
@@ -3641,7 +3674,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }, DUMP_BANS_INTERVAL);
 
     if (drivechain::haskell::ParentReplayAll<2>({[&] { return Params().GetConsensus().drivechain_slot.has_value(); },
-        [&] { return args.GetBoolArg("-drivechainl1blocksync", true); }})) {
+        [&] { return IsDrivechainAutomaticBiddingEnabled(args); }})) {
         const int64_t interval_seconds = drivechain::haskell::BoundedWait(args.GetIntArg("-drivechainl1blocksyncinterval", 10),INT64_MAX);
         LogPrintf("Starting drivechain L1 block sync thread, interval %d seconds, mined BIP301 BMM enforcement, sidechain slot %d\n",
             interval_seconds,

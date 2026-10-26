@@ -1,5 +1,5 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
-module ExchangeTests (exchangeArithmetic, exchangeAbi, cursorAbi, authorityOrder, forcedAbi, profileOrder, trancheParity, trackerOrder, configurationOrder, headerOrder, parentTarget, connectionOrder, disconnectOrder, availabilityOrder, sourceMarkerAbi, m6Abi, invalidPhaseLazy, envelopeRequirementAbi, checkpointOrder, capitalIdentityAbi, genesisInitializationOrder, deploymentOrder, frozenBoundsAbi, distinctAbi, registryAbi, requiredIdentityOrder, physicalOrder, spendSelection, transactionShapeOrder, genesisFundingAbi, genesisStateAbi, genesisCovenantAbi, tapPreimageAbi, inboxEntryAbi) where
+module ExchangeTests (exchangeArithmetic, exchangeAbi, cursorAbi, authorityOrder, forcedAbi, profileOrder, trancheParity, trackerOrder, configurationOrder, headerOrder, parentTarget, connectionOrder, disconnectOrder, availabilityOrder, sourceMarkerAbi, m6Abi, invalidPhaseLazy, envelopeRequirementAbi, checkpointOrder, capitalIdentityAbi, genesisInitializationOrder, deploymentOrder, frozenBoundsAbi, distinctAbi, registryAbi, requiredIdentityOrder, physicalOrder, spendSelection, transactionShapeOrder, genesisFundingAbi, genesisStateAbi, genesisCovenantAbi, tapPreimageAbi, inboxEntryAbi, transactionAdmissionAbi, publicTransactionAdmissionAbi) where
 
 import Control.Operation.Validation
 import qualified Control.Operation as Operation
@@ -45,9 +45,59 @@ import Drivechain (elements_hs_exchange_append_marker)
 import Drivechain (elements_hs_exchange_sources)
 import Drivechain (elements_hs_exchange_source_admission)
 import Drivechain (elements_hs_exchange_registry_decode)
+import Drivechain (DeriveTransactionAssets, elements_hs_exchange_transaction_admission)
+import BmmConstants (bondFixedSupply)
 
 foreign import ccall "wrapper" makeCustodyHash :: CustodyHash -> IO (FunPtr CustodyHash)
 foreign import ccall "wrapper" makeShapeRead :: (Ptr () -> Word32 -> IO Int32) -> IO (FunPtr (Ptr () -> Word32 -> IO Int32))
+foreign import ccall "wrapper" makeTransactionAssets :: DeriveTransactionAssets -> IO (FunPtr DeriveTransactionAssets)
+
+transactionAdmissionAbi :: Property
+transactionAdmissionAbi = forAll ((,,,) <$> flags 127 <*> flags 31 <*> flags 3 <*> flags 3) $
+  \(inputs,outputs,outputWitnesses,inputWitnesses) -> ioProperty $ do
+    let parts = map B.pack [inputs,outputs,outputWitnesses,inputWitnesses]
+        bytes = B.concat (map (wordLE 8 . fromIntegral . B.length) parts ++ parts)
+        expected = [all (\n -> not (testBit n 0) && testBit n 1) inputs,
+          all (\n -> all (testBit n) [0,1,2]) outputs &&
+          all (\n -> (testBit n 2 || testBit n 3) && (testBit n 4 || testBit n 5)) inputs &&
+          all (==3) outputWitnesses && all (==3) inputWitnesses]
+        call mode dataBytes = B.useAsCStringLen dataBytes $ \(ptr,size) ->
+          elements_hs_exchange_transaction_admission mode (fromIntegral size) (castPtr ptr) 0 0 0 0 nullFunPtr nullPtr
+    results <- mapM (`call` bytes) [0,1]
+    bad <- sequence [call 4 bytes, call 0 (bytes <> B.singleton 0),
+      call 0 (B.replicate 8 255 <> B.drop 8 bytes), call 1 (B.take 31 bytes),
+      elements_hs_exchange_transaction_admission 0 maxBound nullPtr 0 0 0 0 nullFunPtr nullPtr]
+    pure $ conjoin [results === map (\ok -> if ok then 1 else 0) expected, bad === replicate 5 (-1)]
+  where flags limit = resize 40 (listOf (choose (0,limit)))
+
+publicTransactionAdmissionAbi :: Property
+publicTransactionAdmissionAbi = forAll (choose (0,18 :: Int)) $ \mutation -> ioProperty $ do
+  calls <- newIORef (0 :: Int)
+  let asset = B.replicate 32 1; token = B.replicate 32 2
+      issuance = B.singleton (if mutation == 1 then 105 else 104) <>
+        wordLE 8 (if mutation == 2 then bondFixedSupply-1 else bondFixedSupply) <> wordLE 8 1
+      output identity amount flags = B.singleton flags <> identity <> wordLE 8 amount
+      inventory = output asset (if mutation == 3 then bondFixedSupply-1 else bondFixedSupply) (if mutation == 4 then 15 else 7)
+      burn = output token 1 (if mutation == 5 then 7 else 23)
+      extra = if mutation == 6 then output asset 0 7 else B.empty
+      bytes = wordLE 8 1 <> wordLE 8 (if mutation == 6 then 3 else 2) <> wordLE 8 1 <> wordLE 8 1 <>
+        issuance <> inventory <> burn <> extra <> B.pack [if mutation == 7 then 1 else 3,3]
+      derive _ ptr = do
+        before <- peekArray 64 ptr
+        if before /= replicate 64 0 then error "uninitialized transaction asset buffer" else pure ()
+        modifyIORef' calls (+1)
+        pokeArray ptr (B.unpack (asset <> if mutation == 8 then asset else token))
+        pure (if mutation == 9 then -1 else 1)
+      call reader encoded i o b = B.useAsCStringLen encoded $ \(ptr,size) ->
+        elements_hs_exchange_transaction_admission 2 (fromIntegral size) (castPtr ptr) i o b 0 reader nullPtr
+      indices = case mutation of 10 -> (1,0,1); 11 -> (0,0,0); 12 -> (0,0,2); 13 -> (maxBound,0,1); _ -> (0,0,1)
+      body = case mutation of 14 -> B.init bytes; 15 -> bytes <> B.singleton 0; 16 -> B.replicate 8 255 <> B.drop 8 bytes; _ -> bytes
+      early = mutation `elem` [1,2,7,10,11,12,13,14,15,16]
+      expected = if mutation `elem` [9,14,15,16,17] then -1 else if mutation `elem` [0,18] then 1 else 0
+  result <- bracket (makeTransactionAssets derive) freeHaskellFunPtr $ \reader ->
+    let (i,o,b) = indices in call (if mutation == 17 then nullFunPtr else reader) body i o b
+  observed <- readIORef calls
+  pure $ conjoin [result === expected, observed === if early || mutation == 17 then 0 else 1]
 
 inboxEntryAbi :: Property
 inboxEntryAbi = conjoin [inboxEventAbi, inboxStepAbi, bondEntryAbi, markerContextAbi, markerFrameAbi, legacyMarkerFrameAbi, cursorPayloadAbi, custodyReceiptsAbi, annexHeaderAbi, custodyRootOrder, custodyRootAbi, sourceAdmissionOrder, sourceAuthorizationAbi, registryCodecAbi, registryEncodingAbi, appendMarkerAbi, sourceTrackingAbi, sourcePredecessorAbi, stagingEncodingAbi, deploymentEncodingAbi]
@@ -118,7 +168,7 @@ sourcePredecessorAbi = forAll ((,,,,,,) <$> elements [0,1,2] <*> elements [0,1,2
   let encode n = B.unpack (wordBE 8 (fromInteger (n `div` 18446744073709551616)) <> wordBE 8 (fromInteger n))
       input = replicate 32 (if zeroHead then 0 else 1) ++ encode count ++ encode processed
       expected | profile>1 = -1
-               | (profile==1 && proof/=1) || height==0 || parent==0 || zeroHead || count<processed = 1
+               | (profile==1 && proof `notElem` [1,2]) || height==0 || parent==0 || zeroHead || count<processed = 1
                | profile==0 && count>18446744073709551615 = 2
                | otherwise = 0
   withArray [profile,proof,height,parent,0,0,0] $ \fields -> withArray input $ \source ->

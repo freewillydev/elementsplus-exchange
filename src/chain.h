@@ -9,6 +9,7 @@
 #include <arith_uint256.h>
 #include <consensus/params.h>
 #include <ecx_bond_v2.h>
+#include <ecx_custody_projection.h>
 #include <flatfile.h>
 #include <haskell/bmm_constants.h>
 #include <kernel/cs_main.h>
@@ -255,8 +256,10 @@ public:
     uint64_t forcedProcessedCursor{0};
     uint64_t depositProcessedCursor{0};
     uint64_t sourceBacklogOldestParentHeight{0};
+    std::array<unsigned char, CBlockHeader::SWAP_FORCED_STATE_SIZE> swapForcedState{};
     //! Verified V2 public capital projection; never part of the block header.
     std::optional<ecx::BondV2CapitalSnapshot> ecxBondV2Capital{};
+    std::optional<ecx::CustodyProjection> ecxCustodyProjection{};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
@@ -355,6 +358,7 @@ public:
           forcedProcessedCursor{block.forcedProcessedCursor},
           depositProcessedCursor{block.depositProcessedCursor},
           sourceBacklogOldestParentHeight{block.sourceBacklogOldestParentHeight},
+          swapForcedState{block.swapForcedState},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -404,6 +408,7 @@ public:
         block.forcedProcessedCursor = forcedProcessedCursor;
         block.depositProcessedCursor = depositProcessedCursor;
         block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
+        block.swapForcedState = swapForcedState;
         block.nTime = nTime;
         // Dynafed headers always serialize block_height as part of their
         // identity (see CBlockHeader::Serialize), so it must be reconstructed
@@ -622,6 +627,11 @@ public:
             SER_READ(obj, obj.depositProcessedCursor = 0);
             SER_READ(obj, obj.sourceBacklogOldestParentHeight = 0);
         }
+        if (layout.swap_forced) {
+            READWRITE(obj.swapForcedState);
+        } else {
+            SER_READ(obj, obj.swapForcedState.fill(0));
+        }
         if (g_con_elementsmode && g_con_utreexo && (uint32_t(obj.nVersion) & utreexo::HEADER_BIT)) {
             READWRITE(obj.utreexo);
         } else {
@@ -668,6 +678,7 @@ public:
         block.forcedProcessedCursor = forcedProcessedCursor;
         block.depositProcessedCursor = depositProcessedCursor;
         block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
+        block.swapForcedState = swapForcedState;
         block.nTime = nTime;
         // Dynafed headers always serialize block_height as part of their
         // identity (see CBlockHeader::Serialize), so it must be reconstructed

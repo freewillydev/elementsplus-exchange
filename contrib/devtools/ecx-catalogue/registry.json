@@ -12,17 +12,17 @@
     "kind": "user-selected-policy",
     "context_milliweight": 1000,
     "proof_milliweight": 1000000000,
-    "note": "Historical WSL diagnostics are separate evidence, not measurements of these policy values or of all 24 current jets."
+    "note": "Historical WSL diagnostics are separate evidence, not measurements of these policy values or of all 26 current jets."
   },
   "input_sha256": {
-    "generate.py": "1852b7ade62290d089293b741b71a794db8577d68201f325b51794767c5f8809",
-    "DeriveEcxCatalogue.hs": "0284dc425295665f5e1e610721ee6878deb9f99f163a4a6cc6e265684b4b9047",
-    "EcxPrimitiveCandidate.hs": "c92269809eb58fc035652fbe2907354fc97e7c4c329209b5d18659bb8b1e6460",
-    "apply_overlay.py": "37ceba884b43dc5b6ab6ac956b7f4396d2e431da09450a3496cf7a072d0cacca",
+    "generate.py": "c0d792529e222567c2bf2c2d813a8fb43fd7d5fcb71095569da74c24f6abbf46",
+    "DeriveEcxCatalogue.hs": "10e6033d06cc2e08007688e339c62e04ca262922230ba541c47cea36d46f00d0",
+    "EcxPrimitiveCandidate.hs": "a81869482aaf8edd2e60c3289159de6d46f947d536714f7e9712dbc493166840",
+    "apply_overlay.py": "0d0c27bce248b7456747ffd756ad588449c5cb7a6596ba432868a18022eb5915",
     "catalogue.project": "3e18debc41d9c2b92f84033381f29226d5ad272784a6f70d544181ea781b8714",
     "catalogue.project.freeze": "91b147d51d2b2948a1d4cf1b52bd3e2b77a4bfb6decbcf726fe903a59f07d664",
-    "reproduce.sh": "8adc46865ce729aec1e35e3d736a4c81696c053d0f393b4ec3b03d0432932730",
-    "jet-identities.tsv": "42ff23bcae0c3628be7aa51adb22dfec036ee55494d8cb619be8fac839983b16",
+    "reproduce.sh": "9fb39b62a556936558b5c559ab8635112e5a5ca71df83068acd64849344cbc0f",
+    "jet-identities.tsv": "cb6aa675dfe9037ea276588cc90d2966bffbc75c15cdbe169cd699f6a514be64",
     "evidence/sp1-smoke-cost-candidate-20260827.json": "e14ff8ed38bd780dd7bdf20b8a584c69611d161397847b3eff7573f1c1eec196",
     "evidence/current-bmm-wsl-diagnostic-20260828.json": "55600e0ba53ba3629b73f09a5b6d765c480227661c44439b7d5d1f091964532b"
   },
@@ -609,6 +609,54 @@
       "target_type_index": "ty_b",
       "enum_name": "ECX_VERIFY_SP1_GROTH16_V6_INCREMENTAL_SUCCESSOR_SHA256",
       "c_jet_symbol": "simplicity_verify_sp1_groth16_v6_incremental_successor_sha256"
+    },
+    {
+      "index": 24,
+      "name": "verify_sp1_groth16_v7_swap_successor_sha256",
+      "haskell_bits": "1111000111100001001",
+      "encoding_bits": "111000111100001001",
+      "cost_milliweight": 1000000000,
+      "cmr": "e3f953afdd015f0b98dfc56d595dbe68a1d16021602b3a5a45c7a9ae484c1cc4",
+      "imr": "df270ee5ac70456feabb441dab73340c92b9a657a502059dca80d2de315429ae",
+      "amr": "e3f953afdd015f0b98dfc56d595dbe68a1d16021602b3a5a45c7a9ae484c1cc4",
+      "source_tmr": "1ae545b7c3fd85fe816c70ea4c78b7419d8be3c1fb3f7223fa7d8d503675518f",
+      "target_tmr": "885a22de3edb3f40db0609c24023303fec6787be4d4921e45ee9d983acb5d89d",
+      "specification_cmr": "7df991419b76fa16d5de4f9ff5e0ef2be724f01cd455b45537371809d5eec92a",
+      "specification_imr": "fa5883025814eba102d2fb027dd05f036338d39eb3164756547d8b606a80c400",
+      "decoder_path": [
+        5,
+        25
+      ],
+      "source_type_name": "*hh",
+      "target_type_name": "2",
+      "source_type_index": "ty_w512",
+      "target_type_index": "ty_b",
+      "enum_name": "ECX_VERIFY_SP1_GROTH16_V7_SWAP_SUCCESSOR_SHA256",
+      "c_jet_symbol": "simplicity_verify_sp1_groth16_v7_swap_successor_sha256"
+    },
+    {
+      "index": 25,
+      "name": "verify_sp1_groth16_v8_custody_successor_sha256",
+      "haskell_bits": "1111000111100001010",
+      "encoding_bits": "111000111100001010",
+      "cost_milliweight": 1000000000,
+      "cmr": "937f563be85f9c9be99ff52988614dc49ae32b2d326641b0c140ef221e12d9f1",
+      "imr": "9a67fc9ad0fc4c8db38a65665cf76e36a8846d62de00d975ebc33b659ade53be",
+      "amr": "937f563be85f9c9be99ff52988614dc49ae32b2d326641b0c140ef221e12d9f1",
+      "source_tmr": "1ae545b7c3fd85fe816c70ea4c78b7419d8be3c1fb3f7223fa7d8d503675518f",
+      "target_tmr": "885a22de3edb3f40db0609c24023303fec6787be4d4921e45ee9d983acb5d89d",
+      "specification_cmr": "4ffeca47e2c190462db17d9e585f67b14e43aa2b169985fc1b17a8ca23546af8",
+      "specification_imr": "6443e8ff7aa955770cceae6af33b872e644c4832b550e2acd2eb57bb4d9e69a1",
+      "decoder_path": [
+        5,
+        26
+      ],
+      "source_type_name": "*hh",
+      "target_type_name": "2",
+      "source_type_index": "ty_w512",
+      "target_type_index": "ty_b",
+      "enum_name": "ECX_VERIFY_SP1_GROTH16_V8_CUSTODY_SUCCESSOR_SHA256",
+      "c_jet_symbol": "simplicity_verify_sp1_groth16_v8_custody_successor_sha256"
     }
   ]
 }

@@ -1,19 +1,377 @@
-{-# LANGUAGE TypeFamilies, BangPatterns #-}
+{-# LANGUAGE TypeFamilies, BangPatterns, ConstraintKinds, DataKinds, FlexibleContexts #-}
+{-# LANGUAGE GADTs, MultiParamTypeClasses, TypeApplications, FlexibleInstances #-}
 -- Copyright (c) 2026 The Elements Core developers
 -- Distributed under the MIT software license.
 module ParentReplay where
 
 import Control.Operation.Validation
-import Data.Bits (testBit)
+import Control.Operation
+import CapabilityContext (CapabilityContext)
+import Data.Bits ((.&.), shiftR, testBit)
 import Data.Int (Int32, Int64)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Word (Word8, Word16, Word32, Word64)
 import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C
+import qualified Data.Binary.Get as G
+import qualified ReplayStore as RS
 import Data.List (findIndex, foldl', sort)
-import Workflow (runRequiredEffects)
-import BmmConstants (depositAddressLimit)
+import Control.Monad (forM_, unless, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
+import Workflow (NativeBytes, CommandFlow(..), runRequiredEffects)
+import BmmConstants (depositAddressLimit, parentMessageTags)
+import Numeric (showHex)
+
+runStore :: Word32 -> (Word32 -> IO Int64) -> IO Int32
+runStore kind = validate . CommandFlow (storeMaximum kind)
+  (\phase result -> validate (StoreFlow kind phase result))
+
+runDeadline :: (Word32 -> IO Int64) -> IO Int32
+runDeadline = runStore 25
+
+newtype RpcPreparation = RpcPreparation (Word32 -> IO Int64)
+
+class CredentialSource op where
+  selectCredential :: op -> ExceptT Int32 IO Bool
+class CredentialCache op where
+  cachedCredential :: op -> ExceptT Int32 IO Bool
+class CredentialLoader op where
+  loadCredential :: op -> ExceptT Int32 IO ()
+class RequestTimeout op where
+  configureTimeout :: op -> IO Int32
+
+checkedStore :: Word32 -> (Word32 -> IO Int64) -> ExceptT Int32 IO Bool
+checkedStore kind action = do
+  result <- liftIO (runStore kind action)
+  when (result < 0) (throwE result)
+  pure (result /= 0)
+
+instance CredentialSource RpcPreparation where
+  selectCredential (RpcPreparation action) = checkedStore 58 action
+instance CredentialCache RpcPreparation where
+  cachedCredential (RpcPreparation action) = do
+    let effect step = do
+          result <- liftIO (action step)
+          unless (result == 1) (throwE (-1))
+    effect 20
+    found <- checkedStore 57 (action . (20+))
+    effect 27
+    pure found
+instance CredentialLoader RpcPreparation where
+  loadCredential (RpcPreparation action) = checkedStore 59 (action . (40+)) >> pure ()
+
+prepareCredentials :: (CredentialSource op, CredentialCache op, CredentialLoader op)
+  => op -> ExceptT Int32 IO ()
+prepareCredentials value = do
+  selected <- selectCredential value
+  unless selected $ do
+    cached <- cachedCredential value
+    unless cached (loadCredential value)
+
+instance RequestTimeout RpcPreparation where
+  configureTimeout (RpcPreparation action) = do
+    configured <- newIORef 0
+    let positive value = fromIntegral (validate (Record 15 0 value 0 0))
+        observe step = case step of
+          3 -> positive <$> action step
+          8 -> positive <$> action step
+          11 -> do
+            value <- action step
+            writeIORef configured value
+            pure (positive value)
+          12 -> do
+            seconds <- readIORef configured
+            remainingSeconds <- action step
+            pure (fromIntegral (validate (Record 11 0 0 (fromIntegral seconds) (fromIntegral remainingSeconds))))
+          _ -> action step
+    runStore 56 observe
+
+type RpcPreparationCapabilities = '[CredentialSource, CredentialCache, CredentialLoader, RequestTimeout]
+instance Operation RpcPreparation RpcPreparationCapabilities where
+  type Context RpcPreparation = CapabilityContext RpcPreparationCapabilities RpcPreparation
+  type Outcome RpcPreparation = IO Int32
+  data DSL RpcPreparation where
+    PrepareCredentials :: Context RpcPreparation => DSL RpcPreparation
+    ConfigureTimeout :: Context RpcPreparation => DSL RpcPreparation
+  interpret operation request = withOperation @RpcPreparation operation $ \value ->
+    case request of
+      PrepareCredentials -> Just (either id (const 1) <$> runExceptT (prepareCredentials value))
+      ConfigureTimeout -> Just (configureTimeout value)
+
+newtype RpcCall = RpcCall (Word32 -> IO Int64)
+data RpcAttemptResult = RpcSucceeded | RpcAuthenticationFailed | RpcFailed deriving (Eq, Show)
+
+class RpcCircuit op where
+  admitRpcCall :: op -> ExceptT Int32 IO ()
+class RpcAttempt op where
+  attemptRpcCall :: op -> ExceptT Int32 IO RpcAttemptResult
+class RpcAuthentication op where
+  retryRpcCall :: op -> ExceptT Int32 IO Bool
+class RpcFailure op where
+  rejectRpcCall :: op -> ExceptT Int32 IO ()
+class RpcReply op where
+  verifyRpcReply :: op -> ExceptT Int32 IO ()
+
+instance RpcCircuit RpcCall where
+  admitRpcCall (RpcCall action) = checkedStore 26 action >> pure ()
+instance RpcAttempt RpcCall where
+  attemptRpcCall (RpcCall action) = liftIO (action 10) >>= \result -> case result of
+    0 -> pure RpcSucceeded
+    1 -> pure RpcAuthenticationFailed
+    2 -> pure RpcFailed
+    _ -> throwE (-1)
+instance RpcAuthentication RpcCall where
+  retryRpcCall (RpcCall action) = checkedStore 55 (action . (20+))
+instance RpcFailure RpcCall where
+  rejectRpcCall (RpcCall action) = do
+    result <- liftIO (runRequiredEffects action [12,13])
+    -- Native action 13 rethrows the retained exception; returning cannot succeed.
+    throwE (if result == 0 then -1 else result)
+instance RpcReply RpcCall where
+  verifyRpcReply (RpcCall action) = checkedStore 54 (action . (30+)) >> pure ()
+
+performRpcCall :: (RpcCircuit op, RpcAttempt op, RpcAuthentication op, RpcFailure op)
+  => op -> ExceptT Int32 IO ()
+performRpcCall value = do
+  admitRpcCall value
+  result <- attemptRpcCall value
+  case result of
+    RpcSucceeded -> pure ()
+    RpcFailed -> rejectRpcCall value
+    RpcAuthenticationFailed -> do
+      retry <- retryRpcCall value
+      if retry then do
+        second <- attemptRpcCall value
+        unless (second == RpcSucceeded) (rejectRpcCall value)
+      else rejectRpcCall value
+
+type RpcCallCapabilities = '[RpcCircuit, RpcAttempt, RpcAuthentication, RpcFailure, RpcReply]
+instance Operation RpcCall RpcCallCapabilities where
+  type Context RpcCall = CapabilityContext RpcCallCapabilities RpcCall
+  type Outcome RpcCall = IO Int32
+  data DSL RpcCall where
+    CallRpc :: Context RpcCall => DSL RpcCall
+    CallCheckedRpc :: Context RpcCall => DSL RpcCall
+  interpret operation request = withOperation @RpcCall operation $ \value ->
+    let run = fmap (either id (const 1)) . runExceptT
+    in case request of
+      CallRpc -> Just (run (performRpcCall value))
+      CallCheckedRpc -> Just (run (performRpcCall value >> verifyRpcReply value))
+
+-- The same milestone workflow is callable on its own or directly from cache
+-- advancement, without returning to C++ to dispatch Haskell subrules.
+newtype Milestone = Milestone NativeBytes
+data MilestoneInput = MilestoneInput
+  { milestoneHeight :: Word32, milestoneDescription :: B.ByteString
+  , milestoneSlot :: Maybe Word8, milestoneProposal :: Maybe RS.Hash
+  , milestoneProposed :: (Word32,RS.Hash), milestoneActivated :: (Word32,RS.Hash)
+  , milestoneCheckpoint :: (Word32,RS.Hash), milestoneTreasury :: (RS.Hash,Word32,Int64)
+  } deriving (Eq, Show)
+
+milestoneInput :: G.Get MilestoneInput
+milestoneInput = MilestoneInput <$> G.getWord32le <*> (B.pack <$> RS.counted 1 G.getWord8)
+  <*> present G.getWord8 <*> present RS.hash <*> point <*> point <*> point
+  <*> ((,,) <$> RS.hash <*> G.getWord32le <*> G.getInt64le)
+  where
+    point = (,) <$> G.getWord32le <*> RS.hash
+    present parser = do
+      exists <- RS.flag
+      value <- parser
+      pure (if exists then Just value else Nothing)
+
+readReplayReply :: NativeBytes -> Word32 -> Word64 -> G.Get a -> ExceptT Int32 IO a
+readReplayReply native step index parser = do
+  bytes <- liftIO (native step index B.empty)
+  either throwE pure (RS.decode parser bytes)
+milestoneRead :: Milestone -> Word32 -> Word64 -> G.Get a -> ExceptT Int32 IO a
+milestoneRead (Milestone native) = readReplayReply native
+milestoneFail :: Milestone -> String -> ExceptT Int32 IO a
+milestoneFail (Milestone native) message = do
+  reply <- liftIO (native 8 0 (C.pack message))
+  throwE (if B.null reply then 0 else -1)
+milestoneHash :: Milestone -> Word32 -> RS.Hash -> ExceptT Int32 IO ()
+milestoneHash value height expected = do
+  actual <- milestoneRead value 1 0 RS.hash
+  unless (actual == expected) $ milestoneFail value
+    ("authenticated parent milestone height " ++ show height ++ " hashes to " ++ hashHex actual ++ ", expected " ++ hashHex expected)
+
+hashHex :: RS.Hash -> String
+hashHex = concatMap (\byte -> if byte < 16 then '0':showHex byte "" else showHex byte "") . B.unpack . B.reverse
+
+-- The native reader projects upstream GetOp, not a second Script parser.
+coinbasePush :: NativeBytes -> Word64 -> ExceptT Int32 IO (Maybe B.ByteString)
+coinbasePush native index = do
+  first <- readReplayReply native 1 index G.getWord16le
+  if first /= 106 then pure Nothing else do
+    (op,ended,payload) <- readReplayReply native 2 index
+      ((,,) <$> G.getWord16le <*> RS.flag <*> (B.pack <$> RS.counted 1 G.getWord8))
+    pure (if op <= 78 && ended then Just payload else Nothing)
+
+milestoneMessage :: Milestone -> B.ByteString -> ExceptT Int32 IO ()
+milestoneMessage value@(Milestone native) expected = do
+  count <- milestoneRead value 2 0 (RS.optional G.getWord64le) >>=
+    maybe (milestoneFail value "pinned parent identity block has no coinbase transaction") pure
+  let scan index matches
+        | index == count = pure matches
+        | otherwise = do
+            payload <- coinbasePush (\step -> native (step+2)) index
+            scan (index+1) (if payload == Just expected then matches+1 else matches)
+  found <- scan 0 (0 :: Word64)
+  unless (found == 1) $ milestoneFail value
+    ("pinned parent identity block contains " ++ show found ++ " copies of its expected drivechain message")
+
+milestoneIdentity :: MilestoneInput -> ExceptT Int32 IO (Word8,RS.Hash)
+milestoneIdentity input = case (milestoneSlot input,milestoneProposal input) of
+  (Just slot,Just proposal) -> pure (slot,proposal)
+  _ -> throwE (-1)
+milestoneTag :: String -> B.ByteString
+milestoneTag key = B.pack (map fromIntegral (maybe (error "unknown parent message tag") id (lookup key parentMessageTags)))
+milestonePending :: Milestone -> ExceptT Int32 IO (Maybe (Word32,Word32))
+milestonePending value = milestoneRead value 5 0 (RS.optional ((,) <$> G.getWord32le <*> G.getWord32le))
+
+class MilestoneSource op where
+  readMilestone :: op -> ExceptT Int32 IO MilestoneInput
+class ProposalMilestone op where
+  checkProposalMilestone :: op -> MilestoneInput -> ExceptT Int32 IO ()
+class ActivationMilestone op where
+  checkActivationMilestone :: op -> MilestoneInput -> ExceptT Int32 IO ()
+class CheckpointMilestone op where
+  checkCheckpointMilestone :: op -> MilestoneInput -> ExceptT Int32 IO ()
+
+instance MilestoneSource Milestone where
+  readMilestone value = milestoneRead value 0 0 milestoneInput
+instance ProposalMilestone Milestone where
+  checkProposalMilestone value input =
+    when (not (B.null (milestoneDescription input)) && milestoneHeight input == fst (milestoneProposed input)) $ do
+      milestoneHash value (milestoneHeight input) (snd (milestoneProposed input))
+      (slot,_) <- milestoneIdentity input
+      milestoneMessage value (milestoneTag "PARENT_M1_TAG" <> B.singleton slot <> milestoneDescription input)
+      pending <- milestonePending value
+      unless (pending == Just (milestoneHeight input,0)) $ milestoneFail value
+        "authenticated parent proposal milestone did not derive the expected pending proposal state"
+instance ActivationMilestone Milestone where
+  checkActivationMilestone value input =
+    when (not (B.null (milestoneDescription input)) && milestoneHeight input == fst (milestoneActivated input)) $ do
+      milestoneHash value (milestoneHeight input) (snd (milestoneActivated input))
+      (slot,proposal) <- milestoneIdentity input
+      milestoneMessage value (milestoneTag "PARENT_M2_TAG" <> B.singleton slot <> proposal)
+      active <- milestoneRead value 6 0 RS.hash
+      matches <- if active == proposal then (== Nothing) <$> milestonePending value else pure False
+      unless matches $ milestoneFail value
+        "authenticated parent activation milestone did not derive the expected active proposal state"
+instance CheckpointMilestone Milestone where
+  checkCheckpointMilestone value input = when (milestoneHeight input == fst (milestoneCheckpoint input)) $ do
+    milestoneHash value (milestoneHeight input) (snd (milestoneCheckpoint input))
+    (ctip,amount) <- milestoneRead value 7 0
+      ((,) <$> RS.optional ((,) <$> RS.hash <*> G.getWord32le) <*> G.getInt64le)
+    let (expectedHash,expectedIndex,expectedAmount) = milestoneTreasury input
+        ctipMatches = if RS.nonzero expectedHash then ctip == Just (expectedHash,expectedIndex) && amount == expectedAmount
+                      else ctip == Nothing && amount == 0
+    active <- milestoneRead value 6 0 RS.hash
+    proposalMatches <- if B.null (milestoneDescription input) then pure (not (RS.nonzero active))
+      else maybe (throwE (-1)) (pure . (active ==)) (milestoneProposal input)
+    unless (proposalMatches && ctipMatches) $ milestoneFail value
+      "authenticated parent checkpoint milestone did not derive the asserted active proposal and CTIP"
+
+validateMilestones :: (MilestoneSource op, ProposalMilestone op, ActivationMilestone op, CheckpointMilestone op)
+  => op -> ExceptT Int32 IO ()
+validateMilestones value = do
+  input <- readMilestone value
+  checkProposalMilestone value input
+  checkActivationMilestone value input
+  checkCheckpointMilestone value input
+
+type MilestoneCapabilities = '[MilestoneSource, ProposalMilestone, ActivationMilestone, CheckpointMilestone]
+instance Operation Milestone MilestoneCapabilities where
+  type Context Milestone = CapabilityContext MilestoneCapabilities Milestone
+  type Outcome Milestone = IO Int32
+  data DSL Milestone where
+    ValidateMilestones :: Context Milestone => DSL Milestone
+  interpret operation request = withOperation @Milestone operation $ \value -> case request of
+    ValidateMilestones -> Just (either id (const 1) <$> runExceptT (validateMilestones value))
+
+
+newtype BmmScan = BmmScan NativeBytes
+data BmmScanPlan = BmmScanPlan Word8 Word64 (Maybe RS.Hash) deriving (Eq, Show)
+data BmmCommitment = BmmCommitment RS.Hash Word32 deriving (Eq, Show)
+
+bmmScanEffect :: BmmScan -> Word32 -> Word64 -> B.ByteString -> ExceptT Int32 IO ()
+bmmScanEffect (BmmScan native) step index input = do
+  reply <- liftIO (native step index input)
+  unless (B.null reply) (throwE (-1))
+bmmScanFail :: BmmScan -> String -> ExceptT Int32 IO a
+bmmScanFail value message = bmmScanEffect value 6 0 (C.pack message) >> throwE 0
+
+class BmmScanAdmission op where
+  prepareBmmScan :: op -> ExceptT Int32 IO BmmScanPlan
+class BmmCollection op where
+  collectBmmCommitment :: op -> BmmScanPlan -> ExceptT Int32 IO BmmCommitment
+class BmmPublication op where
+  publishBmmCommitment :: op -> BmmScanPlan -> BmmCommitment -> ExceptT Int32 IO ()
+
+instance BmmScanAdmission BmmScan where
+  prepareBmmScan value@(BmmScan native) = do
+    (slot,match,expected) <- readReplayReply native 1 0 ((,,) <$> G.getInt32le <*> RS.flag <*> RS.hash)
+    unless (slot >= 0 && slot <= 255) (bmmScanFail value "BIP301 M7 sidechain slot is outside the uint8 range")
+    count <- readReplayReply native 2 0 (RS.optional G.getWord64le) >>=
+      maybe (bmmScanFail value "raw BMM block has no coinbase transaction") pure
+    pure (BmmScanPlan (fromIntegral slot) count (if match then Just expected else Nothing))
+instance BmmCollection BmmScan where
+  collectBmmCommitment value@(BmmScan native) (BmmScanPlan slot count _) = scan 0 (0 :: Word64) Nothing
+    where
+      scan index !matches selected
+        | index == count = case (matches,selected) of
+            (1,Just commitment) -> pure commitment
+            _ -> bmmScanFail value ("BMM successor has " ++
+              (if matches == 0 then "no enforcer-recognized M7 for" else show matches ++ " enforcer-recognized M7 outputs for") ++
+              " sidechain slot " ++ show slot)
+        | otherwise = do
+            payload <- coinbasePush (\step -> native (step+2)) index
+            case payload >>= recognized of
+              Just commitment -> scan (index+1) (matches+1) (Just (BmmCommitment commitment (fromIntegral index)))
+              Nothing -> scan (index+1) matches selected
+      recognized bytes
+        | B.length bytes /= 37 = Nothing
+        | otherwise = case validate (Message (B.unpack bytes)) of
+            (5,_,_) | B.index bytes 4 == slot -> Just (B.pack (commitmentBytes 0 (B.unpack bytes)))
+            _ -> Nothing
+instance BmmPublication BmmScan where
+  publishBmmCommitment value (BmmScanPlan _ _ expected) (BmmCommitment hash index) = do
+    -- Match callers historically observe the output index even on hash mismatch.
+    bmmScanEffect value 5 (fromIntegral index) hash
+    case expected of
+      Just wanted | hash /= wanted -> bmmScanFail value
+        ("BMM successor commits to critical hash " ++ hashHex hash ++ ", expected " ++ hashHex wanted)
+      _ -> pure ()
+
+scanBmmCommitment :: (BmmScanAdmission op, BmmCollection op, BmmPublication op)
+  => op -> ExceptT Int32 IO BmmCommitment
+scanBmmCommitment value = do
+  plan <- prepareBmmScan value
+  commitment <- collectBmmCommitment value plan
+  publishBmmCommitment value plan commitment
+  pure commitment
+
+type BmmScanCapabilities = '[BmmScanAdmission, BmmCollection, BmmPublication]
+instance Operation BmmScan BmmScanCapabilities where
+  type Context BmmScan = CapabilityContext BmmScanCapabilities BmmScan
+  type Outcome BmmScan = IO Int32
+  data DSL BmmScan where
+    ScanBmmCommitment :: Context BmmScan => DSL BmmScan
+  interpret operation request = withOperation @BmmScan operation $ \value -> case request of
+    ScanBmmCommitment -> Just (either id (const 1) <$> runExceptT (scanBmmCommitment value))
+
 
 exceedsLane :: Word64 -> Word64 -> Word64 -> Bool
 exceedsLane lane current additional = current>lane || additional>lane-current
+
+treasurySlot :: Word32 -> Word32 -> Int32
+treasurySlot script opcode
+  | (opcode == 0xb4 || opcode == 0xb7) && script .&. 0xff == opcode
+    && (script `shiftR` 8) .&. 0xff == 1 && script `shiftR` 24 == 0x51 =
+      fromIntegral ((script `shiftR` 16) .&. 0xff)
+  | otherwise = -1
 
 data Distance = Distance Word32 Word32
 instance Validation Distance where
@@ -56,6 +414,46 @@ instance Validation CoinbaseMessages where
       finish index sawM4 effects = runRequiredEffects (\step -> action step index) (effects ++ [8]) >>= \result ->
         if result == 0 then visit (index+1) sawM4 else pure result
 
+-- One entry owns the ordered message traversal. Native callbacks select the
+-- current message and perform effects; nested rule calls stay in Haskell.
+data MessageWorkflow = MessageWorkflow Word64 Word32 Word64 NativeBytes
+instance Validation MessageWorkflow where
+  type ValidationResult MessageWorkflow = IO Int32
+  validate (MessageWorkflow count height settings native) = either id id <$> runExceptT (visit 0)
+    where
+      parameter offset = fromIntegral ((settings `shiftR` offset) `mod` 65536)
+      scalar base step value = do
+        result <- native (base+step) value B.empty
+        if B.length result /= 8 then ioError (userError "invalid replay scalar reply")
+        else pure (fromIntegral (B.foldr (\byte rest -> fromIntegral byte+256*rest) (0 :: Word64) result))
+      effect step = do
+        reply <- liftIO (native step 0 B.empty)
+        unless (B.null reply) (throwE (-1))
+      checked group failure action = do
+        result <- liftIO action
+        when (result < 0) (throwE failure)
+        when (result /= 0) (throwE (group+result))
+      visit index
+        | index == count = effect 40 >> pure 0
+        | otherwise = do
+            message <- liftIO (native 0 index B.empty)
+            when (B.length message < 2 || odd (B.length message)) (throwE (-1))
+            let kind = B.index message 0
+                flags = fromIntegral (B.index message 1)
+                votes = [fromIntegral (B.index message i) + 256*fromIntegral (B.index message (i+1))
+                  | i <- [2,4..B.length message-2]]
+            case kind of
+              1 -> effect 2
+              2 -> do
+                effect 3
+                checked 0x100 (-2) (validate (M2Proposal height
+                  (parameter 0) (parameter 16) (parameter 32) (parameter 48) (scalar 10)))
+              3 -> checked 0x200 (-3) (validate (M3Proposal (scalar 20)))
+              5 -> pure () -- M7 was authenticated before replay mutations.
+              _ -> checked 0x300 (-4) (validate (M4Workflow flags votes
+                (\step slot input -> native (30+step) slot input)))
+            visit (index+1)
+
 data M4Repeat = M4Repeat Word32 (Word32 -> IO Int64)
 instance Validation M4Repeat where
   type ValidationResult M4Repeat = IO Int32
@@ -69,6 +467,62 @@ instance Validation M4Repeat where
           2 -> pure 0
           _ -> pure (-1)
         _ -> pure (-1)
+
+-- One entry owns mode selection, ordered slots, vote arithmetic and publication.
+-- Reads are lazy: abstentions never load pending withdrawals, and a bad slot
+-- prevents reads/publication for all later slots.
+data M4Workflow = M4Workflow Word32 [Word16] NativeBytes
+instance Validation M4Workflow where
+  type ValidationResult M4Workflow = IO Int32
+  validate (M4Workflow flags explicit native) = either id (const 0) <$> runExceptT (do
+    when (flags > 15) (throwE (-1))
+    unless (testBit flags 0) (throwE 1)
+    when (testBit flags 1) (throwE 2)
+    entries <- readBytes 0 0
+    when (B.length entries > 514 || odd (B.length entries) ||
+      any ((>1) . B.index entries) [1,3..B.length entries-1]) (throwE (-1))
+    let active = B.unpack (validate (ActiveSlots entries))
+    if testBit flags 2 then do
+      unless (length explicit == length active) (throwE 3)
+      forM_ (zip active explicit) $ \(slot,vote) -> when (vote /= 65535) $ do
+        (hashes,votes) <- pending slot
+        case validate (ExplicitVote vote hashes votes) of
+          (0,_) -> pure ()
+          (1,updated) -> publish slot 1 (B.take 32 (B.drop (32*fromIntegral vote) hashes)) updated
+          (2,updated) -> publish slot 0 (B.replicate 32 0) updated
+          _ -> throwE 4
+    else if testBit flags 3 then forM_ active $ \slot -> do
+      (hashes,votes) <- pending slot
+      case validate (LeadingVote hashes votes) of
+        Nothing -> pure ()
+        Just (leader,updated) -> publish slot 1 (B.take 32 (B.drop (32*fromIntegral leader) hashes)) updated
+    else do
+      previous <- readBytes 1 0
+      unless (B.length previous `mod` 34 == 0 && B.length previous <= 256*34) (throwE (-1))
+      forM_ [0,34..B.length previous-1] $ \offset -> do
+        let slot = B.index previous offset
+            upvote = B.index previous (offset+1)
+            target = B.take 32 (B.drop (offset+2) previous)
+        when (upvote > 1) (throwE (-1))
+        (hashes,votes) <- pending slot
+        case validate (if upvote == 1 then VoteUpdate target hashes votes else VoteAlarm votes) of
+          Nothing -> throwE 6
+          Just (False,_) -> pure ()
+          Just (True,updated) -> publish slot upvote target updated)
+    where
+      readBytes step slot = liftIO (native step (fromIntegral slot) B.empty)
+      pending slot = do
+        bytes <- readBytes 2 slot
+        when (B.null bytes || B.head bytes > 1) (throwE (-1))
+        when (B.head bytes == 0) (throwE 5)
+        let rows = B.tail bytes
+        unless (B.length rows `mod` 34 == 0) (throwE (-1))
+        pure (B.concat [B.take 32 (B.drop i rows) | i <- [0,34..B.length rows-1]],
+          [fromIntegral (B.index rows (i+32)) + 256*fromIntegral (B.index rows (i+33)) | i <- [0,34..B.length rows-1]])
+      publish slot kind target votes = do
+        result <- liftIO (native 3 (fromIntegral slot) (B.cons kind target <>
+          B.pack (concatMap (\v -> [fromIntegral v,fromIntegral (v `div` 256)]) votes)))
+        unless (B.null result) (throwE (-1))
 
 data M8Acceptance = M8Acceptance Word64 (Word32 -> Word64 -> IO Int64)
 instance Validation M8Acceptance where
@@ -259,6 +713,63 @@ instance Validation CtipChanges where
           else publish
       publish = completeEntry (action 7)
 
+-- One treasury transaction, with native effects scoped to its caller. Groups
+-- 1-7 reuse the existing rules; group 9 retains native M6 serialization/hash.
+-- A positive result identifies the rejecting group and its unchanged error.
+data TransactionReplay = TransactionReplay Word64 Word64 Word64 Word64 Word32 Word32
+  (Word32 -> Word64 -> IO Int64)
+instance Validation TransactionReplay where
+  type ValidationResult TransactionReplay = IO Int32
+  validate (TransactionReplay slots inputs outputs maximumValue threshold single native) =
+    either id (const 0) <$> runExceptT (do
+      when (maximumValue > fromIntegral (maxBound :: Int64) || single > 1) (throwE (-1))
+      check 1 =<< liftIO (validate (CtipOwners slots maximumValue (one 1)))
+      check 2 =<< liftIO (validate (CtipSpends inputs (\step index -> narrow <$> call 2 step index)))
+      check 3 =<< liftIO (validate (CtipOutputs outputs maximumValue (call 3)))
+      owners <- count 0
+      check 4 =<< liftIO (validate (CtipReplacements owners (fmap narrow . one 4)))
+      replacements <- count 1
+      check 5 =<< liftIO (validate (CtipChanges replacements (one 5)))
+      changes <- count 2
+      when (changes /= 0) $ do
+        decreases <- count 3
+        if decreases /= 0 then do
+          idResult <- liftIO (newIORef 0)
+          result <- liftIO (validate (M6Withdrawal decreases changes inputs threshold single $ \step ->
+            if step /= 2 then one 6 step else do
+              previous <- native 0 4
+              status <- validate (M6Id outputs inputs previous (fromIntegral maximumValue) 1 (call 9))
+              writeIORef idResult status
+              pure (if status == 0 then 1 else 0)))
+          check 9 =<< liftIO (readIORef idResult)
+          check 6 result
+        else deposits changes 0)
+    where
+      call group step = native (group * 100 + step)
+      one group step = call group step 0
+      narrow value
+        | value < fromIntegral (minBound :: Int32) || value > fromIntegral (maxBound :: Int32) = -1
+        | otherwise = fromIntegral value
+      check group result
+        | result < 0 = throwE (-1)
+        | result == 0 = pure ()
+        | otherwise = throwE (group * 256 + result)
+      count field = do
+        value <- liftIO (native 0 field)
+        when (value < 0) (throwE (-1))
+        pure (fromIntegral value)
+      deposits remaining index = when (remaining /= 0) $ do
+        selected <- liftIO (native 800 index)
+        unless (selected == 1) (throwE (-1))
+        old <- liftIO (native 0 4)
+        new <- liftIO (native 0 5)
+        output <- count 6
+        flags <- liftIO (native 0 7)
+        when (flags < 0 || flags > 7) (throwE (-1))
+        check 7 =<< liftIO (validate (M5Deposit old new maximumValue output outputs
+          (fromIntegral flags) (call 7)))
+        deposits (remaining-1) (index+1)
+
 data CtipReplacements = CtipReplacements Word64 (Word32 -> IO Int32)
 instance Validation CtipReplacements where
   type ValidationResult CtipReplacements = IO Int32
@@ -331,13 +842,16 @@ data ExpireProposals = ExpireProposals Word64 Word32 Word32 Word32 (Word32 -> IO
 instance Validation ExpireProposals where
   type ValidationResult ExpireProposals = IO Int32
   validate (ExpireProposals count height threshold maxAge action) = expireEntries count height action $ \age ->
-    action 2 >>= \votes -> pure $
-      if votes < 0 || votes > 65535 then Left (-1)
-      else if votes > age then Left 2
-      else case validate (Record 19 threshold votes (fromIntegral age) (fromIntegral maxAge)) of
-        0 -> Right False
-        1 -> Right True
-        _ -> Left (-1)
+    proposalExpiry threshold maxAge age <$> action 2
+
+proposalExpiry :: Word32 -> Word32 -> Int64 -> Int64 -> Either Int32 Bool
+proposalExpiry threshold maxAge age votes
+  | votes < 0 || votes > 65535 = Left (-1)
+  | votes > age = Left 2
+  | otherwise = case validate (Record 19 threshold votes (fromIntegral age) (fromIntegral maxAge)) of
+      0 -> Right False
+      1 -> Right True
+      _ -> Left (-1)
 
 data ExpireWithdrawals = ExpireWithdrawals Word64 Word32 Word32 (Word32 -> IO Int64)
 instance Validation ExpireWithdrawals where
@@ -353,6 +867,108 @@ expireEntries count height action decide = repeatEntries count $
     else decide (fromIntegral height-proposed) >>= \decision -> case decision of
       Left code -> pure code
       Right expired -> completeEntry (action (if expired then 3 else 4))
+
+-- Snapshots contain only total native getters. Publish the valid prefix before
+-- reporting a later rejection, preserving the original in-place replay effects.
+data Maintenance = Maintenance Word32 Word64 Word32 Word32 NativeBytes
+class ProposalMaintenance op where
+  expireProposalSlots :: op -> ExceptT Int32 IO [Word8]
+class WithdrawalMaintenance op where
+  expireWithdrawalSlots :: op -> [Word8] -> ExceptT Int32 IO ()
+class ReplayPublication op where
+  pruneReplaySlots :: op -> ExceptT Int32 IO ()
+  publishReplayBlock :: op -> ExceptT Int32 IO ()
+
+replayWord :: B.ByteString -> Word64
+replayWord = B.foldr (\byte rest -> fromIntegral byte + 256*rest) 0
+
+maintenanceEffect :: NativeBytes -> Word32 -> Word64 -> B.ByteString -> ExceptT Int32 IO ()
+maintenanceEffect native step slot payload = do
+  reply <- liftIO (native step slot payload)
+  unless (B.null reply) (throwE (-1))
+
+expirySnapshot :: Word32 -> Int -> (Int64 -> B.ByteString -> Either Int32 Bool)
+  -> B.ByteString -> (Int32, [Word64])
+expirySnapshot height width decide rows
+  | width < 4 || B.length rows `mod` width /= 0 = (-1,[])
+  | otherwise = visit 0 [] rows
+  where
+    visit !index selected remaining
+      | B.null remaining = (0,reverse selected)
+      | proposed > fromIntegral height = (1,reverse selected)
+      | otherwise = case decide (fromIntegral height-fromIntegral proposed) (B.take width remaining) of
+          Left code -> (code,reverse selected)
+          Right expired -> visit (index+1) (if expired then index:selected else selected) (B.drop width remaining)
+      where proposed = replayWord (B.take 4 remaining)
+
+applyExpiry :: NativeBytes -> Word32 -> Word8 -> (Int32 -> Int32) -> (Int32,[Word64]) -> ExceptT Int32 IO ()
+applyExpiry native step slot diagnostic (status,indices) = do
+  unless (null indices) $ maintenanceEffect native step (fromIntegral slot)
+    (B.pack [fromIntegral (index `shiftR` shift) | index <- indices, shift <- [0,8..56]])
+  when (status /= 0) (throwE (if status < 0 then status else diagnostic status))
+
+instance ProposalMaintenance Maintenance where
+  expireProposalSlots (Maintenance height settings _ _ native) = do
+    slots <- liftIO (native 0 0 B.empty)
+    when (B.length slots > 514 || odd (B.length slots) ||
+      any ((>1) . B.index slots) [1,3..B.length slots-1]) (throwE (-1))
+    forM_ [0,2..B.length slots-1] $ \offset -> do
+      let slot = B.index slots offset
+          window = if B.index slots (offset+1) == 1 then 32 else 0
+          parameter bit = fromIntegral ((settings `shiftR` bit) `mod` 65536)
+      rows <- liftIO (native 1 (fromIntegral slot) B.empty)
+      applyExpiry native 2 slot (\code -> code*256+fromIntegral slot) $
+        expirySnapshot height 8 (\age row -> proposalExpiry (parameter (window+16)) (parameter window)
+          age (fromIntegral (replayWord (B.drop 4 row)))) rows
+    pure (B.unpack (validate (ActiveSlots slots)))
+
+instance WithdrawalMaintenance Maintenance where
+  expireWithdrawalSlots (Maintenance height _ maxAge _ native) slots = forM_ slots $ \slot -> do
+    rows <- liftIO (native 3 (fromIntegral slot) B.empty)
+    applyExpiry native 4 slot (const 0x300) $
+      expirySnapshot height 4 (\age _ -> Right (age > fromIntegral maxAge)) rows
+
+instance ReplayPublication Maintenance where
+  pruneReplaySlots (Maintenance _ _ _ _ native) = do
+    slots <- liftIO (native 10 0 B.empty)
+    when (B.length slots > 512 || odd (B.length slots) ||
+      any ((>63) . B.index slots) [1,3..B.length slots-1]) (throwE (-1))
+    let retired = B.pack [B.index slots i | i <- [0,2..B.length slots-1], B.index slots (i+1) == 0]
+    unless (B.null retired) (maintenanceEffect native 11 0 retired)
+  publishReplayBlock (Maintenance _ _ _ flags native) = do
+    let deadline = validate (CommandFlow (storeMaximum 25)
+          (\phase result -> validate (StoreFlow 25 phase result)) (\step -> do
+            reply <- native (20+step) 0 B.empty
+            pure $ case B.unpack reply of
+              [0] -> 0
+              [1] -> 1
+              _ -> -1))
+        action 3 = do
+          result <- deadline
+          pure (if result == 0 then 1 else -1)
+        action step = do
+          reply <- native (11+step) 0 B.empty
+          pure (if B.null reply then 1 else -1)
+    status <- liftIO $ validate (BlockPublish flags action)
+    when (status /= 0) (throwE status)
+
+maintainBeforeTreasury :: (ProposalMaintenance op, WithdrawalMaintenance op) => op -> ExceptT Int32 IO ()
+maintainBeforeTreasury value = expireProposalSlots value >>= expireWithdrawalSlots value
+maintainAfterTreasury :: ReplayPublication op => op -> ExceptT Int32 IO ()
+maintainAfterTreasury value = pruneReplaySlots value >> publishReplayBlock value
+
+type MaintenanceCapabilities = '[ProposalMaintenance, WithdrawalMaintenance, ReplayPublication]
+instance Operation Maintenance MaintenanceCapabilities where
+  type Context Maintenance = CapabilityContext MaintenanceCapabilities Maintenance
+  type Outcome Maintenance = IO Int32
+  data DSL Maintenance where
+    BeforeTreasury :: Context Maintenance => DSL Maintenance
+    AfterTreasury :: Context Maintenance => DSL Maintenance
+  interpret operation request = withOperation @Maintenance operation $ \value ->
+    let run = fmap (either id (const 0)) . runExceptT
+    in case request of
+      BeforeTreasury -> Just (run (maintainBeforeTreasury value))
+      AfterTreasury -> Just (run (maintainAfterTreasury value))
 
 newtype VoteLeader = VoteLeader [Word16]
 instance Validation VoteLeader where
@@ -458,7 +1074,7 @@ storeBounds =
   ++ [7,7,14,13,8,5,3,11,16,19,8,6,4,4,6,7,4,7,6,7,5,3,5,10,3,4,9,4,3,5,7,4,2,2,4,6,8,8,5,17,16,11,6,6,30,20,5,5,4,11,14,9]
 
   ++ [10,8,7,2,7,8,14,3,8,17,28,3,2,4,13,14,-1,7,5,7,19,22,13,8,13,11,12,6,6,8,5,3,4,7,14,7,11,4,14,23,2,16,5,3,7,3,5,2]
-  ++ [6,6,22,31,11,8,7,6,3,4,9,3,6,6,8,5,6]
+  ++ [6,6,22,31,11,8,7,6,3,4,9,3,6,6,8,5,6,8,8]
 
 data MempoolSweepPreflight = MempoolSweepPreflight Word32 Word32
 instance Validation MempoolSweepPreflight where
@@ -598,6 +1214,15 @@ instance Validation IndexCapitalFlow where
     [(1,(-1,2)),(2,(12,3)),(3,(12,4)),(4,(12,5)),(5,(6,7)),(6,(-1,-11)),
      (7,(10,8)),(8,(10,9)),(9,(10,11)),(10,(-1,-11)),(11,(-1,2)),(12,(-1,-10))]
 
+commitmentBytes :: Word32 -> [Word8] -> [Word8]
+commitmentBytes 0 bytes | length bytes == 37 = reverse (drop 5 bytes)
+commitmentBytes 1 bytes | length bytes == 32 = bytes
+commitmentBytes 2 bytes = case validate (Message bytes) of
+  (5,_,_) -> commitmentBytes 0 bytes
+  (kind,_,_) | kind == 2 || kind == 3 -> commitmentBytes 1 (drop 5 bytes)
+  _ -> error "parent message has no commitment hash"
+commitmentBytes _ _ = error "invalid commitment payload"
+
 newtype Message = Message [Word8]
 instance Validation Message where
   type ValidationResult Message = (Word32, Word32, [Word16])
@@ -636,6 +1261,10 @@ data Record = Record Word32 Word32 Int64 Word64 Word64 | TipFlow Word32 Word32
 instance Validation Record where
   type ValidationResult Record = Int32
   validate (StoreFlow kind phase result) = case (kind,phase) of
+    (328,_) -> transition phase result
+      [(1,(-10,4)),(4,(-10,5)),(5,(-10,7)),(7,(-10,8)),(8,(-10,-11))]
+    (327,_) -> transition phase result
+      [(1,(-10,2)),(2,(-10,3)),(3,(-10,4)),(4,(-10,5)),(5,(-10,7)),(7,(-10,8)),(8,(-10,-11))]
     (227,_) -> transition phase result
       [(1,(-10,2)),(2,(-1,3)),(3,(-11,4)),(4,(-12,5)),(5,(7,6)),(6,(-1,7)),(7,(-1,1))]
     (226,_) -> transition phase result

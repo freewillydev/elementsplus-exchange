@@ -7,8 +7,12 @@
 #define BITCOIN_RPC_REQUEST_H
 
 #include <any>
+#include <cstdint>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <util/fs.h>
 #include <univalue.h>
@@ -51,8 +55,13 @@ public:
 };
 
 // ELEMENTS:
+/** Native file effects; the closure owns the descriptor, not validation policy. */
+using RpcAuthFileReader = std::function<std::vector<unsigned char>(uint32_t, uint64_t, std::span<const unsigned char>)>;
+RpcAuthFileReader MakeRpcAuthFileReader(
+    const fs::path& path, std::string& contents, std::string* error, bool rotating);
 /** Return the resolved parent-node cookie path. */
 fs::path GetMainchainAuthCookieFile();
+fs::path GetMainchainAuthCookieFile(const std::string& cookie_file);
 /** Read one private, canonical Bitcoin Core rotating cookie. */
 bool ReadMainchainAuthCookieFile(
     const fs::path& path,

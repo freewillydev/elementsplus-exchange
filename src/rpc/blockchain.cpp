@@ -262,6 +262,10 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
         result.pushKV("bmmproofhash", blockindex->hashBmmProof.GetHex());
         result.pushKV("exchangestateroot", blockindex->hashExchangeStateRoot.GetHex());
         result.pushKV("forcedinboxroot", blockindex->hashForcedInboxRoot.GetHex());
+        if (CBlockHeader::GetLayout(blockindex->nVersion, false, false, true).swap_forced) {
+            // Exact canonical bytes retain all128 count/cursor bits for clients.
+            result.pushKV("swapforcedstate", HexStr(blockindex->swapForcedState));
+        }
         result.pushKV("depositinboxroot", blockindex->hashDepositInboxRoot.GetHex());
         result.pushKV("ecxparentheight", static_cast<uint64_t>(blockindex->ecxParentHeight));
         result.pushKV("forcedprocessedcursor", blockindex->forcedProcessedCursor);
@@ -1477,6 +1481,21 @@ static RPCHelpMan getecxconsensuscontext()
                 {RPCResult::Type::STR_HEX, "parentblockhash", "BMM-authenticated parent block hash"},
             }},
             {RPCResult::Type::NUM, "sourceparentheight", "Approval height committed by the active ECX header"},
+            {RPCResult::Type::NUM, "bridgeversion", /*optional=*/true, "Verified swap projection schema (2 for V24; 3 for exact custody)"},
+            {RPCResult::Type::STR_HEX, "bridgestateroot", /*optional=*/true, "Bridge root in consensus byte order"},
+            {RPCResult::Type::BOOL, "profitlockinsolvent", /*optional=*/true, "Proof-derived swap profit insolvency flag"},
+            {RPCResult::Type::OBJ, "forcedinboxv3", /*optional=*/true, "Authenticated full-width exact source state", {
+                {RPCResult::Type::STR_HEX, "canonicalstate", "Canonical145 source bytes"},
+                {RPCResult::Type::STR, "entrycount", "Unsigned128-bit decimal source count"},
+                {RPCResult::Type::STR, "processedcursor", "Unsigned128-bit decimal cursor"},
+                {RPCResult::Type::NUM, "oldestpendingparentheight", "Authenticated pending age; zero when empty"},
+            }},
+            {RPCResult::Type::OBJ, "custodyfutures", /*optional=*/true, "Verified exact custody/history child", {
+                {RPCResult::Type::NUM, "version", "Child state schema"},
+                {RPCResult::Type::ARR, "state_root", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
+                {RPCResult::Type::ARR, "configuration_digest", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
+                {RPCResult::Type::ARR, "policy_digest", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
+            }},
             {RPCResult::Type::OBJ, "capital", /*optional=*/true, "Verified V2 public capital projection (present only for a frozen V2 deployment)", {
                 {RPCResult::Type::NUM, "version", "Capital projection version"},
                 {RPCResult::Type::STR_HEX, "exchangestateroot", "Root selecting this exact projection"},
@@ -1595,6 +1614,34 @@ static RPCHelpMan getecxconsensuscontext()
         "sourcebacklogoldestparentheight",
         exchange.source_backlog_oldest_parent_height);
     const ecx::ExchangeConsensus& frozen{ecx::LayerTwoLabsExchangeConsensus()};
+    if (frozen.custody_successor.activation_enabled) {
+        if (!tip->ecxCustodyProjection || tip->ecxBondV2Capital ||
+            !ecx::CheckCustodyProjectionIdentity(*tip->ecxCustodyProjection,exchange.exchange_state_root,frozen))
+            throw JSONRPCError(RPC_MISC_ERROR,"exact custody tip has no verified profile3 projection");
+        const auto& custody=*tip->ecxCustodyProjection;
+        const auto bytes=[](const uint256& hash) {
+            UniValue array(UniValue::VARR);
+            for (const auto byte : hash) array.push_back(static_cast<unsigned int>(byte));
+            return array;
+        };
+        UniValue child(UniValue::VOBJ);
+        child.pushKV("version",2);
+        child.pushKV("state_root",bytes(custody.custody_history_root));
+        child.pushKV("configuration_digest",bytes(custody.ecx_configuration));
+        child.pushKV("policy_digest",bytes(custody.clearing_policy));
+        UniValue wide(UniValue::VOBJ);
+        wide.pushKV("canonicalstate",HexStr(tip->swapForcedState));
+        ecx::BigEndianUint128 count,cursor;
+        std::copy_n(tip->swapForcedState.begin()+65,16,count.bytes.begin());
+        std::copy_n(tip->swapForcedState.begin()+113,16,cursor.bytes.begin());
+        wide.pushKV("entrycount",drivechain::haskell::WideDecimal(count.bytes));wide.pushKV("processedcursor",drivechain::haskell::WideDecimal(cursor.bytes));
+        wide.pushKV("oldestpendingparentheight",tip->sourceBacklogOldestParentHeight);
+        result.pushKV("forcedinboxv3",std::move(wide));
+        result.pushKV("bridgeversion",3);
+        result.pushKV("bridgestateroot",HexStr(custody.custody_history_root));
+        result.pushKV("profitlockinsolvent",custody.profit_lock_insolvent!=0);
+        result.pushKV("custodyfutures",child);
+    }
     static_assert(ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION == 4);
     if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_REPORT,
         [&](uint32_t step) -> uint32_t {
@@ -1609,14 +1656,7 @@ static RPCHelpMan getecxconsensuscontext()
         const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
         switch (step) {
             case 4: return capital.version;
-            case 5: return drivechain::haskell::ExchangeCarryIdentity(capital.proof_profile,
-                std::array<const unsigned char*,15>{
-                    capital.configuration_hash.begin(),capital.transition_program_id.begin(),capital.transition_cmr.begin(),
-                    capital.exchange_state_root.begin(),capital.bond_asset_id.begin(),capital.bond_deployment_commitment.begin(),
-                    frozen.bond_v2.configuration_hash.begin(),frozen.bond_v2.transition_program_id.begin(),frozen.bond_v2.transition_cmr.begin(),
-                    frozen.bond_v2.incremental_successor_configuration_hash.begin(),frozen.bond_v2.incremental_successor_program_id.begin(),
-                    frozen.bond_v2.incremental_successor_transition_cmr.begin(),exchange.exchange_state_root.begin(),
-                    frozen.bond_v2.bond_asset_id.begin(),frozen.bond_v2.bond_deployment_commitment.begin()});
+            case 5: return ecx::CheckCapitalProjectionIdentity(capital,exchange.exchange_state_root,frozen);
             case 6: return capital.bond_inventory_covenant_hash == frozen.bond_v2.inventory_covenant_script_sha256;
             case 7: return capital.capital_mode;
             case 8: return capital.oracle_mode;
@@ -1629,10 +1669,16 @@ static RPCHelpMan getecxconsensuscontext()
             }
         })) {
         const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
+        if (capital.proof_profile == 2) {
+            result.pushKV("bridgeversion", 2);
+            result.pushKV("bridgestateroot", HexStr(capital.bridge_state_root));
+            result.pushKV("profitlockinsolvent", capital.profit_lock_insolvent != 0);
+        }
         UniValue capital_json(UniValue::VOBJ);
         capital_json.pushKV("version", capital.version);
         capital_json.pushKV(
-            "proofprofile", capital.proof_profile == 0 ? "finite-v18" : "incremental-successor");
+            "proofprofile", capital.proof_profile == 0 ? "finite-v18" :
+                capital.proof_profile == 1 ? "incremental-successor" : "swap-successor-v24");
         capital_json.pushKV("exchangestateroot", capital.exchange_state_root.GetHex());
         capital_json.pushKV("configurationhash", capital.configuration_hash.GetHex());
         capital_json.pushKV(
@@ -1855,10 +1901,10 @@ static RPCHelpMan getecxbondinboxentries()
         drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECONSTRUCT,
             [&](uint32_t step) -> uint32_t {
             switch (step) {
-            case 1: return expected.proof_profile;
-            case 2: return working.proof_profile;
+            case 1: return expected.proof_profile != 0;
+            case 2: return working.proof_profile != 0;
             case 3:
-                candidate.proof_profile = 1;
+                candidate.proof_profile = expected.proof_profile;
                 candidate.bond_inbox_head_root = ecx::IncrementalSuccessorBondInboxGenesisHead(frozen);
                 candidate.node_bond_inbox_head_root = candidate.bond_inbox_head_root;
                 candidate.bond_inbox_entry_count = 0;
@@ -4449,6 +4495,43 @@ UniValue FetchDrivechainL1PegEvents(int sidechain_id)
 
 } // namespace
 
+static RPCHelpMan getdrivechaindepositdestination()
+{
+    return RPCHelpMan{"getdrivechaindepositdestination",
+        "Encode the recipient and exact Elements fee to commit in an L1 M5 deposit.\n"
+        "This does not create or broadcast a transaction. The parent transaction fee is separate.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Recipient Elements address."},
+            {"deposit_fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Exact Elements fee deducted from the deposit, in integer satoshis. The deposit must exceed this amount."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR, "destination", "Opaque destination for the enforcer's CreateDepositTransaction address field."},
+            {RPCResult::Type::STR, "bitwindow_address", "Slot-prefixed destination for BitWindow's generic deposit-address parser."},
+            {RPCResult::Type::STR_HEX, "destination_hex", "Exact M5 destination bytes."},
+            {RPCResult::Type::NUM, "deposit_fee_sats", "Elements fee committed by these bytes."},
+            {RPCResult::Type::NUM, "sidechain_slot", "Configured sidechain slot."},
+        }},
+        RPCExamples{HelpExampleCli("getdrivechaindepositdestination", "\"<elements-address>\" 1000")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto slot = Params().GetConsensus().drivechain_slot;
+            if (!slot) throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Native BIP300 deposits are not enabled on this network");
+            const auto& fee_value = request.params[1];
+            CAmount fee{0};
+            if (!fee_value.isNull() && (!fee_value.isNum() || !ParseInt64(fee_value.getValStr(), &fee)))
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "deposit_fee_sats must be an integer");
+            std::string destination;
+            try { destination = EncodeDrivechainDepositDestination(request.params[0].get_str(), fee); }
+            catch (const std::invalid_argument& e) { throw JSONRPCError(RPC_INVALID_PARAMETER, e.what()); }
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("destination", destination);
+            result.pushKV("bitwindow_address", strprintf("s%u_%s", *slot, destination));
+            result.pushKV("destination_hex", HexStr(std::vector<unsigned char>(destination.begin(), destination.end())));
+            result.pushKV("deposit_fee_sats", fee);
+            result.pushKV("sidechain_slot", *slot);
+            return result;
+        }};
+}
+
 static RPCHelpMan getdrivechainpegevents()
 {
     return RPCHelpMan{"getdrivechainpegevents",
@@ -5366,6 +5449,7 @@ void RegisterBlockchainRPCCommands(CRPCTable &t)
         {"blockchain", &getecxconsensuscontext},
         {"blockchain", &getecxbondinboxentries},
         {"blockchain", &getdrivechainpegevents},
+        {"blockchain", &getdrivechaindepositdestination},
         {"blockchain", &getdrivechainwithdrawalbundle},
         {"blockchain", &verifydrivechainwithdrawalbundle},
         {"blockchain", &submitdrivechainwithdrawal},

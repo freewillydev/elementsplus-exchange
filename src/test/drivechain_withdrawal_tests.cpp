@@ -2,11 +2,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/haskell_reference.h>
 #include <drivechain_withdrawal.h>
 
 #include <asset.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <crypto/common.h>
 #include <haskell/bridge.h>
 #include <haskell/bmm_constants.h>
 #include <init.h>
@@ -14,6 +16,7 @@
 #include <node/context.h>
 #include <node/drivechain_withdrawal_bundle.h>
 #include <primitives/txwitness.h>
+#include <rpc/protocol.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
@@ -24,6 +27,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -462,6 +467,162 @@ BOOST_AUTO_TEST_CASE(haskell_wallet_bundle_construction_boundary)
         BOOST_CHECK_THROW(BuildWithdrawalBundle(100,1,1,true,[&](const auto&) -> const std::vector<unsigned char>& {
             return short_reply;
         }),std::runtime_error);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(wallet_withdrawal_workflow_native_boundary)
+{
+    namespace hs = drivechain::haskell;
+    const auto scalar = [](uint64_t value) {
+        std::vector<unsigned char> bytes(8);
+        WriteLE64(bytes.data(),value);
+        return bytes;
+    };
+    // Independent procedural traces, including errors before and after commit.
+    for (unsigned route = 0; route < 7; ++route) {
+        const bool absent = route == 2, omitted = route == 6;
+        const bool verbose = route != 1 && !omitted;
+        const CAmount fee = omitted ? 0 : 1000;
+        const int expected_error = route == 3 ? -8 : route == 4 || route == 5 ? -4 : 0;
+        std::vector<uint32_t> expected{1,2,3};
+        const auto steps = [&](std::initializer_list<uint32_t> values) {
+            expected.insert(expected.end(),values.begin(),values.end());
+        };
+        if (!absent) {
+            steps({4,5,10,101,102,103,106,109,111,113,20,22});
+            if (!omitted) steps({23});
+            if (route == 3) steps({0});
+            else {
+                steps({24});
+                if (!omitted) steps({25});
+                steps({26});
+                if (!omitted) steps({27});
+                steps({28,29,30,31,32,40,41,42,43});
+                if (route == 4) steps({0});
+                else {
+                    steps({44,46});
+                    if (route == 5) steps({0});
+                    else steps({47,verbose ? 49U : 48U});
+                }
+            }
+        }
+        for (unsigned kind = 0; kind < 5; ++kind) {
+            for (size_t fault = 0; fault < (kind ? expected.size() : 1); ++fault) {
+                std::mutex mutex;
+                std::vector<uint32_t> seen;
+                std::vector<unsigned char> burn;
+                unsigned commits{0}, replies{0}, status{99}, caught{0};
+                {
+                    std::optional<std::unique_lock<std::mutex>> lock;
+                    const auto native = [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                        const size_t position = seen.size();
+                        seen.push_back(step);
+                        if (step >= 5) BOOST_REQUIRE(lock && lock->owns_lock());
+                        if (kind && position == fault) {
+                            if (kind == 1) throw std::logic_error("original wallet failure");
+                            if (kind == 2) throw 678;
+                            if (kind == 3) throw JSONRPCError(-912,"original RPC failure");
+                            return std::vector<unsigned char>(9,0);
+                        }
+                        if (step == 0) {
+                            if (!index) throw std::runtime_error(std::string(input.begin(),input.end()));
+                            BOOST_REQUIRE_EQUAL(index,1U);
+                            BOOST_REQUIRE(input.size() >= 4);
+                            throw JSONRPCError(static_cast<int32_t>(ReadLE32(input.data())),
+                                std::string(input.begin()+4,input.end()));
+                        }
+                        BOOST_REQUIRE_EQUAL(index,0U);
+                        if (step == 29) {
+                            BOOST_REQUIRE(input.size() >= 8);
+                            BOOST_CHECK_EQUAL(ReadLE64(input.data()),100000+fee);
+                            burn.assign(input.begin()+8,input.end());
+                        } else if (step == 47) {
+                            BOOST_REQUIRE_EQUAL(input.size(),4U);
+                            BOOST_CHECK_EQUAL(ReadLE32(input.data()),2U);
+                        } else BOOST_REQUIRE(input.empty());
+                        switch (step) {
+                        case 2: return scalar(3);
+                        case 3: return scalar(!absent);
+                        case 4: lock.emplace(mutex); break;
+                        case 20: {
+                            std::vector<unsigned char> frame(13,0);
+                            WriteLE64(frame.data(),100000);
+                            WriteLE32(frame.data()+8,31);
+                            frame[12]=1;
+                            return frame;
+                        }
+                        case 22: case 24: case 26: return scalar(omitted);
+                        case 23: return scalar(route == 3);
+                        case 25: return scalar(verbose);
+                        case 28: {
+                            auto frame=scalar(100000);
+                            const auto encoded_fee=scalar(fee);
+                            frame.insert(frame.end(),encoded_fee.begin(),encoded_fee.end());
+                            frame.insert(frame.end(),PARENT_GENESIS.begin(),PARENT_GENESIS.end());
+                            frame.insert(frame.end(),DESTINATION.begin(),DESTINATION.end());
+                            return frame;
+                        }
+                        case 41: ++commits; break;
+                        case 43: return scalar(route != 4);
+                        case 46: {
+                            std::vector<unsigned char> frame(PEGGED_ASSET.begin(),PEGGED_ASSET.end());
+                            frame.insert(frame.end(),PARENT_GENESIS.begin(),PARENT_GENESIS.end());
+                            frame.resize(92);
+                            WriteLE64(frame.data()+64,100000+fee);
+                            WriteLE64(frame.data()+72,100000);
+                            WriteLE64(frame.data()+80,fee);
+                            WriteLE32(frame.data()+88,burn.size());
+                            frame.insert(frame.end(),burn.begin(),burn.end());
+                            for (unsigned i=0; i<(route == 5 ? 2U : 1U); ++i) {
+                                const auto offset=frame.size();
+                                frame.resize(offset+49,1);
+                                WriteLE32(frame.data()+offset,2+i);
+                                std::copy(PEGGED_ASSET.begin(),PEGGED_ASSET.end(),frame.begin()+offset+4);
+                                WriteLE64(frame.data()+offset+40,100000+fee);
+                            }
+                            return frame;
+                        }
+                        case 48: case 49: ++replies; break;
+                        case 102: return scalar(44);
+                        case 109: return scalar(22);
+                        case 113: return scalar(8);
+                        }
+                        return scalar(1);
+                    };
+                    try {
+                        status=hs::RunReplayStore(hs::ReplayStoreWorkflow::WALLET_WITHDRAWAL,native);
+                    } catch (const UniValue& error) {
+                        caught=3;
+                        BOOST_CHECK_EQUAL(error["code"].getInt<int>(),kind == 3 ? -912 : expected_error);
+                        if (kind == 3) BOOST_CHECK_EQUAL(error["message"].get_str(),"original RPC failure");
+                    } catch (int value) {
+                        caught=2;
+                        BOOST_CHECK_EQUAL(value,678);
+                    } catch (const std::exception& error) {
+                        caught=1;
+                        if (kind == 1) BOOST_CHECK_EQUAL(error.what(),"original wallet failure");
+                    }
+                }
+                std::unique_lock recovered(mutex,std::try_to_lock);
+                BOOST_REQUIRE(recovered.owns_lock());
+                BOOST_CHECK_LE(commits,1U);
+                if (!kind) {
+                    BOOST_CHECK(seen == expected);
+                    BOOST_CHECK_EQUAL(caught,expected_error ? 3U : 0U);
+                    BOOST_CHECK_EQUAL(commits,absent || route == 3 ? 0U : 1U);
+                    BOOST_CHECK_EQUAL(replies,absent || expected_error ? 0U : 1U);
+                    if (!expected_error) BOOST_CHECK_EQUAL(status,absent ? 0U : 1U);
+                } else {
+                    std::vector<uint32_t> prefix(expected.begin(),expected.begin()+fault+1);
+                    if (kind == 4 && expected[fault] != 0) prefix.push_back(0);
+                    BOOST_CHECK(seen == prefix);
+                    BOOST_CHECK_EQUAL(caught,kind == 4 ? 1U : kind);
+                    BOOST_CHECK_EQUAL(replies,0U);
+                    const auto commit=std::find(expected.begin(),expected.end(),41);
+                    BOOST_CHECK_EQUAL(commits,commit < expected.begin()+fault ? 1U : 0U);
+                }
+            }
+        }
     }
 }
 

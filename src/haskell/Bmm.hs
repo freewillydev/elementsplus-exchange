@@ -11,16 +11,20 @@ import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import CapabilityContext
 import Workflow
-import Control.Monad (when, void, guard)
-import Control.Exception (evaluate)
+import Control.Monad (when, void, guard, unless, forM, forM_)
+import Control.Exception (Exception, SomeException, evaluate, finally, throwIO, try)
 import Data.Bits (testBit, (.&.), (.|.), shiftL, shiftR)
 import Data.Int (Int32, Int64)
 import Data.List (sort)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.Word (Word8, Word32, Word64)
-import Deposit (ReadPegFields, readPegFields)
-import ParentReplay (transition, Message(..))
+import Deposit (ReadPegFields, readPegFields, constructionScalar, constructionWord)
+import ParentReplay (transition, commitmentBytes)
+import qualified ParentReplay as R
+import qualified Exchange
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Withdrawal (readLE, wordLE)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Storable (peek, poke)
@@ -149,8 +153,14 @@ instance Validation BiddingFlow where
     SuccessorProbe phase result -> transition phase result [(1,(-10,2)),(2,(-12,-11))]
     RewardWalletFlow phase result -> transition phase result
       [(1,(-10,2)),(2,(-1,3)),(3,(-10,4)),(4,(5,6)),(5,(6,-11)),(6,(-1,3))]
+    -- Template result: unavailable (0), coinbase-only (1), transactions selected (2).
+    TemplateCreationFlow 3 result -> case result of
+      0 -> 4
+      1 -> -10
+      2 -> -11
+      _ -> -1
     TemplateCreationFlow phase result -> transition phase result
-      [(1,(2,3)),(2,(-1,-10)),(3,(4,-11)),(4,(-1,-10))]
+      [(1,(2,3)),(2,(-1,-10)),(4,(-1,-10))]
     FundedSubmissionFlow phase result -> transition phase result
       [(1,(-10,2)),(2,(3,4)),(3,(-1,-10)),(4,(-1,-11))]
     ProductionRoutingFlow phase result -> transition phase result
@@ -324,6 +334,94 @@ instance Validation RecoveryFlow where
       | phase>=12 -> transition phase result [(12,(65536+256+13,14)),(14,(1,1))]
       | otherwise -> validate (RecoveryPeerFlow phase result)
 
+-- Compose retrieval rules here; native callbacks retain JSON, transport and clocks.
+newtype BodyRecovery = BodyRecovery (Word32 -> IO Int64)
+class RecoveryReplies op where
+  isPrunedReply :: op -> ExceptT Int32 IO Bool
+  checkRecoveryReply :: op -> ExceptT Int32 IO ()
+class RecoveryHeader op where
+  recoveryHeight :: op -> ExceptT Int32 IO Int64
+class RecoveryPeers op where
+  requestRecoveryPeer :: op -> ExceptT Int32 IO ()
+class RecoveryEffects op where
+  recoveryEffect :: op -> Word32 -> IO Int64
+
+recoveryFlow :: Int32 -> (Word32 -> Word32 -> RecoveryFlow) -> (Word32 -> IO Int64) -> IO Int32
+recoveryFlow limit rule = validate . CommandFlow limit (\phase result -> validate (rule phase result))
+
+recoveryEffectChecked :: RecoveryEffects op => op -> Word32 -> ExceptT Int32 IO ()
+recoveryEffectChecked value step = do
+  result <- lift (recoveryEffect value step)
+  unless (result == 1) (throwE (-1))
+
+recoveryAccepted :: IO Int32 -> ExceptT Int32 IO ()
+recoveryAccepted run = lift run >>= \code -> unless (code == 0) (throwE code)
+
+instance RecoveryEffects BodyRecovery where
+  recoveryEffect (BodyRecovery native) = native
+instance RecoveryReplies BodyRecovery where
+  isPrunedReply (BodyRecovery native) = do
+    code <- lift (recoveryFlow 5 (RecoveryReplyFlow True) (native . (+100)))
+    case code of
+      0 -> pure True
+      1 -> pure False
+      _ -> throwE (-1)
+  checkRecoveryReply value@(BodyRecovery native) = do
+    code <- lift (recoveryFlow 2 (RecoveryReplyFlow False) (native . (+300)))
+    case code of
+      0 -> pure ()
+      1 -> recoveryEffectChecked value 303 >> throwE (-1)
+      _ -> throwE (-1)
+instance RecoveryHeader BodyRecovery where
+  recoveryHeight value@(BodyRecovery native) = do
+    recoveryEffectChecked value 200
+    checkRecoveryReply value
+    recoveryEffectChecked value 212
+    recoveryAccepted $ recoveryFlow 11 RecoveryHeaderFlow $ \step ->
+      if step == 7 then fmap (either (const (-1)) (const 1)) $ runExceptT $ do
+        recoveryEffectChecked value 207
+        checkRecoveryReply value
+        recoveryEffectChecked value 214
+      else native (200+step)
+    height <- lift (native 213)
+    unless (height >= 0 && height <= 2147483647) (throwE (-1))
+    pure height
+instance RecoveryPeers BodyRecovery where
+  requestRecoveryPeer value@(BodyRecovery native) = do
+    recoveryEffectChecked value 400
+    checkRecoveryReply value
+    recoveryEffectChecked value 415
+    recoveryAccepted $ recoveryFlow 14 RecoveryPeerReplyFlow $ \step ->
+      if step == 11 then fmap (either (const (-1)) (const 1)) $ runExceptT $ do
+        recoveryEffectChecked value 411
+        checkRecoveryReply value
+        recoveryEffectChecked value 417
+      else native (400+step)
+
+recoverParentBody :: (RecoveryReplies op, RecoveryHeader op, RecoveryPeers op, RecoveryEffects op) => op -> IO Int32
+recoverParentBody value = do
+  initialHeight <- newIORef 0
+  recoveryFlow 21 RecoveryBodyFlow $ \step -> fmap (either (const (-1)) id) $ runExceptT $ case step of
+    2 -> boolean <$> isPrunedReply value
+    15 -> boolean <$> isPrunedReply value
+    9 -> recoveryHeight value >>= lift . writeIORef initialHeight >> pure 1
+    10 -> requestRecoveryPeer value >> pure 1
+    20 -> do
+      current <- recoveryHeight value
+      initial <- lift (readIORef initialHeight)
+      pure (boolean (current == initial))
+    _ -> lift (recoveryEffect value step)
+  where boolean valid = if valid then 1 else 0
+
+type BodyRecoveryCapabilities = '[RecoveryReplies, RecoveryHeader, RecoveryPeers, RecoveryEffects]
+instance Operation BodyRecovery BodyRecoveryCapabilities where
+  type Context BodyRecovery = CapabilityContext BodyRecoveryCapabilities BodyRecovery
+  type Outcome BodyRecovery = IO Int32
+  data DSL BodyRecovery where
+    RecoverBody :: Context BodyRecovery => DSL BodyRecovery
+  interpret operation request = withOperation @BodyRecovery operation $ \value -> case request of
+    RecoverBody -> Just (recoverParentBody value)
+
 type WriteState = Ptr () -> Word32 -> Word32 -> IO Int32
 
 -- Probe: 0 resets failures, 1 succeeds, 2 is definitive, 3 preserves failures.
@@ -379,11 +477,38 @@ instance Validation ParentRpcAddress where
     ParentRpcIPv4 value -> value `shiftR` 24 == 127
     ParentRpcIPv6 bytes -> bytes == B.replicate 15 0 <> B.singleton 1
 
+class HostAdmission op where
+  admitRpcHost :: op -> IO Bool
+
+admitHostSnapshot :: B.ByteString -> IO Bool
+admitHostSnapshot bytes = case B.uncons bytes of
+  Just (0, rest) | B.null rest -> pure False
+  Just (4, rest) | B.length rest == 4 -> pure (validate (ParentRpcIPv4 (fromIntegral (readLE rest))))
+  Just (6, rest) | B.length rest == 16 -> pure (validate (ParentRpcIPv6 rest))
+  _ -> ioError (userError "invalid parent RPC host snapshot")
+
+newtype RpcHost = RpcHost NativeBytes
+instance HostAdmission RpcHost where
+  admitRpcHost (RpcHost native) = do
+    mode <- native 1 0 B.empty
+    if mode == wordLE 8 0 then pure True
+      else if mode == wordLE 8 1 then native 2 0 B.empty >>= admitHostSnapshot
+      else ioError (userError "invalid parent RPC host mode")
+instance Operation RpcHost '[HostAdmission] where
+  type Context RpcHost = CapabilityContext '[HostAdmission] RpcHost
+  type Outcome RpcHost = IO Int32
+  data DSL RpcHost where
+    CheckRpcHost :: Context RpcHost => DSL RpcHost
+  interpret operation request = withOperation @RpcHost operation $ \value ->
+    case request of
+      CheckRpcHost -> Just (fromIntegral . fromEnum <$> admitRpcHost value)
+
 data StageAdmission
   = RewardAddress (Word32 -> IO Int32)
   | NativeProduction (Word32 -> IO Int32)
   | EcxProduction (Word32 -> IO Int32)
   | SyncTick (Word32 -> IO Int32)
+  | SyncHeights Int64 Int64 (Word32 -> IO Int32)
 instance Validation StageAdmission where
   type ValidationResult StageAdmission = IO Int32
   validate request = case request of
@@ -397,6 +522,9 @@ instance Validation StageAdmission where
       [(1,101),(19,101),(2,102),(20,102),(3,103),(15,115),(4,104),
        (6,106),(16,116),(7,107),(9,109),(10,110),(12,112)]
     SyncTick action -> run 5 action
+    SyncHeights parent child action
+      | validate (ChildBehind child parent) -> orderedFacts action [(4,4),(5,5)] 0
+      | otherwise -> pure 3
     where
       run count action = orderedFacts action [(step,fromIntegral step) | step <- [1..count]] 0
       -- Reports cannot turn rejection into success; malformed replies do not log.
@@ -462,6 +590,38 @@ instance Validation WorkBudget where
                   if budget > maxBound `quot` 1000 then pure maxBound
                     else maybe (pure maxBound) (scan (index+1)) (addWork total (budget*1000))
         where next = scan (index+1) total
+
+data WorkMeasurement = WorkMeasurement Word32 Word64 Word64 NativeBytes
+instance Validation WorkMeasurement where
+  type ValidationResult WorkMeasurement = IO (Int32,Word64,Word64)
+  validate (WorkMeasurement mode count initial native)
+    | mode > 1 = pure (-1,initial,0)
+    | otherwise = scan 0 initial 0
+    where
+      scan index total lastWork
+        | index == count = pure (0,total,lastWork)
+        | otherwise = do
+            snapshot <- native 0 index B.empty
+            when (B.length snapshot `mod` 40 /= 0) (ioError (userError "invalid work snapshot"))
+            let field witness column = readLE (B.take 8 (B.drop (fromIntegral witness*40+column*8) snapshot))
+                readField step witness _ = case step of
+                  0 -> pure (field witness 0)
+                  1 -> pure (field witness (if field witness 1 == 0x50 then 2 else 1))
+                  2 -> pure (field witness (if field witness 1 == 0x50 then 4 else 3))
+                  3 -> do
+                    bytes <- native 1 witness (wordLE 8 index)
+                    if B.length bytes == 8 then pure (readLE bytes) else ioError (userError "invalid serialized work size")
+                  _ -> ioError (userError "invalid work field")
+                -- WorkBudget first asks for the last tag, then the selected
+                -- control tag. Distinguish those reads by their stack index.
+                readBudget step witness item
+                  | step == 1 && item == field witness 0-1 = pure (field witness 1)
+                  | otherwise = readField step witness item
+            work <- validate (WorkBudget (fromIntegral (B.length snapshot `div` 40)) readBudget)
+            case addWork total work of
+              Just next -> scan (index+1) next work
+              Nothing | mode == 0 -> pure (1,total,work)
+                      | otherwise -> scan (index+1) maxBound work
 
 data WorkQuote = WorkQuote Int64 Word64 Int64 Int64 Int64
 instance Validation WorkQuote where
@@ -645,6 +805,193 @@ instance Validation CredentialRead where
           else if count==maxBound-1 then pure (1,used)
           else if count>capacity-used then pure (-1,used)
           else if count==0 then pure (0,used) else go (used+count)
+
+newtype AuthFile = AuthFile NativeBytes
+
+class CredentialMetadata op where
+  inspectCredentialFile :: op -> IO Int32
+class CredentialContents op where
+  readCredentialFile :: op -> IO (Int32,Word64)
+class CredentialFileEffects op where
+  credentialFileEffect :: op -> Word32 -> Word64 -> IO Int64
+class CredentialFormat op where
+  validateCredentialRecord :: op -> Bool -> IO Int32
+
+authFileScalar :: NativeBytes -> Word32 -> Word64 -> B.ByteString -> IO Word64
+authFileScalar action step index input = do
+  bytes <- action step index input
+  if B.length bytes==8 then pure (readLE bytes)
+    else ioError (userError "invalid credential workflow scalar")
+
+instance CredentialFileEffects AuthFile where
+  credentialFileEffect (AuthFile action) step index =
+    fromIntegral <$> authFileScalar action step index B.empty
+instance CredentialMetadata AuthFile where
+  inspectCredentialFile value = validate (PrivateFileAdmission observe)
+    where
+      effect step = credentialFileEffect value step 0
+      observe 1 = effect 31 >>= \result -> case result of
+        0 -> pure 0
+        1 -> effect 38
+        _ -> pure (-1)
+      observe step = effect (step+30)
+instance CredentialContents AuthFile where
+  readCredentialFile (AuthFile action) = validate (CredentialRead 4097
+    (\offset available -> authFileScalar action 40 offset (wordLE 8 available)))
+instance CredentialFormat AuthFile where
+  validateCredentialRecord (AuthFile action) rotating = do
+    bytes <- action 50 0 B.empty
+    if B.length bytes>4096 then pure (-1)
+    else case validate (Exchange.ConfigurationField (if rotating then 7 else 8) bytes) of
+      Right accepted | accepted==B.singleton 1 -> pure 1
+      Left 1 -> do
+        reported <- authFileScalar action 60 0 B.empty
+        pure (if reported==1 then 0 else -1)
+      _ -> pure (-1)
+
+loadAuthFile :: (CredentialMetadata op, CredentialContents op, CredentialFileEffects op)
+  => op -> IO Int32
+loadAuthFile value = do
+  readResult <- newIORef (0,0)
+  let observe 6 = fromIntegral <$> inspectCredentialFile value
+      observe 7 = do
+        result@(status,_) <- readCredentialFile value
+        writeIORef readResult result
+        pure (fromIntegral status)
+      observe 9 = do
+        closed <- credentialFileEffect value 9 0
+        (status,_) <- readIORef readResult
+        pure (if closed==1 then fromIntegral status else -1)
+      observe 11 = readIORef readResult >>= \(_,used) -> credentialFileEffect value 11 used
+      observe step = credentialFileEffect value step 0
+  validate (CommandFlow 26 (\phase result -> validate (CredentialFileFlow phase result)) observe)
+
+loadAuthRecord :: (CredentialMetadata op, CredentialContents op, CredentialFileEffects op, CredentialFormat op)
+  => op -> Bool -> IO Int32
+loadAuthRecord value rotating = do
+  loaded <- loadAuthFile value
+  if loaded==1 then validateCredentialRecord value rotating else pure loaded
+
+type AuthFileCapabilities = '[CredentialMetadata, CredentialContents, CredentialFileEffects, CredentialFormat]
+instance Operation AuthFile AuthFileCapabilities where
+  type Context AuthFile = CapabilityContext AuthFileCapabilities AuthFile
+  type Outcome AuthFile = IO Int32
+  data DSL AuthFile where
+    ReadRawAuthFile :: Context AuthFile => DSL AuthFile
+    ReadStaticAuthRecord :: Context AuthFile => DSL AuthFile
+    ReadCookieAuthRecord :: Context AuthFile => DSL AuthFile
+  interpret operation request = withOperation @AuthFile operation $ \value ->
+    case request of
+      ReadRawAuthFile -> Just (loadAuthFile value)
+      ReadStaticAuthRecord -> Just (loadAuthRecord value False)
+      ReadCookieAuthRecord -> Just (loadAuthRecord value True)
+
+-- The transport composes the file capabilities here, without a dependency from
+-- parent replay back through BMM/exchange credential validation.
+newtype RpcSession = RpcSession NativeBytes
+newtype RpcTransportFailure = RpcTransportFailure R.RpcAttemptResult deriving Show
+instance Exception RpcTransportFailure
+
+rpcSessionBytes :: RpcSession -> NativeBytes
+rpcSessionBytes (RpcSession native) step index input = do
+  bytes <- native step index input
+  if step < 100 then pure bytes else case B.uncons bytes of
+    Just (1,rest) -> pure rest
+    Just (2,rest) | B.null rest -> throwIO (RpcTransportFailure R.RpcAuthenticationFailed)
+    Just (0,rest) | B.null rest -> throwIO (RpcTransportFailure R.RpcFailed)
+    _ -> ioError (userError "invalid parent RPC transport frame")
+
+rpcSessionScalar :: RpcSession -> Word32 -> IO Int64
+rpcSessionScalar value step = rpcSessionNumber value step B.empty
+
+rpcSessionNumber :: RpcSession -> Word32 -> B.ByteString -> IO Int64
+rpcSessionNumber value step input = do
+  body <- rpcSessionBytes value step 0 input
+  if B.length body == 8 then pure (fromIntegral (readLE body))
+    else ioError (userError "invalid parent RPC scalar")
+
+instance R.CredentialSource RpcSession where
+  selectCredential = R.selectCredential . R.RpcPreparation . (\value step -> rpcSessionScalar value (400+step))
+instance R.CredentialCache RpcSession where
+  cachedCredential = R.cachedCredential . R.RpcPreparation . (\value step -> rpcSessionScalar value (400+step))
+instance HostAdmission RpcSession where
+  admitRpcHost value = rpcSessionBytes value 444 0 B.empty >>= admitHostSnapshot
+instance R.CredentialLoader RpcSession where
+  loadCredential value = R.checkedStore 59 observe >> pure ()
+    where
+      effect step = do
+        status <- rpcSessionScalar value step
+        unless (status == 1) (ioError (userError "invalid credential file lifecycle result"))
+      file rotating = do
+        ready <- if rotating then do
+          chain <- rpcSessionBytes value 483 0 B.empty
+          let path = if validate (Exchange.NetworkSelection 3 0 chain) == 1 then ".cookie" else "regtest/.cookie"
+          rpcSessionNumber value 447 (C.pack path)
+          else rpcSessionScalar value 445
+        case ready of
+          0 -> pure 0
+          1 -> do
+            status <- loadAuthRecord (AuthFile (\step -> rpcSessionBytes value (500+step))) rotating
+              `finally` effect 480
+            when (rotating && status == 0) (effect 481)
+            when (rotating && status == 1) (effect 482)
+            pure (fromIntegral status)
+          _ -> pure (-1)
+      observe 4 = fromIntegral . fromEnum <$> admitRpcHost value
+      observe 5 = file False
+      observe 7 = file True
+      observe step = rpcSessionScalar value (440+step)
+
+instance R.RpcCircuit RpcSession where
+  admitRpcCall = R.admitRpcCall . R.RpcCall . rpcSessionScalar
+instance R.RpcAuthentication RpcSession where
+  retryRpcCall = R.retryRpcCall . R.RpcCall . rpcSessionScalar
+instance R.RpcFailure RpcSession where
+  rejectRpcCall = R.rejectRpcCall . R.RpcCall . rpcSessionScalar
+instance R.RpcReply RpcSession where
+  verifyRpcReply = R.verifyRpcReply . R.RpcCall . rpcSessionScalar
+instance R.RpcAttempt RpcSession where
+  attemptRpcCall value = do
+    let action = rpcSessionScalar value
+        accepted run = do
+          status <- lift run
+          unless (status >= 0 && status <= 3) (throwE (-1))
+        effect step = do
+          result <- lift (action step)
+          unless (result == 1) (throwE (-1))
+        deadline = accepted (R.runDeadline (action . (200+)))
+        request = do
+          deadline
+          effect 100
+          accepted (R.configureTimeout (R.RpcPreparation (action . (300+))))
+          effect 101
+          R.prepareCredentials value
+          effect 102
+          deadline
+          effect 103
+          deadline
+          effect 104
+          effect 105
+    -- Cleanup precedes cookie invalidation, retry and backoff even on failure.
+    result <- lift (try (runExceptT request) `finally` (action 11 >> pure ()))
+    case result of
+      Left (RpcTransportFailure failure) -> pure failure
+      Right status -> either throwE (const (pure R.RpcSucceeded)) status
+
+type RpcSessionCapabilities =
+  '[R.RpcCircuit, R.RpcAttempt, R.RpcAuthentication, R.RpcFailure, R.RpcReply,
+    R.CredentialSource, R.CredentialCache, R.CredentialLoader, HostAdmission]
+instance Operation RpcSession RpcSessionCapabilities where
+  type Context RpcSession = CapabilityContext RpcSessionCapabilities RpcSession
+  type Outcome RpcSession = IO Int32
+  data DSL RpcSession where
+    CallTransport :: Context RpcSession => DSL RpcSession
+    CallCheckedTransport :: Context RpcSession => DSL RpcSession
+  interpret operation request = withOperation @RpcSession operation $ \value ->
+    let run = fmap (either id (const 1)) . runExceptT
+    in case request of
+      CallTransport -> Just (run (R.performRpcCall value))
+      CallCheckedTransport -> Just (run (R.performRpcCall value >> R.verifyRpcReply value))
 
 data GrpcTextAdmission = GrpcTextAdmission B.ByteString B.ByteString
 instance Validation GrpcTextAdmission where
@@ -1007,15 +1354,16 @@ instance Validation DifficultyInterval where
 foreign import ccall "dynamic" writeState :: FunPtr WriteState -> WriteState
 
 class StateReplacement op where
-  replacementHeight :: op -> Int32
+  replacementHeight :: op -> IO Int32
   clearStoredState :: op -> IO ()
   prepareStoredState :: op -> IO ()
 
 replaceStoredState :: (StateReplacement op, Finalize op, FinalInput op ~ Word32, FinalResult op ~ ()) => op -> IO ()
 replaceStoredState request = do
+  height <- replacementHeight request
   clearStoredState request
   prepareStoredState request
-  finalize request (fromIntegral (max 0 (replacementHeight request)))
+  finalize request (fromIntegral (max 0 height))
 
 data StateWrite = StateWrite Int32 (FunPtr WriteState) (Ptr ())
                 | StateRestore Int32 (FunPtr WriteState) (Ptr ())
@@ -1061,8 +1409,8 @@ instance Operation StateEncode StateEncodeCapabilities where
   interpret operation request = withOperation @StateEncode operation $ \value -> case request of
     EncodeState -> Just (assembleStoredState value)
 instance StateReplacement StateWrite where
-  replacementHeight (StateWrite height _ _) = height
-  replacementHeight (StateRestore height _ _) = max 1 height - 1
+  replacementHeight (StateWrite height _ _) = pure height
+  replacementHeight (StateRestore height _ _) = pure (max 1 height - 1)
   clearStoredState request = stateAction request 0 0
   prepareStoredState request = stateAction request 1 0
 instance Finalize StateWrite where
@@ -1081,6 +1429,48 @@ instance Operation StateWrite StateWriteCapabilities where
     ReplaceState :: Context StateWrite => DSL StateWrite
   interpret operation request = withOperation @StateWrite operation $ \value -> case request of
     ReplaceState -> Just (replaceStoredState value)
+
+-- Encode and replace within one workflow; native effects never request a
+-- second Haskell encoding plan. The two products reuse the existing algebras.
+data PersistedOutput = PersistedOutput Bool NativeBytes
+newtype OutputEncoding = OutputEncoding NativeBytes
+
+instance StateAssembly OutputEncoding where
+  serializeMarker (OutputEncoding native) = stateEffect native 11 0 B.empty
+  serializeParent (OutputEncoding native) = stateEffect native 12 0 B.empty
+  pushStatePayload (OutputEncoding native) = stateEffect native 13 0 B.empty
+instance Finalize OutputEncoding where
+  type FinalInput OutputEncoding = ()
+  type FinalResult OutputEncoding = ()
+  finalize (OutputEncoding native) () = do
+    stateEffect native 14 117 B.empty
+    stateEffect native 14 0 B.empty
+
+instance StateReplacement PersistedOutput where
+  replacementHeight (PersistedOutput restore native) = do
+    values <- stateReplyWords native 0 1
+    case values of
+      [bits] | bits <= 0xffffffff -> do
+        let height = fromIntegral bits :: Int32
+        pure (if restore then max 1 height - 1 else height)
+      _ -> ioError (userError "invalid persisted output height")
+  clearStoredState (PersistedOutput _ native) = stateEffect native 10 0 B.empty
+  prepareStoredState (PersistedOutput _ native) = do
+    assembleStoredState (OutputEncoding native)
+    stateEffect native 15 0 B.empty
+instance Finalize PersistedOutput where
+  type FinalInput PersistedOutput = Word32
+  type FinalResult PersistedOutput = ()
+  finalize (PersistedOutput _ native) height = stateEffect native 16 (fromIntegral height) B.empty
+
+type PersistedOutputCapabilities = '[StateReplacement, Finalize]
+instance Operation PersistedOutput PersistedOutputCapabilities where
+  type Context PersistedOutput = CapabilityContext PersistedOutputCapabilities PersistedOutput
+  type Outcome PersistedOutput = IO Int32
+  data DSL PersistedOutput where
+    PersistOutput :: Context PersistedOutput => DSL PersistedOutput
+  interpret operation request = withOperation @PersistedOutput operation $ \value -> case request of
+    PersistOutput -> Just (replaceStoredState value >> pure 1)
 
 -- Field groups: scalars, blobs, public state/history, private state/history.
 type ReadFingerprint = Ptr () -> Word32 -> Word32 -> Ptr Word64 -> Ptr (Ptr Word8) -> IO Int32
@@ -1119,11 +1509,13 @@ fingerprintPayload source = do
       pure (blockHash ++ concatMap (bigEndian 4) fields ++ bigEndian 8 count ++ concatMap (bigEndian 4) times)
 
 data FingerprintRequest = FingerprintRequest (FunPtr ReadFingerprint) (Ptr ())
--- Exchange v9 field ordering. Native adapters expose values, not encoded layout.
+-- Exchange v10 field ordering. Native adapters expose values, not encoded layout.
 exchangeFingerprintPayload :: FingerprintSource op => op -> IO [Word8]
 exchangeFingerprintPayload source = do
   private <- fingerprintNumber source 0 37
   when (private > 1) (error "invalid exchange fingerprint mode")
+  swaps <- fingerprintNumber source 0 39
+  when (swaps > 1) (error "invalid swap fingerprint mode")
   parts <- sequence $
     [number 4 i | i <- [0..9]] ++ [number 8 i | i <- [10..20]] ++
     concat [[raw i, number 4 (21+i)] | i <- [0..2]] ++
@@ -1134,7 +1526,8 @@ exchangeFingerprintPayload source = do
      sized 8 21, sized 8 22] ++ [number 4 i | i <- [32..35]] ++
     [sized 8 23] ++ [raw i | i <- [24..62]] ++
     [number 8 36, pure [fromIntegral private],
-     if private == 1 then number 4 38 else pure (bigEndian 4 0)]
+     if private == 1 then number 4 38 else pure (bigEndian 4 0),
+     pure [fromIntegral swaps]] ++ [raw i | i <- [63..66]]
   pure (concat parts)
   where
     number width index = bigEndian width <$> fingerprintNumber source 0 index
@@ -1227,13 +1620,14 @@ scriptCall (SignetRequest reader context) action
       else if action == 0 then peekArray 4 out else pure []
 
 instance ScriptStream SignetRequest where
-  nextScriptStep request = do
-    fields <- scriptCall request 0
-    case fields of
-      [parsed,end,size,prefix] | parsed >= 0 && parsed <= 1 && end >= 0 && end <= 1 &&
-          size >= 0 && prefix >= 0 && prefix <= 0xffffffff ->
-        pure (if parsed == 0 then ScriptEnd (end == 1) else ScriptPush size prefix)
-      _ -> error "invalid signet script facts"
+  nextScriptStep request = scriptCall request 0 >>= signetScriptStep
+
+signetScriptStep :: [Int64] -> IO ScriptStep
+signetScriptStep [parsed,end,size,prefix]
+  | parsed >= 0 && parsed <= 1 && end >= 0 && end <= 1 &&
+      size >= 0 && prefix >= 0 && prefix <= 0xffffffff =
+    pure (if parsed == 0 then ScriptEnd (end == 1) else ScriptPush size prefix)
+signetScriptStep _ = error "invalid signet script facts"
 instance ScriptRewrite SignetRequest where
   editScript request action = void (scriptCall request (fromIntegral (fromEnum action) + 1))
 instance Finalize SignetRequest where
@@ -1252,6 +1646,131 @@ instance Operation SignetRequest ScriptCapabilities where
     ExtractSignet :: Context SignetRequest => DSL SignetRequest
   interpret operation request = withOperation @SignetRequest operation $ \value -> case request of
     ExtractSignet -> Just (extractSignet value)
+
+-- Parent-header and BMM validation share construction and witness selection,
+-- but retain their different native decoding and Merkle-proof contracts.
+class SignetConstruction op where
+  buildSignetTransactions :: op -> ExceptT Int32 IO ()
+  writeSignetBlockData :: op -> ExceptT Int32 IO ()
+class SignetCommitment op where
+  selectSignetCommitment :: op -> ExceptT Int32 IO Bool
+
+signetEffect :: NativeBytes -> Word32 -> Word64 -> ExceptT Int32 IO ()
+signetEffect native step index = do
+  value <- lift (constructionScalar native step index)
+  unless (value == 1) (throwE (-1))
+
+constructSignet :: NativeBytes -> ExceptT Int32 IO ()
+constructSignet native = do
+  let fields = B.concat (map (wordLE 4 . fromIntegral) (validate SignetTemplate))
+  forM_ (validate (SignetActions 0)) $ \action -> do
+    reply <- lift (native (200+action) 0 fields)
+    unless (reply == wordLE 8 1) (throwE (-1))
+
+writeSignetData :: NativeBytes -> ExceptT Int32 IO ()
+writeSignetData native = mapM_ (\field -> signetEffect native (300+field) 0) (validate (Preimage 1))
+
+selectSignetWitness :: NativeBytes -> ExceptT Int32 IO Bool
+selectSignetWitness native = do
+  count <- lift (constructionScalar native 500 0)
+  unless (count <= fromIntegral (maxBound :: Word32)) (throwE (-1))
+  let scan index found
+        | index == count = do
+            answer <- lift (constructionScalar native 502 found)
+            case answer of
+              0 -> pure False
+              1 -> pure True
+              _ -> throwE (-1)
+        | otherwise = do
+            facts <- lift (native 501 index B.empty)
+            unless (B.length facts == 16) (throwE (-1))
+            let matches = witnessCommitment (fromIntegral (readLE (B.take 8 facts)))
+                  (fromIntegral (readLE (B.drop 8 facts)))
+            matches `seq` scan (index+1) (if matches then index else found)
+  scan 0 maxBound
+
+newtype SignetSession = SignetSession NativeBytes
+class SignetProof op where
+  signetScope :: op -> IO a -> IO a
+  signetFacts :: op -> Word32 -> IO [Word64]
+  signetResult :: op -> Int32 -> IO Bool
+
+instance ScriptStream SignetSession where
+  nextScriptStep (SignetSession native) = map fromIntegral <$> proofWords native 10 4 >>= signetScriptStep
+instance ScriptRewrite SignetSession where
+  editScript (SignetSession native) action = stateEffect native (11+fromIntegral (fromEnum action)) 0 B.empty
+instance Finalize SignetSession where
+  type FinalInput SignetSession = Bool
+  type FinalResult SignetSession = Int32
+  finalize value found = when found (editScript value PublishScript) >> pure 1
+
+instance SignetConstruction SignetSession where
+  buildSignetTransactions (SignetSession native) = constructSignet (\step -> native (step-180))
+  writeSignetBlockData (SignetSession native) = writeSignetData (\step -> native (step-270))
+instance SignetCommitment SignetSession where
+  selectSignetCommitment (SignetSession native) = selectSignetWitness (\step -> native (step-460))
+
+signetChecked :: ExceptT Int32 IO a -> IO a
+signetChecked action = runExceptT action >>= either (const (ioError (userError "invalid signet projection"))) pure
+
+instance SignetProof SignetSession where
+  signetScope (SignetSession native) action =
+    stateEffect native 0 0 B.empty >> action `finally` stateEffect native 1 0 B.empty
+  signetFacts (SignetSession native) step = case step of
+    2 -> stateEffect native 54 0 B.empty >> pure [1,0,0,0]
+    3 -> answer <$> proofBoolean native 53
+    4 -> do
+      -- The old BMM decoder catches all exceptions, unlike parent authentication.
+      result <- try @SomeException $ do
+        let required s = proofScalar native s >>= \ok -> unless (ok == 1) (ioError (userError "signet decode failure"))
+        required 60
+        mapM_ (required . (61+)) (validate (SignetActions 1))
+        proofScalar native 63 >>= \status -> case status of
+          0 -> pure 0
+          1 -> pure 1
+          _ -> ioError (userError "signet decode failure")
+      stateEffect native 64 0 B.empty
+      pure [either (const 2) id result,0,0,0]
+    5 -> proofWords native 50 4
+    6 -> answer <$> proofBoolean native 51
+    7 -> answer <$> proofBoolean native 52
+    _ -> ioError (userError "invalid signet observation")
+    where answer ok = [fromIntegral (fromEnum ok),0,0,0]
+  signetResult (SignetSession native) result
+    | result == 0 = pure True
+    | result >= -6 && result <= -1 = do
+        stateEffect native 90 0 (C.pack (messages !! fromIntegral (-result-1)))
+        pure False
+    | otherwise = ioError (userError "invalid signet validation result")
+    where messages = ["BMM parent block has no Bitcoin witness commitment",
+            "BMM parent block has a malformed signet commitment script",
+            "BMM parent block signet solution contains trailing data",
+            "BMM parent block signet solution cannot be decoded",
+            "BMM signet proof does not authenticate exactly the coinbase",
+            "BMM parent block signet solution is invalid"]
+
+verifySignetSession :: (SignetConstruction op, SignetCommitment op, SignetProof op,
+    ScriptStream op, ScriptRewrite op, Finalize op, FinalInput op ~ Bool, FinalResult op ~ Int32)
+  => op -> IO Bool
+verifySignetSession value = signetScope value $
+  validate (ProofExecution 0 0 observe) >>= signetResult value
+  where
+    observe 1 = do
+      found <- signetChecked (selectSignetCommitment value)
+      pure [fromIntegral (fromEnum found),0,0,0]
+    observe 2 = signetFacts value 2 >> extractSignet value >>= \ok -> pure [fromIntegral ok,0,0,0]
+    observe 3 = signetChecked (buildSignetTransactions value) >> signetFacts value 3
+    observe 7 = signetChecked (writeSignetBlockData value) >> signetFacts value 7
+    observe step = signetFacts value step
+
+type SignetSessionCapabilities = '[SignetConstruction, SignetCommitment, SignetProof, ScriptStream, ScriptRewrite, Finalize]
+instance Operation SignetSession SignetSessionCapabilities where
+  type Context SignetSession = CapabilityContext SignetSessionCapabilities SignetSession
+  type Outcome SignetSession = IO Bool
+  data DSL SignetSession where
+    VerifySignetSession :: Context SignetSession => DSL SignetSession
+  interpret operation request = withOperation @SignetSession operation $ \value -> case request of
+    VerifySignetSession -> Just (verifySignetSession value)
 
 -- Positive results select the next action, zero accepts, negative results reject.
 data SignetValidation = SignetValidation Word32 Word64 Word64 Word64 Word64
@@ -1292,15 +1811,351 @@ instance Validation ProofExecution where
             if kind == 1 && phase == 19 then pure 0
               else run (nextProofStep (fromIntegral phase) fields)
 
+-- Compose proof decisions inside the traversal; native replies contain facts,
+-- not the results of another Haskell entry. Extended steps retain lazy reads.
+data ProofWorkflow = ProofWorkflow Word32 (Word32 -> IO [Word64])
+instance Validation ProofWorkflow where
+  type ValidationResult ProofWorkflow = IO Int32
+  validate (ProofWorkflow start native)
+    | start `notElem` [0,11,21] = pure minBound
+    | otherwise = either id id <$> runExceptT (if start == 21 then do
+        _ <- readFields 22 >>= rule 13
+        accepted <- boolean 23
+        pure (if accepted then 0 else -1)
+      else run (validate (Traversal start 0 0)))
+    where
+      readFields step = do
+        fields <- lift (native step)
+        case fields of
+          [_,_,_,_] -> pure fields
+          _ -> throwE minBound
+      boolean step = do
+        fields <- readFields step
+        case head fields of
+          0 -> pure False
+          1 -> pure True
+          _ -> throwE minBound
+      rule :: Word32 -> [Word64] -> ExceptT Int32 IO [Word64]
+      rule phase [flags,a,b,c]
+        | flags <= fromIntegral (maxBound :: Word32) =
+            case validate (Proof phase (fromIntegral flags) a b c) of
+              0 -> pure [1,0,0,0]
+              code | code > 0 -> throwE (100+code)
+              _ -> throwE minBound
+      rule _ _ = throwE minBound
+      reply 1 = do
+        fields <- readFields 1
+        _ <- rule 0 fields
+        readFields 147
+      reply 20 = do
+        ready <- boolean 200
+        when (not ready) (throwE minBound)
+        let decode step bits
+              | step == 205 = pure bits
+              | otherwise = do
+                  accepted <- boolean step
+                  if accepted then decode (step+1) (bits .|. (1 `shiftL` fromIntegral (step-201)))
+                    else pure bits
+        decoded <- decode 201 0
+        fields <- readFields 205
+        case fields of
+          [coinbase,inputs,0,0] | coinbase <= 1 -> rule 2 [decoded .|. (coinbase `shiftL` 4),inputs,0,0]
+          _ -> throwE minBound
+      reply 5 = do
+        let extend [] = pure True
+            extend (step:rest) = boolean step >>= \accepted ->
+              if accepted then extend rest else pure False
+        accepted <- extend [150,151,152]
+        _ <- rule 4 [if accepted then 7 else 0,0,0,0]
+        fields <- readFields 154
+        case fields of
+          [flags,signet,0,0] | signet <= 1 -> do
+            _ <- rule 11 [flags,0,0,0]
+            _ <- readFields 155 >>= rule 12
+            pure [1,signet,0,0]
+          _ -> throwE minBound
+      reply step
+        | Just phase <- lookup step [(2,1),(3,3),(4,10),(8,5),(10,6),(12,7),(13,8),(15,9)] =
+            readFields step >>= rule phase
+        | otherwise = readFields step
+      run phase
+        | phase < -2 || phase > 20 = throwE minBound
+        | phase <= 0 = pure phase
+        | otherwise = do
+            fields <- reply (fromIntegral phase)
+            case fields of
+              a:b:_ | phase == 19 -> pure 0
+                    | otherwise -> run (validate (Traversal (fromIntegral phase) a b))
+              _ -> throwE minBound
+
+-- A proof session composes codecs and traversal without a native callback
+-- re-entering the ABI for the next workflow. Native objects remain borrowed.
+newtype ProofSession = ProofSession NativeBytes
+class ProofCoding op where
+  encodeProofBytes :: op -> IO Bool
+  decodeProofBytes :: op -> IO Bool
+class ProofEnvelopeAccess op where
+  resetProofError :: op -> IO ()
+  proofFacts :: op -> Word32 -> IO [Word64]
+  proofHeaderEnabled :: op -> IO Bool
+  publishProofCommitment :: op -> IO ()
+  proofResult :: op -> Int32 -> IO Bool
+class ProofSequence op where
+  verifyProofSequence :: op -> IO Bool
+
+class ProofHeaderEvolution op where
+  type ProofHeaderState op
+  inspectProofState :: op -> IO (Maybe (ProofHeaderState op))
+  beginProofHeaders :: op -> ProofHeaderState op -> IO (ProofHeaderState op)
+  matchesProofParent :: op -> ProofHeaderState op -> IO Bool
+  matchesProofBits :: op -> ProofHeaderState op -> IO Bool
+  exceedsProofMedian :: op -> ProofHeaderState op -> IO Bool
+  advanceProofHeader :: op -> ProofHeaderState op -> IO (ProofHeaderState op, [Word64])
+  publishProofState :: op -> ProofHeaderState op -> IO ()
+
+data ProofHeaderProgress = ProofHeaderProgress
+  { proofStateHash :: B.ByteString, proofStateFields :: [Word32]
+  , proofStateInterval :: Int64, proofStateTimespan :: Int64
+  , proofEntryCount :: Word64, proofEntryPosition :: Word64 }
+
+proofWords :: NativeBytes -> Word32 -> Int -> IO [Word64]
+proofWords native step count = do
+  bytes <- native step 0 B.empty
+  unless (B.length bytes == count*8) (ioError (userError "invalid proof session reply"))
+  pure [readLE (B.take 8 (B.drop (8*i) bytes)) | i <- [0..count-1]]
+
+proofScalar :: NativeBytes -> Word32 -> IO Word64
+proofScalar native step = head <$> proofWords native step 1
+
+proofBoolean :: NativeBytes -> Word32 -> IO Bool
+proofBoolean native step = proofScalar native step >>= \value -> case value of
+  0 -> pure False
+  1 -> pure True
+  _ -> ioError (userError "invalid proof session boolean")
+
+rejectProof :: NativeBytes -> String -> IO Bool
+rejectProof native message = stateEffect native 390 0 (C.pack message) >> pure False
+
+proofBytes :: NativeBytes -> Word32 -> Int -> B.ByteString -> IO B.ByteString
+proofBytes native step size input = do
+  bytes <- native step 0 input
+  unless (B.length bytes == size) (ioError (userError "invalid proof header projection"))
+  pure bytes
+
+proofEvaluation :: NativeBytes -> String -> IO a -> IO a
+proofEvaluation native message action = do
+  result <- try @SomeException action
+  case result of
+    Right value -> pure value
+    Left _ -> native 409 0 (C.pack message) >> ioError (userError message)
+
+headerDWords :: B.ByteString -> [Word32]
+headerDWords bytes = [fromIntegral (readLE (B.take 4 (B.drop offset bytes))) | offset <- [0,4..B.length bytes-4]]
+
+instance ProofHeaderEvolution ProofSession where
+  type ProofHeaderState ProofSession = ProofHeaderProgress
+  inspectProofState (ProofSession native) = do
+    fields <- proofWords native 400 11
+    case fields of
+      [hash,timespan,spacing,height,time,bits,start,startTime,count,latest,entries]
+        | hash <= 1 && all (<= 0xffffffff) [height,time,bits,start,startTime,latest] -> do
+          interval <- proofEvaluation native "Haskell difficulty interval failed" $
+            evaluate (validate (DifficultyInterval (fromIntegral timespan) (fromIntegral spacing)))
+          let valid = validate (ParentState (fromIntegral hash) interval (fromIntegral height) (fromIntegral time)
+                (fromIntegral bits) (fromIntegral start) (fromIntegral startTime) count (fromIntegral latest)) == 0
+          if not valid then rejectProof native "BMM parent-chain state is malformed" >> pure Nothing
+            else pure (Just (ProofHeaderProgress B.empty (map fromIntegral [height,time,bits,start,startTime])
+              interval (fromIntegral timespan) entries 0))
+      _ -> ioError (userError "invalid proof state projection")
+  beginProofHeaders (ProofSession native) state = do
+    bytes <- proofBytes native 401 97 B.empty
+    unless (B.index bytes 52 == 11) (ioError (userError "invalid proof state history"))
+    let fields = headerDWords (B.take 20 (B.drop 32 bytes) <> B.drop 53 bytes)
+    unless (take 5 fields == proofStateFields state) (ioError (userError "inconsistent proof state projection"))
+    pure state {proofStateHash = B.take 32 bytes, proofStateFields = fields}
+  matchesProofParent (ProofSession native) state =
+    (== proofStateHash state) <$> proofBytes native 402 32 B.empty
+  matchesProofBits (ProofSession native) state = do
+    (height,time,bits,startTime) <- case take 5 (proofStateFields state) of
+      [height,time,bits,_,startTime] -> pure (height,time,bits,startTime)
+      _ -> ioError (userError "invalid proof header state")
+    timing <- proofEvaluation native "Haskell BMM retarget evaluation failed" $
+      evaluate (validate (Retarget height (proofStateInterval state) (proofStateTimespan state) time startTime))
+    expected <- if timing == -1 then pure bits else do
+      targets <- proofBytes native 405 64 (wordLE 4 (fromIntegral bits))
+      scaled <- proofEvaluation native "Haskell BMM target scaling failed" $
+        mapM evaluate (validate (TargetScale (fromIntegral timing) (fromIntegral (proofStateTimespan state))
+          (B.unpack (B.take 32 targets)) (B.unpack (B.drop 32 targets))))
+      fromIntegral . readLE <$> proofBytes native 406 4 (B.pack scaled)
+    actual <- headerDWords <$> proofBytes native 403 8 B.empty
+    pure (actual !! 1 == expected)
+  exceedsProofMedian (ProofSession native) state = do
+    actual <- headerDWords <$> proofBytes native 403 8 B.empty
+    let median = validate (Median (drop 5 (proofStateFields state)))
+    pure (fromIntegral (head actual) > median)
+  advanceProofHeader (ProofSession native) state = do
+    [time,bits] <- headerDWords <$> proofBytes native 403 8 B.empty
+    fields <- proofEvaluation native "Haskell BMM advancement failed" $
+      mapM evaluate (validate (Advance (proofStateInterval state) time bits (proofStateFields state)))
+    hash <- proofBytes native 404 32 B.empty
+    stateEffect native 408 0 B.empty
+    pure (state {proofStateHash = hash, proofStateFields = fields, proofEntryPosition = proofEntryPosition state + 1},
+      [proofEntryPosition state,proofEntryCount state,0,0])
+  publishProofState (ProofSession native) state = do
+    let fields = map (wordLE 4 . fromIntegral) (proofStateFields state)
+    stateEffect native 407 0 (proofStateHash state <> B.concat (take 5 fields) <> B.singleton 11 <> B.concat (drop 5 fields))
+
+proofCodecRule :: NativeBytes -> Word32 -> Word32 -> Word64 -> Word64 -> IO Bool
+proofCodecRule native phase facts a b = case validate (Codec phase facts a b) of
+  0 -> pure True
+  code | code >= 1 && code <= 4 -> rejectProof native (messages !! (fromIntegral code-1))
+  _ -> ioError (userError "invalid proof session codec result")
+  where
+    messages = ["serialized BMM proof exceeds its consensus size bound",
+      "BMM proof is empty or exceeds its consensus size bound",
+      "BMM proof is malformed or non-canonical",
+      "cannot attach BMM proof without the header version bit"]
+
+instance ProofCoding ProofSession where
+  encodeProofBytes value@(ProofSession native) = do
+    resetProofError value
+    reply <- native 300 0 B.empty
+    case B.uncons reply of
+      Just (0,message) -> rejectProof native (C.unpack message)
+      Just (1,bytes) | B.length bytes == 8 -> proofCodecRule native 0 0 (readLE bytes) Constants.proofBytes
+      _ -> ioError (userError "invalid proof serialization reply")
+  decodeProofBytes value@(ProofSession native) = do
+    resetProofError value
+    size <- proofScalar native 301
+    bounded <- proofCodecRule native 1 0 size Constants.proofBytes
+    if not bounded then pure False else do
+      decoded <- proofBoolean native 302
+      version <- if decoded then (== Constants.schemaVersion) <$> proofScalar native 303 else pure False
+      count <- if version then proofScalar native 304 else pure 0
+      shape <- proofCodecRule native 2 (fromIntegral (fromEnum decoded + 2*fromEnum version)) count Constants.proofEntries
+      if not shape then pure False else do
+        canonical <- proofBoolean native 305
+        proofCodecRule native 3 (if canonical then 1 else 0) 0 0
+
+instance ProofEnvelopeAccess ProofSession where
+  resetProofError (ProofSession native) = stateEffect native 392 0 B.empty
+  proofFacts (ProofSession native) step
+    | step == 6 = do
+        accepted <- verifySignetSession (SignetSession (\s -> native (700+s)))
+        pure [fromIntegral (fromEnum accepted),0,0,0]
+    | Just offset <- lookup step [(9,500),(23,600)] = do
+        accepted <- extractSelectedCommitment (CommitmentSession (\s -> native (offset+s)))
+        pure [fromIntegral (fromEnum accepted),0,0,0]
+    | otherwise = proofWords native step 4
+  proofHeaderEnabled (ProofSession native) = do
+    present <- proofBoolean native 306
+    proofCodecRule native 4 (if present then 1 else 0) 0 0
+  publishProofCommitment (ProofSession native) = stateEffect native 307 0 B.empty
+  proofResult (ProofSession native) result
+    | result >= 101 && result <= 111 = rejectProof native (messages !! (fromIntegral result-101))
+    | result < -2 || result > 20 = ioError (userError "invalid proof traversal result")
+    | result == -2 = do
+        empty <- proofBoolean native 391
+        if empty then rejectProof native "BMM parent header does not extend the authenticated state" else pure False
+    | otherwise = pure (result == 0)
+    where
+      messages = ["BMM proof envelope is invalid",
+        "BMM proof entry exceeds its transaction or Merkle proof bound",
+        "BMM proof entry has a malformed or non-canonical coinbase proof",
+        "BMM Merkle proof does not authenticate exactly the parent coinbase",
+        "BMM parent header does not extend the authenticated state",
+        "BMM proof final header is not the successor of the committed L1 parent",
+        "BMM successor commitment does not match the sidechain critical hash",
+        "sidechain block does not commit its exact BMM proof bytes",
+        "BMM proof does not extend the locally authenticated parent-chain state",
+        "BMM proof contains an invalid parent-chain proof-of-work header",
+        "sidechain block has no coinbase transaction"]
+
+instance ProofSequence ProofSession where
+  verifyProofSequence = evolveProofHeaders
+
+-- The validated parent state stays in Haskell for the entire header sequence.
+-- Native adapters expose immutable facts and crypto, and publish only at success.
+evolveProofHeaders :: (ProofHeaderEvolution op, ProofEnvelopeAccess op) => op -> IO Bool
+evolveProofHeaders value = do
+  resetProofError value
+  current <- newIORef Nothing
+  let withState action = readIORef current >>= maybe (ioError (userError "missing proof header state")) action
+      answer accepted = [if accepted then 1 else 0,0,0,0]
+      observe 147 = do
+        state <- inspectProofState value
+        writeIORef current state
+        pure (answer (maybe False (const True) state))
+      observe 18 = withState $ \state -> do
+        next <- beginProofHeaders value state
+        writeIORef current (Just next)
+        pure (answer True)
+      observe 150 = withState (fmap answer . matchesProofParent value)
+      observe 151 = withState (fmap answer . matchesProofBits value)
+      observe 152 = withState (fmap answer . exceedsProofMedian value)
+      observe 7 = withState $ \state -> do
+        (next,position) <- advanceProofHeader value state
+        writeIORef current (Just next)
+        pure position
+      observe 19 = withState $ \state -> publishProofState value state >> pure (answer True)
+      observe step = proofFacts value step
+  validate (ProofWorkflow 0 observe) >>= proofResult value
+
+attachProofEnvelope :: (ProofCoding op, ProofEnvelopeAccess op) => op -> IO Bool
+attachProofEnvelope value = do
+  resetProofError value
+  enabled <- proofHeaderEnabled value
+  if not enabled then pure False else do
+    encoded <- encodeProofBytes value
+    if encoded then publishProofCommitment value >> pure True else pure False
+
+verifyProofParent :: ProofEnvelopeAccess op => op -> IO Bool
+verifyProofParent value = validate (ProofWorkflow 21 (proofFacts value)) >>= proofResult value
+
+verifyProofEnvelope :: (ProofCoding op, ProofEnvelopeAccess op, ProofSequence op) => op -> IO Bool
+verifyProofEnvelope value = do
+  resetProofError value
+  let result accepted = [if accepted then 1 else 0,0,0,0]
+      observe 14 = result <$> decodeProofBytes value
+      observe 16 = result <$> verifyProofParent value
+      observe 17 = do
+        ready <- proofFacts value 17
+        unless (ready == [1,0,0,0]) (ioError (userError "invalid proof sequence preparation"))
+        result <$> verifyProofSequence value
+      observe step = proofFacts value step
+  validate (ProofWorkflow 11 observe) >>= proofResult value
+
+type ProofSessionCapabilities = '[ProofCoding, ProofEnvelopeAccess, ProofHeaderEvolution, ProofSequence]
+instance Operation ProofSession ProofSessionCapabilities where
+  type Context ProofSession = CapabilityContext ProofSessionCapabilities ProofSession
+  type Outcome ProofSession = IO Int32
+  data DSL ProofSession where
+    EncodeProof :: Context ProofSession => DSL ProofSession
+    DecodeProof :: Context ProofSession => DSL ProofSession
+    AttachProof :: Context ProofSession => DSL ProofSession
+    VerifyProofEntries :: Context ProofSession => DSL ProofSession
+    VerifyProofBlock :: Context ProofSession => DSL ProofSession
+    VerifyProofParent :: Context ProofSession => DSL ProofSession
+  interpret operation request = withOperation @ProofSession operation $ \value ->
+    let reply = Just . fmap (fromIntegral . fromEnum) in case request of
+      EncodeProof -> reply (encodeProofBytes value)
+      DecodeProof -> reply (decodeProofBytes value)
+      AttachProof -> reply (attachProofEnvelope value)
+      VerifyProofEntries -> reply (verifyProofSequence value)
+      VerifyProofBlock -> reply (verifyProofEnvelope value)
+      VerifyProofParent -> reply (verifyProofParent value)
+
 data HeaderLayout = HeaderLayout Word32 Word32
 instance Validation HeaderLayout where
   type ValidationResult HeaderLayout = Maybe (Word32,Word32)
   validate (HeaderLayout version flags)
-    | flags > 47 || (flags > 16 && flags < 32) = Nothing
-    | flags == 16 = Just (version,rawFields)
+    | flags > 127 || legacyFlags > 47 || (legacyFlags > 16 && legacyFlags < 32) = Nothing
+    | legacyFlags == 16 = Just (version,rawFields)
     | not (testBit flags 0) = Just (version,0)
     | otherwise = Just (normalized,fields)
     where
+      legacyFlags = flags .&. 63
+      swapForced = testBit flags 6 && testBit version Constants.swapForcedHeaderBit
       reading = testBit flags 1
       withdrawal = if reading then testBit version Constants.withdrawalHeaderBit else testBit flags 2
       dynamic = if reading then testBit version 31 else testBit flags 3
@@ -1309,19 +2164,13 @@ instance Validation HeaderLayout where
         (if reading then 0 else present withdrawal Constants.withdrawalHeaderBit .|. present dynamic 31)
       fields = present withdrawal 0 .|. present dynamic 6 .|. extensions .|. present (testBit flags 5) 8
       rawFields = present (testBit version Constants.withdrawalHeaderBit) 0 .|. present (testBit version 31) 6 .|. extensions
-      extensions = extensionFields .|. present (extensionFields .&. 24 == 24) 7
+      extensions = extensionFields .|. present (extensionFields .&. 24 == 24) 7 .|. present swapForced 9
       extensionFields = sum [present (testBit version bit) position | (bit,position) <- zip Constants.headerExtensionBits [1..5]]
 
 data CommitmentBytes = CommitmentBytes Word32 [Word8]
 instance Validation CommitmentBytes where
   type ValidationResult CommitmentBytes = [Word8]
-  validate (CommitmentBytes 0 bytes) | length bytes == 37 = reverse (drop 5 bytes)
-  validate (CommitmentBytes 1 bytes) | length bytes == 32 = bytes
-  validate (CommitmentBytes 2 bytes) = case validate (Message bytes) of
-    (5,_,_) -> validate (CommitmentBytes 0 bytes)
-    (kind,_,_) | kind == 2 || kind == 3 -> validate (CommitmentBytes 1 (drop 5 bytes))
-    _ -> error "parent message has no commitment hash"
-  validate _ = error "invalid commitment payload"
+  validate (CommitmentBytes mode bytes) = commitmentBytes mode bytes
 
 newtype SignetActions = SignetActions Word32
 instance Validation SignetActions where
@@ -1365,6 +2214,73 @@ instance Validation Signature where
   validate (SignatureGate witness size index inputs) =
     if witness /= 0 && size /= 0 && fromIntegral index < inputs then 1 else 0
 
+-- Native effects hash/serialize existing Bitcoin objects. Mode selection,
+-- short-circuiting and all signature planning stay inside this one invocation.
+data SignatureWorkflow
+  = SignatureHashWorkflow Int32 Word32 Word64 NativeBytes
+  | SignatureVerifyWorkflow Word32 Word32 Word32 Word64 Word64 B.ByteString NativeBytes
+data SignaturePlan = SignaturePlan Int32 Word32 Word64
+class SignaturePreparation op where
+  prepareSignature :: op -> ExceptT Int32 IO SignaturePlan
+class SignatureHashing op where
+  hashSignature :: op -> SignaturePlan -> ExceptT Int32 IO ()
+class SignatureVerification op where
+  verifySignature :: op -> ExceptT Int32 IO ()
+
+signatureNative :: SignatureWorkflow -> NativeBytes
+signatureNative (SignatureHashWorkflow _ _ _ native) = native
+signatureNative (SignatureVerifyWorkflow _ _ _ _ _ _ native) = native
+
+signatureEffect :: NativeBytes -> Word32 -> Word64 -> B.ByteString -> ExceptT Int32 IO ()
+signatureEffect native step index input = do
+  reply <- lift (native step index input)
+  when (not (B.null reply)) (throwE (-1))
+
+signatureRequired :: NativeBytes -> Word32 -> ExceptT Int32 IO ()
+signatureRequired native step = do
+  reply <- lift (native step 0 B.empty)
+  case B.unpack reply of
+    [1] -> pure ()
+    [0] -> throwE 0
+    _ -> throwE (-1)
+
+instance SignaturePreparation SignatureWorkflow where
+  prepareSignature (SignatureHashWorkflow hashType index outputs _) = pure (SignaturePlan hashType index outputs)
+  prepareSignature (SignatureVerifyWorkflow mode witness index inputs outputs signature native) = do
+      when (mode > 1) (throwE (-1))
+      let (gateIndex, gateInputs) = if mode == 1 then (0,1) else (index,inputs)
+      when (validate (SignatureGate witness (fromIntegral (B.length signature)) gateIndex gateInputs) /= 1) (throwE 0)
+      when (mode == 1) (signatureRequired native 0)
+      signatureRequired native 1
+      let (prefix, hashType) = validate (SignatureBytes (B.unpack signature))
+      signatureEffect native 2 (fromIntegral hashType) (B.take (fromIntegral prefix) signature)
+      pure (SignaturePlan (fromIntegral hashType) index outputs)
+instance SignatureHashing SignatureWorkflow where
+  hashSignature request (SignaturePlan hashType index outputs) = do
+    let native = signatureNative request
+        plan = fromIntegral (validate (HashPlan hashType index outputs))
+        actions = map (100+) (validate (SignatureActions plan)) ++
+          map (200+) (validate (Preimage 0)) ++ [210]
+    signatureEffect native 4 0 (B.pack (map fromIntegral actions))
+instance SignatureVerification SignatureWorkflow where
+  verifySignature (SignatureHashWorkflow _ _ _ _) = pure ()
+  verifySignature request = signatureRequired (signatureNative request) 3
+
+runSignature :: (SignaturePreparation op, SignatureHashing op, SignatureVerification op) => op -> IO Int32
+runSignature value = either id (const 1) <$> runExceptT (do
+  plan <- prepareSignature value
+  hashSignature value plan
+  verifySignature value)
+
+type SignatureCapabilities = '[SignaturePreparation, SignatureHashing, SignatureVerification]
+instance Operation SignatureWorkflow SignatureCapabilities where
+  type Context SignatureWorkflow = CapabilityContext SignatureCapabilities SignatureWorkflow
+  type Outcome SignatureWorkflow = IO Int32
+  data DSL SignatureWorkflow where
+    RunSignature :: Context SignatureWorkflow => DSL SignatureWorkflow
+  interpret operation request = withOperation @SignatureWorkflow operation $ \value -> case request of
+    RunSignature -> Just (runSignature value)
+
 data TargetScale = TargetScale Word64 Word64 [Word8] [Word8]
 instance Validation TargetScale where
   type ValidationResult TargetScale = [Word8]
@@ -1399,6 +2315,24 @@ instance Validation Timing where
     0 -> -1
     time -> time
 
+data RetargetWorkflow = RetargetWorkflow Word32 Int64 Int64 Word32 Word32 NativeBytes
+instance Validation RetargetWorkflow where
+  type ValidationResult RetargetWorkflow = IO Int32
+  validate (RetargetWorkflow height interval target time start native) = do
+    timing <- try @SomeException (evaluate (validate (Retarget height interval target time start)))
+    case timing of
+      Left _ -> pure (-2)
+      Right (-1) -> pure 0
+      Right spanTime -> do
+        bytes <- native 0 0 B.empty
+        if B.length bytes /= 64 then pure (-1) else do
+          scaled <- try @SomeException $ mapM evaluate (validate (TargetScale
+            (fromIntegral spanTime) (fromIntegral target)
+            (B.unpack (B.take 32 bytes)) (B.unpack (B.drop 32 bytes))))
+          case scaled of
+            Left _ -> pure (-3)
+            Right result -> native 1 0 (B.pack result) >> pure 0
+
 -- Upstream GetOp projects two nine-bit opcodes (256 = failure), consumed,
 -- payload size, first four bytes little-endian, and the fifth byte.
 -- Kind 2 instead supplies raw script size and its first six bytes little-endian.
@@ -1406,16 +2340,34 @@ type ReadScript = Ptr () -> Word32 -> Word32 -> Ptr Int64 -> IO Int32
 foreign import ccall "dynamic" readScript :: FunPtr ReadScript -> ReadScript
 
 data Commitment = Commitment Word32 Int32 Word32 (FunPtr ReadScript) (Ptr ())
+
+class CommitmentScripts op where
+  inspectCommitmentScript :: op -> Word32 -> Word32 -> IO [Int64]
+
+instance CommitmentScripts Commitment where
+  inspectCommitmentScript (Commitment _ _ _ reader context) index action =
+    allocaArray 4 $ \out -> do
+      status <- readScript reader context index action out
+      if status /= 1 then error "BMM script adapter fault" else peekArray 4 out
+
+witnessCommitment :: Int64 -> Int64 -> Bool
+witnessCommitment size prefix
+  | size < 0 || prefix < 0 || prefix > 0xffffffffffff = error "BMM witness facts out of range"
+  | otherwise = size >= 38 && prefix == 0xeda921aa246a
+
 instance Validation Commitment where
   type ValidationResult Commitment = IO Int64
-  validate (Commitment kind slot count reader context)
+  validate value@(Commitment kind slot count reader _)
     | kind > 3 = error "invalid BMM commitment kind"
     | count /= 0 && reader == nullFunPtr = error "missing BMM script adapter"
+    | otherwise = selectCommitment value kind slot count
+
+selectCommitment :: CommitmentScripts op => op -> Word32 -> Int32 -> Word32 -> IO Int64
+selectCommitment value kind slot count
+    | kind > 3 = error "invalid BMM commitment kind"
     | otherwise = go 0 Nothing
     where
-      inspect index action = allocaArray 4 $ \out -> do
-        status <- readScript reader context index action out
-        if status /= 1 then error "BMM script adapter fault" else peekArray 4 out
+      inspect = inspectCommitmentScript value
       scriptFields index
         | kind == 2 = inspect index 0
         | otherwise = do
@@ -1433,8 +2385,8 @@ instance Validation Commitment where
             fields <- scriptFields index
             case fields of
               [size,prefix,_,_] | kind == 2 ->
-                if size < 0 || prefix < 0 || prefix > 0xffffffffffff then error "BMM witness facts out of range"
-                else go (index+1) (if size >= 38 && prefix == 0xeda921aa246a then Just index else found)
+                let matches = witnessCommitment size prefix
+                in matches `seq` go (index+1) (if matches then Just index else found)
               [script,size,magic,actualSlot]
                 | script < 0 || script > 524287 || size < 0 -> error "BMM script facts out of range"
                 | kind == 3 ->
@@ -1454,6 +2406,69 @@ instance Validation Commitment where
                       Just _ -> pure (-2)
                 | otherwise -> go (index+1) found
               _ -> error "BMM script field count"
+
+-- Selection and extraction share one borrowed script cursor. Failed selections
+-- never reparse/publish; tagged parents retain their earlier scan-time effect.
+newtype CommitmentSession = CommitmentSession NativeBytes
+class CommitmentPublication op where
+  commitmentSpecification :: op -> IO (Word32,Int32,Word32)
+  readCommitmentPayload :: op -> Word32 -> IO B.ByteString
+  publishCommitment :: op -> B.ByteString -> IO ()
+  rejectCommitment :: op -> String -> IO ()
+
+instance CommitmentScripts CommitmentSession where
+  inspectCommitmentScript (CommitmentSession native) index action = do
+    bytes <- native (10+action) (fromIntegral index) B.empty
+    unless (B.length bytes == 32) (ioError (userError "invalid BMM script projection"))
+    pure [fromIntegral (readLE (B.take 8 (B.drop offset bytes))) | offset <- [0,8,16,24]]
+
+instance CommitmentPublication CommitmentSession where
+  commitmentSpecification (CommitmentSession native) = do
+    fields <- proofWords native 0 3
+    case fields of
+      [kind,slot,count] | kind <= 3 && count <= 0xffffffff &&
+          let signed = fromIntegral slot :: Int64 in signed >= -2147483648 && signed <= 2147483647 ->
+        pure (fromIntegral kind,fromIntegral slot,fromIntegral count)
+      _ -> ioError (userError "invalid BMM commitment specification")
+  readCommitmentPayload (CommitmentSession native) index = do
+    stateEffect native 20 (fromIntegral index) B.empty
+    stateEffect native 21 (fromIntegral index) B.empty
+    native 22 (fromIntegral index) B.empty
+  publishCommitment (CommitmentSession native) = stateEffect native 23 0
+  rejectCommitment (CommitmentSession native) = stateEffect native 90 0 . C.pack
+
+commitmentSelectionError :: Word32 -> Int64 -> Maybe String
+commitmentSelectionError kind result = lookup (kind,result)
+  [((0,-1),"BMM successor coinbase has no M8 commitment for slot 24"),
+   ((0,-2),"BMM successor coinbase contains multiple M8 commitments for slot 24"),
+   ((1,-1),"sidechain block has no L1 parent commitment"),
+   ((1,-2),"sidechain block has multiple L1 parent commitments"),
+   ((3,-4),"block coinbase contains a noncanonical ELMTP parent commitment"),
+   ((3,-2),"block coinbase contains multiple canonical drivechain parent commitments"),
+   ((3,-1),"block coinbase does not contain one canonical ELMTP drivechain parent commitment")]
+
+extractSelectedCommitment :: (CommitmentScripts op, CommitmentPublication op) => op -> IO Bool
+extractSelectedCommitment value = do
+  (kind,slot,count) <- commitmentSpecification value
+  selected <- selectCommitment value kind slot count
+  case commitmentSelectionError kind selected of
+    Just message -> rejectCommitment value message >> pure False
+    Nothing | selected < 0 -> pure False
+    Nothing -> do
+      when (kind <= 1) $ do
+        payload <- readCommitmentPayload value (fromIntegral selected)
+        bytes <- evaluate (B.pack (commitmentBytes kind (B.unpack payload)))
+        publishCommitment value bytes
+      pure True
+
+type CommitmentCapabilities = '[CommitmentScripts, CommitmentPublication]
+instance Operation CommitmentSession CommitmentCapabilities where
+  type Context CommitmentSession = CapabilityContext CommitmentCapabilities CommitmentSession
+  type Outcome CommitmentSession = IO Int32
+  data DSL CommitmentSession where
+    ExtractSelectedCommitment :: Context CommitmentSession => DSL CommitmentSession
+  interpret operation request = withOperation @CommitmentSession operation $ \value -> case request of
+    ExtractSelectedCommitment -> Just (fromIntegral . fromEnum <$> extractSelectedCommitment value)
 
 data ParentState = ParentState Word32 Int64 Word32 Word32 Word32 Word32 Word32 Word64 Word32
 instance Validation ParentState where
@@ -1494,6 +2509,347 @@ instance Validation Activation where
     4 | facts <= 1 -> if toInteger height + toInteger facts >= toInteger activation then 1 else 0
     _ -> -1
 
+-- Header admission owns the lazy activation query. The native side only reads
+-- chain/configuration facts and publishes the original rejection text.
+newtype HeaderPolicy = HeaderPolicy NativeBytes
+class ProofRequirement op where
+  requiresProof :: op -> IO Bool
+class HeaderObservation op where
+  headerFacts :: op -> IO Word32
+  rejectHeader :: op -> Int32 -> IO ()
+
+headerPolicyAbort :: NativeBytes -> String -> IO a
+headerPolicyAbort native message = do
+  void (native 0 0 (C.pack message))
+  ioError (userError message)
+
+headerPolicyWords :: NativeBytes -> Word32 -> Int -> IO [Word64]
+headerPolicyWords native step count = do
+  bytes <- native step 0 B.empty
+  unless (B.length bytes == count*8) (headerPolicyAbort native "invalid BMM header policy reply")
+  pure [readLE (B.take 8 (B.drop (8*i) bytes)) | i <- [0..count-1]]
+
+headerPolicyScalar :: NativeBytes -> Word32 -> Word64 -> IO Word32
+headerPolicyScalar native step limit = do
+  values <- headerPolicyWords native step 1
+  case values of
+    [value] | value <= limit -> pure (fromIntegral value)
+    _ -> headerPolicyAbort native "invalid BMM header policy scalar"
+
+instance ProofRequirement HeaderPolicy where
+  requiresProof (HeaderPolicy native) = do
+    flags <- headerPolicyScalar native 1 3
+    if validate (Activation 0 flags 0 0) /= 2 then pure False else do
+      private <- headerPolicyScalar native 2 1
+      result <- if private == 0 then do
+        ancestry <- headerPolicyScalar native 4 3
+        pure (validate (Activation 2 ancestry 0 0))
+        else do
+          fields <- headerPolicyWords native 3 3
+          case fields of
+            [present,height,activation] | present <= 1 ->
+              pure (validate (Activation 1 (fromIntegral present) (fromIntegral height) (fromIntegral activation)))
+            _ -> headerPolicyAbort native "invalid BMM activation reply"
+      case result of
+        -2 -> headerPolicyAbort native "-ecxprivatebmmcheckpoint requires an explicit -ecxprivatebmmactivationheight"
+        -3 -> headerPolicyAbort native "invalid -ecxprivatebmmactivationheight"
+        0 -> pure False
+        1 -> pure True
+        _ -> headerPolicyAbort native "Haskell BMM activation evaluation failed"
+
+instance HeaderObservation HeaderPolicy where
+  headerFacts (HeaderPolicy native) = do
+    facts <- headerPolicyScalar native 10 255
+    when (testBit facts 6) (headerPolicyAbort native "invalid BMM header preflight")
+    pure facts
+  rejectHeader (HeaderPolicy native) code = do
+    let messages = ["historical signet BMM proof is not valid on native Elements",
+          "public-signet height 2 does not match its immutable checkpoint",
+          "public-signet descendant does not signal deterministic BMM proof",
+          "deterministic BMM header has no proof commitment",
+          "deterministic BMM proof cannot activate outside the public-signet checkpoint"]
+    unless (code >= 1 && code <= 5) (headerPolicyAbort native "Haskell BMM header evaluation failed")
+    reply <- native 11 0 (C.pack (messages !! (fromIntegral code-1)))
+    unless (reply == wordLE 8 1) (headerPolicyAbort native "invalid BMM header rejection reply")
+
+checkHeaderPolicy :: (ProofRequirement op, HeaderObservation op) => op -> IO Int32
+checkHeaderPolicy value = do
+  facts <- headerFacts value
+  let preflight = validate (Header facts)
+  result <- if preflight /= 6 then pure preflight else do
+    required <- requiresProof value
+    pure (validate (Header (facts .|. (if required then 64 else 0) .|. 256)))
+  if result == 0 then pure 1 else rejectHeader value result >> pure 0
+
+type HeaderPolicyCapabilities = '[ProofRequirement, HeaderObservation]
+instance Operation HeaderPolicy HeaderPolicyCapabilities where
+  type Context HeaderPolicy = CapabilityContext HeaderPolicyCapabilities HeaderPolicy
+  type Outcome HeaderPolicy = IO Int32
+  data DSL HeaderPolicy where
+    ProofIsRequired :: Context HeaderPolicy => DSL HeaderPolicy
+    CheckHeaderPolicy :: Context HeaderPolicy => DSL HeaderPolicy
+  interpret operation request = withOperation @HeaderPolicy operation $ \value -> case request of
+    ProofIsRequired -> Just (fromIntegral . fromEnum <$> requiresProof value)
+    CheckHeaderPolicy -> Just (checkHeaderPolicy value)
+
+newtype StoredBmmState = StoredBmmState NativeBytes
+class StateLoading op where
+  loadParentState :: op -> IO (Either String Bool)
+class CheckpointSelection op where
+  checkpointFact :: op -> Word32 -> IO Bool
+  publishCheckpoint :: op -> Bool -> IO ()
+class ParentContextAccess op where
+  validParentContext :: op -> IO Bool
+  parentContextMedian :: op -> IO Int64
+  publishParentContext :: op -> Int64 -> IO ()
+class StateReporting op where
+  reportParentState :: op -> Either String Bool -> IO Int32
+
+-- Only the old payload-decoding region catches native exceptions. Its native
+-- replies carry a success byte so recovery does not poison the FFI session.
+stateReplyWords :: NativeBytes -> Word32 -> Int -> IO [Word64]
+stateReplyWords native step count = do
+  reply <- native step 0 B.empty
+  let owned = step >= 20 && step <= 25
+      bytes = if owned then B.drop 1 reply else reply
+  unless ((not owned || B.take 1 reply == B.singleton 1) && B.length bytes == count*8)
+    (ioError (userError "invalid BMM state observation"))
+  pure [readLE (B.take 8 (B.drop (8*i) bytes)) | i <- [0..count-1]]
+
+stateFlag :: NativeBytes -> Word32 -> IO Bool
+stateFlag native step = do
+  values <- stateReplyWords native step 1
+  case values of
+    [value] | value <= 1 -> pure (value == 1)
+    _ -> ioError (userError "invalid BMM state flag")
+
+stateEffect :: NativeBytes -> Word32 -> Word64 -> B.ByteString -> IO ()
+stateEffect native step index input = do
+  reply <- native step index input
+  unless (reply == wordLE 8 1) (ioError (userError "invalid BMM state effect"))
+
+instance ParentContextAccess StoredBmmState where
+  validParentContext (StoredBmmState native) = do
+    private <- stateFlag native 24
+    fields <- stateReplyWords native 23 8
+    let (preset,_,_) = validate (ConsensusPreset (if private then 1 else 0))
+        interval = case preset of
+          timespan:spacing:_ -> validate (DifficultyInterval (fromIntegral timespan) (fromIntegral spacing))
+          _ -> error "invalid BMM consensus preset fields"
+    case fields of
+      [hash,height,time,bits,start,startTime,count,latest]
+        | hash <= 1 && all (<= 0xffffffff) [height,time,bits,start,startTime,latest] ->
+          pure (validate (ParentState (fromIntegral hash) interval (fromIntegral height) (fromIntegral time)
+            (fromIntegral bits) (fromIntegral start) (fromIntegral startTime) count (fromIntegral latest)) == 0)
+      _ -> ioError (userError "invalid BMM state fields")
+  parentContextMedian (StoredBmmState native) = do
+    history <- stateReplyWords native 25 11
+    unless (all (<= 0xffffffff) history) (ioError (userError "invalid BMM history"))
+    evaluate (validate (ParentMedian (map fromIntegral history)))
+  publishParentContext (StoredBmmState native) median = stateEffect native 26 0 (wordLE 8 (fromIntegral median))
+
+instance StateLoading StoredBmmState where
+  loadParentState value@(StoredBmmState native) = runExceptT $ do
+    present <- lift (stateFlag native 1)
+    if not present then pure False else do
+      forM_ [2..6] $ \step -> do
+        accepted <- lift (stateFlag native step)
+        unless accepted (throwE "persisted BMM state has invalid asset or value encoding")
+      forM_ [(10,6),(11,7),(12,8)] $ \(step,phase) -> do
+        fields <- lift (stateReplyWords native step 2)
+        let result = case fields of
+              [facts,opcode] | facts <= 3 && opcode <= 255 -> validate (Codec phase (fromIntegral facts) opcode 0)
+              _ -> -1
+        when (result < 0) (lift (ioError (userError "invalid BMM script observation")))
+        unless (result == 0) (throwE "persisted BMM state script is malformed")
+      decoded <- lift $ try @SomeException $ runExceptT $ do
+        forM_ [20,21] $ \step -> do
+          fields <- lift (stateReplyWords native step 0)
+          unless (null fields) (lift (ioError (userError "invalid BMM decode effect")))
+        flags <- lift (stateReplyWords native 22 1)
+        unless (flags == [3]) (throwE "persisted BMM state payload is invalid")
+        valid <- lift (validParentContext value)
+        unless valid (throwE "BMM parent-chain state is malformed")
+        pure True
+      either (const (throwE "persisted BMM state payload cannot be decoded")) (either throwE pure) decoded
+
+instance CheckpointSelection StoredBmmState where
+  checkpointFact (StoredBmmState native) = stateFlag native
+  publishCheckpoint (StoredBmmState native) private = do
+    let mode = if private then 1 else 0
+        (fields,hash) = validate (CheckpointPreset mode)
+    stateEffect native 33 (fromIntegral mode) (B.pack hash <> B.concat (map (wordLE 4 . fromIntegral) fields))
+instance StateReporting StoredBmmState where
+  reportParentState (StoredBmmState native) = either
+    (\message -> stateEffect native 90 0 (C.pack message) >> pure 0)
+    (pure . fromIntegral . fromEnum)
+
+effectiveParentState :: (StateLoading op, CheckpointSelection op) => op -> IO (Either String Bool)
+effectiveParentState value = do
+  native <- checkpointFact value 30
+  if native then pure (Left "native Elements requires its authenticated parent replay, not signet BMM state") else do
+    loaded <- loadParentState value
+    case loaded of
+      Right False -> do
+        public <- checkpointFact value 31
+        if public then publishCheckpoint value False >> pure (Right True) else do
+          private <- checkpointFact value 32
+          if private then publishCheckpoint value True >> pure (Right True)
+            else pure (Left "authenticated BMM parent-chain state is missing")
+      _ -> pure loaded
+
+prepareParentContext :: ParentContextAccess op => op -> IO (Either String Bool)
+prepareParentContext value = do
+  valid <- validParentContext value
+  if not valid then pure (Left "BMM parent-chain state is malformed") else do
+    median <- parentContextMedian value
+    if median < 0 then pure (Left "authenticated BMM parent median time past is zero")
+      else publishParentContext value median >> pure (Right True)
+
+type StoredBmmCapabilities = '[StateLoading, CheckpointSelection, ParentContextAccess, StateReporting]
+instance Operation StoredBmmState StoredBmmCapabilities where
+  type Context StoredBmmState = CapabilityContext StoredBmmCapabilities StoredBmmState
+  type Outcome StoredBmmState = IO Int32
+  data DSL StoredBmmState where
+    ReadParentState :: Context StoredBmmState => DSL StoredBmmState
+    EffectiveParentState :: Context StoredBmmState => DSL StoredBmmState
+    PrepareParentContext :: Context StoredBmmState => DSL StoredBmmState
+  interpret operation request = withOperation @StoredBmmState operation $ \value -> case request of
+    ReadParentState -> Just (loadParentState value >>= reportParentState value)
+    EffectiveParentState -> Just (effectiveParentState value >>= reportParentState value)
+    PrepareParentContext -> Just (prepareParentContext value >>= reportParentState value)
+
+-- Chain sessions keep the state, proof and storage subworkflows inside Haskell.
+-- Routes select borrowed native object adapters, never another FFI entry.
+newtype ChainSession = ChainSession NativeBytes
+data ChainOutput = InitialOutput | NextOutput | PriorOutput deriving (Eq, Enum)
+class ChainObservations op where
+  chainFact :: op -> Word32 -> IO Bool
+  chainFailure :: op -> String -> IO ()
+  chainError :: op -> IO String
+class ChainStateAccess op where
+  loadChainState :: op -> IO (Either String Bool)
+  effectiveChainState :: op -> IO Bool
+  matchesChainCheckpoint :: op -> IO Bool
+  storeChainState :: op -> ChainOutput -> IO ()
+class ChainProofAccess op where
+  checkChainHeader :: op -> IO Bool
+  chainProofRequired :: op -> IO Bool
+  decodeChainProof :: op -> IO Bool
+  extractChainParent :: op -> IO Bool
+  verifyChainProof :: op -> Bool -> IO Bool
+
+chainRoute :: Word32 -> NativeBytes -> NativeBytes
+chainRoute base native step = native (base+step)
+
+instance ChainObservations ChainSession where
+  chainFact (ChainSession native) = stateFlag native
+  chainFailure (ChainSession native) message = stateEffect native 90 0 (C.pack message)
+  chainError (ChainSession native) = C.unpack <$> native 92 0 B.empty
+instance ChainStateAccess ChainSession where
+  loadChainState (ChainSession native) = loadParentState (StoredBmmState (chainRoute 2000 native))
+  effectiveChainState (ChainSession native) = do
+    let state = StoredBmmState (chainRoute 2000 native)
+    (==1) <$> (effectiveParentState state >>= reportParentState state)
+  matchesChainCheckpoint (ChainSession native) = do
+    current <- native 8 0 B.empty
+    let (fields,hash) = validate (CheckpointPreset 0)
+        encoded = map (wordLE 4 . fromIntegral) fields
+    pure (current == B.pack hash <> B.concat (take 5 encoded) <> B.singleton 11 <> B.concat (drop 5 encoded))
+  storeChainState (ChainSession native) output = do
+    when (output == InitialOutput) (publishCheckpoint (StoredBmmState (chainRoute 2000 native)) False)
+    stateEffect native 5000 (fromIntegral (fromEnum output)) B.empty
+    replaceStoredState (PersistedOutput (output == PriorOutput) (chainRoute 4000 native))
+instance ChainProofAccess ChainSession where
+  checkChainHeader value@(ChainSession native) = do
+    chainFailure value ""
+    (==1) <$> checkHeaderPolicy (HeaderPolicy (chainRoute 1000 native))
+  chainProofRequired (ChainSession native) = requiresProof (HeaderPolicy (chainRoute 1000 native))
+  decodeChainProof (ChainSession native) = decodeProofBytes (ProofSession (chainRoute 3000 native))
+  extractChainParent (ChainSession native) = verifyProofParent (ProofSession (chainRoute 3000 native))
+  verifyChainProof (ChainSession native) entriesOnly = do
+    private <- stateFlag (chainRoute 1000 native) 2
+    let (fields,limit,challenge) = validate (ConsensusPreset (if private then 1 else 0))
+    stateEffect native 2999 0 (B.concat (map (wordLE 8) fields) <> B.pack limit <> B.pack challenge)
+    let proof = ProofSession (chainRoute 3000 native)
+    if entriesOnly then stateEffect native 2998 0 B.empty >> verifyProofSequence proof
+      else verifyProofEnvelope proof
+
+runChainLifecycle :: (ChainObservations op, ChainStateAccess op, ChainProofAccess op) => Bool -> op -> IO Int32
+runChainLifecycle disconnect value = do
+  stateError <- newIORef ""
+  let number = fromIntegral . fromEnum
+      fact step = number <$> chainFact value step
+      checkpoint = andM (map (chainFact value) [10,11,12])
+      load = do
+        result <- loadChainState value
+        case result of
+          Left message -> writeIORef stateError message >> pure (False,not (null message))
+          Right found -> pure (found,False)
+      observe 1 = fact 0
+      observe 2 = number <$> checkChainHeader value
+      observe 4 = number <$> checkpoint
+      observe 5 = do (found,bad) <- load; pure (number found + 2*number bad)
+      observe 6 = storeChainState value InitialOutput >> pure 1
+      observe 7 = do
+        required <- chainProofRequired value
+        present <- if required then pure False else chainFact value 1
+        pure (number required + 2*number present)
+      observe 8 = do
+        allow <- chainFact value 4
+        present <- chainFact value 1
+        uncommitted <- chainFact value 3
+        nonempty <- chainFact value 2
+        pure (number allow + 2*number present + 4*number uncommitted + 8*number (not nonempty))
+      observe 9 = number <$> effectiveChainState value
+      observe 10 = number <$> verifyChainProof value False
+      observe 11 = storeChainState value NextOutput >> pure 1
+      observe 13 = number <$> checkpoint
+      observe 14 = do
+        (found,bad) <- load
+        same <- if found then matchesChainCheckpoint value else pure False
+        pure (number found + 2*number same + 4*number bad)
+      observe 15 = fact 6
+      observe 16 = fact 1
+      observe 17 = number <$> decodeChainProof value
+      observe 18 = do (found,bad) <- load; pure (number found + 2*number bad)
+      observe 19 = number <$> extractChainParent value
+      observe 20 = storeChainState value PriorOutput >> pure 1
+      observe 21 = number <$> verifyChainProof value True
+      observe 22 = fact 7
+      observe 23 = pure 0
+      observe 108 = fact 2
+      observe 109 = fact 5
+      observe _ = ioError (userError "invalid BMM chain observation")
+  result <- validate (StateWorkflow (if disconnect then 12 else 0) observe)
+  let messages = ["historical signet BMM state is not valid on native Elements",
+        "public BMM checkpoint cannot overwrite existing parent-chain state", "",
+        "public BMM checkpoint state is inconsistent during disconnect",
+        "public BMM checkpoint state could not be removed",
+        "cannot disconnect BMM proof without authenticated state",
+        "BMM state is inconsistent during disconnect"]
+  if result == 0 then pure 1 else if result == 1 then pure 0 else
+    if result >= 101 && result <= 107 then do
+      message <- if result == 103 then readIORef stateError else pure (messages !! (fromIntegral result-101))
+      preserve <- if result == 107 then not . null <$> chainError value else pure False
+      unless preserve (chainFailure value message)
+      pure 0
+    else ioError (userError "invalid BMM chain result")
+  where
+    andM [] = pure True
+    andM (test:rest) = test >>= \accepted -> if accepted then andM rest else pure False
+
+type ChainCapabilities = '[ChainObservations, ChainStateAccess, ChainProofAccess]
+instance Operation ChainSession ChainCapabilities where
+  type Context ChainSession = CapabilityContext ChainCapabilities ChainSession
+  type Outcome ChainSession = IO Int32
+  data DSL ChainSession where
+    ConnectChainState :: Context ChainSession => DSL ChainSession
+    DisconnectChainState :: Context ChainSession => DSL ChainSession
+  interpret operation request = withOperation @ChainSession operation $ \value -> case request of
+    ConnectChainState -> Just (runChainLifecycle False value)
+    DisconnectChainState -> Just (runChainLifecycle True value)
+
 data StateExecution = StateExecution Word32 (Word32 -> IO Int64)
 instance Validation StateExecution where
   type ValidationResult StateExecution = IO Int32
@@ -1507,6 +2863,41 @@ instance Validation StateExecution where
             if reply < fromIntegral (minBound :: Int32) || reply > fromIntegral (maxBound :: Int32)
               then pure (-1)
               else run (validate (StateFlow (fromIntegral phase) (fromIntegral reply)))
+
+-- Lifecycle and source decisions run inside the traversal. Native callbacks
+-- return facts or perform effects; they do not re-enter these decision rules.
+data StateWorkflow = StateWorkflow Word32 (Word32 -> IO Int64)
+instance Validation StateWorkflow where
+  type ValidationResult StateWorkflow = IO Int32
+  validate (StateWorkflow start native)
+    | start `notElem` [0,12,68] = pure (-1)
+    | otherwise = either id id <$> runExceptT (run (validate (StateFlow start 0)))
+    where
+      facts step = do
+        value <- lift (native step)
+        when (value < 0 || value > fromIntegral (maxBound :: Word32)) (throwE (-1))
+        pure (fromIntegral value)
+      decision base value = if value < 0 then throwE (base-value) else pure value
+      lifecycle phase value = decision 100 (validate (Lifecycle phase value))
+      reply step
+        | step == 3 = do
+            present <- facts 108
+            when (present > 1) (throwE (-1))
+            stored <- if present == 1 then pure 1 else facts 109
+            lifecycle 1 stored
+        | Just phase <- lookup step [(1,0),(4,2),(5,3),(7,4),(8,5),(13,6),(14,7),
+            (15,8),(16,9),(18,10),(22,11),(23,11)] = facts step >>= lifecycle phase
+        | Just phase <- lookup step [(69,0),(70,1),(71,2),(73,3)] =
+            facts step >>= decision 200 . validate . StateSource phase
+        | otherwise = do
+            value <- lift (native step)
+            when (value < fromIntegral (minBound :: Int32) || value > fromIntegral (maxBound :: Int32)) (throwE (-1))
+            pure (fromIntegral value)
+      run phase
+        | phase == 0 = pure 0
+        | phase == -1 = pure 1
+        | phase < 0 || phase > 114 = throwE (-1)
+        | otherwise = reply (fromIntegral phase) >>= run . validate . StateFlow (fromIntegral phase)
 
 data StateFlow = StateFlow Word32 Int32
 instance Validation StateFlow where
@@ -1724,6 +3115,211 @@ instance Validation Codec where
     10 -> 8
     _ -> -1
     where check valid failure = if valid then 0 else failure
+
+-- One caller-thread entry owns journal recovery, funding, signing and publication.
+-- Native effects keep Bitcoin codecs and RPC objects, never select the next stage.
+data LocalBidWallet = LocalBidWallet Word64 NativeBytes
+data BidLimits = BidLimits { bidHeight :: Integer, bidFee :: Integer,
+  bidMaximum :: Integer, bidMoneyLimit :: Integer } deriving (Eq, Show)
+data BidPlan = RetrySignedBid | FundLocalBid Bool Integer deriving (Eq, Show)
+
+class BidPreparation op where
+  prepareLocalBid :: op -> IO (Maybe (BidLimits, BidPlan))
+class BidFunding op where
+  fundLocalBid :: op -> BidLimits -> BidPlan -> IO ()
+class BidPublication op where
+  publishLocalBid :: op -> BidLimits -> IO ()
+
+bidScalar :: NativeBytes -> Word32 -> Word64 -> IO Integer
+bidScalar native step index = toInteger . (fromIntegral :: Word64 -> Int64) <$>
+  constructionScalar native step index
+
+bidReject :: NativeBytes -> String -> IO a
+bidReject native message = native 0 0 (C.pack message) >> ioError (userError "native bid rejection returned")
+
+bidRequire :: NativeBytes -> String -> Bool -> IO ()
+bidRequire native message valid = unless valid (bidReject native message)
+
+bidEffect :: NativeBytes -> Word32 -> Integer -> IO ()
+bidEffect native step index = do
+  result <- bidScalar native step (fromInteger index)
+  unless (result == 1) (ioError (userError "invalid local bid effect reply"))
+
+bidCheck :: NativeBytes -> String -> [Word32] -> IO ()
+bidCheck native message = mapM_ (\step -> bidScalar native step 0 >>= bidRequire native message . (== 1))
+
+bidFlag :: NativeBytes -> Word32 -> IO Bool
+bidFlag native step = do
+  result <- bidScalar native step 0
+  unless (result == 0 || result == 1) (ioError (userError "invalid local bid flag"))
+  pure (result == 1)
+
+bidCurrent :: NativeBytes -> BidLimits -> IO ()
+bidCurrent native limits = do
+  bidCheck native "BMM submission cancelled" [2]
+  bidCheck native "BMM parent changed before broadcast" [3]
+  height <- bidScalar native 4 0
+  bidRequire native "BMM parent height mismatch" (height == bidHeight limits)
+  bidCheck native "BMM submission cancelled" [2]
+
+bidInputTotal :: NativeBytes -> BidLimits -> IO Integer
+bidInputTotal native limits = do
+  count <- bidScalar native 16 0
+  bidRequire native "Invalid BMM funding input count" (count > 0 && count <= 100)
+  bidEffect native 34 0
+  let loop total index
+        | index == count = pure total
+        | otherwise = do
+            bidCheck native "BMM submission cancelled" [2]
+            unique <- bidScalar native 20 (fromInteger index)
+            bidRequire native "Duplicate BMM funding input" (unique == 1)
+            shape <- bidScalar native 17 (fromInteger index)
+            bidRequire native "BMM funding input is not confirmed and unspent on L1" (shape == 1)
+            confirmations <- bidScalar native 18 0
+            bidRequire native "BMM funding input is not confirmed and unspent on L1" (confirmations > 0)
+            amount <- bidScalar native 19 0
+            bidRequire native "BMM input amount overflow" (amount >= 0 && amount <= bidMoneyLimit limits - total)
+            loop (total+amount) (index+1)
+  loop 0 0
+
+instance BidPreparation LocalBidWallet where
+  prepareLocalBid (LocalBidWallet maximumMoney native) = do
+    unless (maximumMoney > 0 && maximumMoney <= fromIntegral (maxBound :: Int64))
+      (ioError (userError "invalid local bid money limit"))
+    bytes <- native 1 0 B.empty
+    unless (B.length bytes == 112) (ioError (userError "invalid local bid frame"))
+    let field offset = toInteger (fromIntegral (readLE (B.take 8 (B.drop offset bytes)) :: Word64) :: Int64)
+        slot = field 0
+        height = field 8
+        fee = field 16
+        extra = field 24
+        parent = field 32
+        critical = field 40
+        money = toInteger maximumMoney
+        limits = BidLimits height fee (fee+extra) money
+    bidRequire native "Invalid local BMM bid" (slot >= 0 && slot <= 255 && height > 0 && height < 500000000 &&
+      parent == 1 && critical == 1 && fee > 0 && fee <= money && extra >= 0 && extra <= money-fee)
+    bidCurrent native limits
+    bidCheck native "BMM requires a signing parent wallet" [5]
+    -- M8 h* is display order, followed by the parent's internal hash bytes.
+    let request = B.pack [0x6a,68,0,0xbf,0,fromInteger slot] <>
+          B.reverse (B.drop 80 bytes) <> B.take 32 (B.drop 48 bytes)
+    saved <- constructionWord =<< native 6 0 request
+    unless (saved == 0 || saved == 1) (ioError (userError "invalid saved bid flag"))
+    plan <- if saved == 0 then pure (Just (FundLocalBid False fee)) else do
+      bidEffect native 7 0
+      version <- bidScalar native 30 0
+      bidRequire native "Corrupt saved BMM bid" (version == 2)
+      inputs <- bidScalar native 16 0
+      bidRequire native "Corrupt saved BMM bid" (inputs > 0 && inputs <= 100)
+      outputs <- bidScalar native 27 0
+      bidRequire native "Corrupt saved BMM bid" (outputs == 2)
+      value <- bidScalar native 31 0
+      bidRequire native "Corrupt saved BMM bid" (value == 0)
+      script <- native 8 0 B.empty
+      bidRequire native "Corrupt saved BMM bid" (B.length script == 70 &&
+        B.take 6 script == B.pack [0x6a,68,0,0xbf,0,fromInteger slot])
+      sameParent <- bidFlag native 10
+      if sameParent then do
+        lock <- bidScalar native 32 0
+        bidRequire native "A different candidate is already recorded for this parent; refusing another bid" (lock == height)
+        bidCheck native "A different candidate is already recorded for this parent; refusing another bid" [11]
+        pending <- bidFlag native 12
+        if pending then bidEffect native 55 0 >> pure Nothing else pure (Just RetrySignedBid)
+      else do
+        pending <- bidFlag native 12
+        nextFee <- if not pending then pure fee else do
+          oldFee <- bidScalar native 13 0
+          rate <- bidScalar native 14 0
+          size <- bidScalar native 15 0
+          bidRequire native "Invalid replacement fee data" (oldFee >= 0 && oldFee <= money &&
+            rate > 0 && rate <= money `div` 100032 && size > 0 && size <= 100000)
+          let increment = (rate*(size+32)+999) `div` 1000
+              selected = max fee (oldFee+increment)
+          bidRequire native "Replacement fee overflow" (oldFee <= money-increment)
+          bidRequire native "BMM replacement exceeds configured fee allowance" (selected <= bidMaximum limits)
+          pure selected
+        -- Inspect every previous input, even after one is absent, as before.
+        present <- forM [0..inputs-1] $ \index -> do
+          bidCheck native "BMM submission cancelled" [2]
+          (/= 0) <$> bidScalar native 17 (fromInteger index)
+        let reuse = and present
+        bidRequire native "Pending BMM bid inputs no longer exist" (not pending || reuse)
+        pure (Just (FundLocalBid reuse nextFee))
+    pure (fmap (\selected -> (limits,selected)) plan)
+
+instance BidFunding LocalBidWallet where
+  fundLocalBid _ _ RetrySignedBid = pure ()
+  fundLocalBid (LocalBidWallet _ native) limits (FundLocalBid reuse fee) = do
+    unless reuse $ do
+      bidEffect native 21 0
+      bidEffect native 22 0
+      bidCheck native "BMM change address is not wallet-owned" [23]
+      bidCheck native "Invalid BMM funding target" [24]
+      bidRequire native "Invalid BMM funding target" (fee <= bidMoneyLimit limits-1000)
+      bidEffect native 25 (fee+1000)
+      position <- bidScalar native 26 0
+      outputs <- bidScalar native 27 0
+      bidRequire native "Unexpected BMM funding outputs" ((outputs == 2 && position == -1) || (outputs == 3 && position == 1))
+      forM_ [1..outputs-1] $ \index -> bidScalar native 28 (fromInteger index) >>=
+        bidRequire native "Wallet changed BMM change script" . (== 1)
+      bidEffect native 29 0
+    version <- bidScalar native 30 0
+    bidRequire native "Unexpected BMM funding transaction" (version == 2)
+    outputs <- bidScalar native 27 0
+    bidRequire native "Unexpected BMM funding transaction" (outputs == 2)
+    amount <- bidScalar native 31 0
+    bidRequire native "Unexpected BMM funding transaction" (amount == 0)
+    unless reuse $ do
+      bidCheck native "Wallet changed BMM request" [11]
+      lock <- bidScalar native 32 0
+      bidRequire native "Wallet changed BMM request" (lock == bidHeight limits)
+    bidEffect native 33 0
+    total <- bidInputTotal native limits
+    bidRequire native "Insufficient BMM funds or dust change" (total > fee && total-fee >= 1000)
+    bidEffect native 35 (total-fee)
+    inputs <- bidScalar native 16 0
+    forM_ [0..inputs-1] (bidEffect native 36)
+    bidCurrent native limits
+    bidEffect native 37 0
+    bidCheck native "Incomplete BMM signature" [38]
+    bidEffect native 39 0
+    bidCheck native "Signer changed BMM transaction" [40,41,42,43]
+    forM_ [0..inputs-1] $ \index -> forM_ [44,45] $ \step ->
+      bidScalar native step (fromInteger index) >>= bidRequire native "Signer changed BMM inputs" . (== 1)
+    bidEffect native 46 0
+
+instance BidPublication LocalBidWallet where
+  publishLocalBid (LocalBidWallet _ native) limits = do
+    total <- bidInputTotal native limits
+    change <- bidScalar native 47 0
+    bidRequire native "Saved BMM fee exceeds current budget" (change >= 0 && change <= bidMoneyLimit limits &&
+      total > change && total-change <= bidMaximum limits)
+    bidEffect native 48 0
+    bidCurrent native limits
+    bidCheck native "Malformed parent mempool response" [49,50]
+    accepted <- bidScalar native 51 0
+    unless (accepted == 1) $ do
+      reason <- native 52 0 B.empty
+      bidReject native ("Parent mempool rejected BMM bid: " ++ C.unpack reason)
+    bidEffect native 53 0
+    bidCurrent native limits
+    bidCheck native "Parent returned a different BMM transaction ID" [54]
+
+submitLocalBid :: (BidPreparation op, BidFunding op, BidPublication op) => op -> IO Int32
+submitLocalBid value = do
+  planned <- prepareLocalBid value
+  forM_ planned $ \(limits,plan) -> fundLocalBid value limits plan >> publishLocalBid value limits
+  pure 1
+
+type LocalBidCapabilities = '[BidPreparation, BidFunding, BidPublication]
+instance Operation LocalBidWallet LocalBidCapabilities where
+  type Context LocalBidWallet = CapabilityContext LocalBidCapabilities LocalBidWallet
+  type Outcome LocalBidWallet = IO Int32
+  data DSL LocalBidWallet where
+    SubmitLocalBid :: Context LocalBidWallet => DSL LocalBidWallet
+  interpret operation request = withOperation @LocalBidWallet operation $ \value -> case request of
+    SubmitLocalBid -> Just (submitLocalBid value)
 
 data Proof = Proof Word32 Word32 Word64 Word64 Word64
 instance Validation Proof where

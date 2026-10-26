@@ -31,6 +31,10 @@ static constexpr bool DEFAULT_DAEMONWAIT = false;
 using drivechain::DEFAULT_DRIVECHAIN_BMM_BID;
 
 class ArgsManager;
+/** A named parent wallet never implies permission to spend automatically. */
+bool IsDrivechainAutomaticBiddingEnabled(const ArgsManager& args);
+/** Acknowledge the existing-proposal Betanet test profile, not a production activation. */
+bool CheckDrivechainTestProfileOptIn(const ArgsManager& args, std::string* error = nullptr);
 class CBlock;
 class ChainstateManager;
 namespace interfaces {
@@ -78,6 +82,7 @@ void InitParameterInteraction(ArgsManager& args);
 
 /** Native drivechains forbid DNS on synchronous consensus RPC paths. */
 bool IsMainchainRPCHostAllowed(const std::string& host, bool native_drivechain);
+std::vector<unsigned char> ParentRpcHostSnapshot(const std::string& host);
 
 /** Forbid non-loopback JSON-RPC listeners on the native chain. */
 bool ValidateNativeDrivechainRpcServerConfig(

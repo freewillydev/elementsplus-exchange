@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/haskell_reference.h>
 #include <consensus/amount.h>
 #include <policy/fees.h>
 #include <policy/policy.h>
@@ -18,6 +19,23 @@
 #include <limits>
 #include <set>
 #include <vector>
+
+namespace drivechain::haskell {
+uint64_t BmmWorkBudget(uint64_t count, const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read)
+{
+    uint64_t result{0};
+    ReferenceCheckedStatus(ReferenceReadScalarAdmission(elements_hs_bmm_work_budget_v1,read,count,&result),
+        0,"Haskell work budget evaluation failed");
+    return result;
+}
+
+bool BmmWorkTotal(bool saturate, uint64_t count, const std::function<uint64_t(uint64_t)>& read, uint64_t& total)
+{
+    return ReferenceCheckedStatus(ReferenceReadScalarAdmission(elements_hs_bmm_work_total_v1,
+        [&](uint32_t, uint64_t index, uint64_t) { return read(index); },
+        static_cast<uint32_t>(saturate),count,total,&total),1,"Haskell work total evaluation failed") == 0;
+}
+}
 
 BOOST_AUTO_TEST_SUITE(policy_fee_tests)
 
@@ -277,6 +295,39 @@ BOOST_AUTO_TEST_CASE(simplicity_work_budget_legacy_parity)
     }), std::logic_error, [](const auto& error) { return std::string(error.what()) == "work read fault"; });
 }
 
+BOOST_AUTO_TEST_CASE(bmm_whole_candidate_measurement)
+{
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.witness.vtxinwit.resize(1);
+    tx.witness.vtxinwit[0].scriptWitness.stack = {{0}, {0}, std::vector<unsigned char>(32), {0xbe}};
+    const CTransaction immutable{tx};
+    const auto work = uint64_t(GetSerializeSize(tx.witness.vtxinwit[0].scriptWitness.stack)+50)*1000;
+    for (const bool saturate : {false, true}) {
+        uint64_t total{UINT64_MAX-1}, last{0};
+        std::vector<uint64_t> reads;
+        const bool accepted = drivechain::haskell::MeasureWork(saturate, 3,
+            [&](uint64_t index) -> const CTransaction& { reads.push_back(index); return immutable; }, total, &last);
+        BOOST_CHECK_EQUAL(accepted, saturate);
+        BOOST_CHECK_EQUAL(total, saturate ? UINT64_MAX : UINT64_MAX-1);
+        BOOST_CHECK_EQUAL(last, work);
+        BOOST_CHECK(reads == (saturate ? std::vector<uint64_t>{0,0,1,1,2,2} : std::vector<uint64_t>{0,0}));
+    }
+    uint64_t total{UINT64_MAX-1};
+    BOOST_CHECK_EQUAL(GetSimplicityValidationMilliweight(immutable, &total), work);
+    BOOST_CHECK_EQUAL(total, UINT64_MAX);
+    total = 7;
+    BOOST_CHECK_EXCEPTION(drivechain::haskell::MeasureWork(false, 3,
+        [&](uint64_t index) -> const CTransaction& {
+            if (index == 1) throw std::logic_error("whole candidate read fault");
+            return immutable;
+        }, total), std::logic_error, [](const auto& error) { return std::string(error.what()) == "whole candidate read fault"; });
+    BOOST_CHECK_EQUAL(total, 7U);
+    BOOST_CHECK(drivechain::haskell::MeasureWork(false, 0,
+        [](uint64_t) -> const CTransaction& { throw std::logic_error("empty candidate read"); }, total));
+    BOOST_CHECK_EQUAL(total, 7U);
+}
+
 BOOST_AUTO_TEST_CASE(bmm_work_total_modes)
 {
     for (bool saturate : {false,true}) {
@@ -284,7 +335,7 @@ BOOST_AUTO_TEST_CASE(bmm_work_total_modes)
         std::vector<uint64_t> seen;
         const bool accepted = drivechain::haskell::BmmWorkTotal(saturate,3,[&](uint64_t index) {
             seen.push_back(index);
-            // Production enters the witness-budget interpreter inside this callback.
+            // The former production path nested a witness-budget entry here.
             BOOST_CHECK_EQUAL(drivechain::haskell::BmmWorkBudget(0,[](uint32_t,uint64_t,uint64_t) {
                 throw std::logic_error("empty budget read"); return uint64_t{0};
             }),0U);

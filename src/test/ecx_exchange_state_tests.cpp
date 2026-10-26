@@ -1,7 +1,11 @@
 // Copyright (c) 2026 The Elements Core developers
 // Distributed under the MIT software license.
 
+#include <test/util/haskell_reference.h>
 #include <ecx_exchange_state.h>
+#include <ecx_forced_v3.h>
+#include <ecx_forced_v3_block.h>
+#include <test/data/ecx_forced_v3_vectors.h>
 #include <addresstype.h>
 #include <haskell/bridge.h>
 #include <haskell/simplicity_ffi.h>
@@ -62,6 +66,209 @@ extern "C" {
 #include <limits>
 #include <set>
 #include <tuple>
+
+#include <haskell/domain_abi.h>
+#include <thread>
+extern "C" void elements_hs_runtime_init(void);
+
+// Legacy fine-grained ABI adapters are kept only for differential tests.
+namespace drivechain::haskell {
+bool ExchangeForcedV3State(std::span<const unsigned char> bytes,
+    std::span<const unsigned char,32> economic_hash)
+{
+    if (bytes.size()!=145) return false;
+    elements_hs_runtime_init();
+    const auto result = elements_hs_exchange_forced_v3_bytes_v1(1,bytes.size(),
+        const_cast<unsigned char*>(bytes.data()),const_cast<unsigned char*>(economic_hash.data()),0,nullptr);
+    if (result<0 || result>1) throw std::runtime_error("Haskell exact forced state failed");
+    return result==1;
+}
+
+bool ExchangeEnvelopeHeader(std::span<const unsigned char> payload, std::string& error)
+{
+    elements_hs_runtime_init();
+    const int code = elements_hs_exchange_envelope_header_v1(payload.size(),
+        payload.size() > 4 ? payload[4] : 0, payload.size() >= 45 ? ReadLE32(payload.data() + 41) : 0);
+    if (code < 0 || code > 2) throw std::runtime_error("Haskell ECX envelope header failed");
+    if (code) error = code == 1 ? "malformed ECX M6 envelope" : "invalid ECX M6 envelope length";
+    return code == 0;
+}
+
+bool ExchangeEnvelopeScan(const std::function<int32_t(uint32_t)>& read, std::string& error)
+{
+    static constexpr const char* errors[]{"ECX M6 envelope requires a coinbase transaction",
+        "duplicate ECX M6 envelope", nullptr, "noncanonical ECX M6 envelope script",
+        "ECX M6 envelope may appear only when hashWithdrawalBundle changes",
+        "ECX M6 envelope exists while clearing the withdrawal bundle commitment",
+        "withdrawal bundle commitment lacks its ECX M6 envelope",
+        "ECX M6 PXST does not bind the selected active-chain checkpoint"};
+    return ReferenceExchangeResult(ReferenceReadAdmission<int32_t,-1>(elements_hs_exchange_envelope_scan_v1,read),errors,error,
+        "Haskell M6 envelope workflow failed");
+}
+
+bool ExchangeM6Preimage(std::span<const unsigned char> raw,
+    std::span<unsigned char, 64> commitments, std::string& error)
+{
+    elements_hs_runtime_init();
+    const int code = elements_hs_exchange_m6_v1(raw.size(), const_cast<unsigned char*>(raw.data()), commitments.data());
+    static constexpr const char* errors[]{
+        "ECX M6 preimage has a noncanonical transaction prefix",
+        "ECX M6 preimage has an invalid output",
+        "ECX M6 commitment outputs must remain zero-valued",
+        "ECX M6 preimage has trailing or noncanonical locktime bytes",
+        "ECX M6 preimage lacks its canonical commitment or PXST output"};
+    return ReferenceExchangeResult(code, errors, error, "Haskell ECX M6 parser failed");
+}
+
+bool ExchangeCheckpoint(const std::function<bool(uint32_t)>& read, std::string& error)
+{
+    const int code = ReferenceReadAdmission<int32_t>(elements_hs_exchange_checkpoint_v1,read);
+    static constexpr const char* errors[]{
+        "ECX M6 envelope does not hash to hashWithdrawalBundle",
+        "ECX M6 checkpoint is not a prior block",
+        "ECX M6 checkpoint is not the committed active-chain state"};
+    return ReferenceExchangeResult(code, errors, error, "Haskell exchange checkpoint validation failed");
+}
+}
+
+namespace drivechain::haskell {
+namespace {
+int LegacyCheckedStatus(int code, int maximum, const char* failure)
+{
+    if (code < 0 || code > maximum) throw std::runtime_error(failure);
+    return code;
+}
+bool LegacyExchangeResult(int code, std::span<const char* const> errors, std::string& error, const char* failure)
+{
+    LegacyCheckedStatus(code, errors.size(), failure);
+    if (code && errors[code-1]) error = errors[code-1];
+    return code == 0;
+}
+}
+bool FrozenProfile(uint32_t mode, uint32_t confirmations, std::span<const unsigned char> bytes,
+    const unsigned char* expected, unsigned char* output, const char* failure)
+{
+    elements_hs_runtime_init();
+    const int code=elements_hs_exchange_frozen_profile_v1(mode,confirmations,bytes.size(),
+        const_cast<unsigned char*>(bytes.data()),const_cast<unsigned char*>(expected),output);
+    return LegacyCheckedStatus(code,1,failure)==0;
+}
+
+bool ExchangeOracleProfile(uint32_t confirmations, std::span<const unsigned char> bytes,
+    std::span<const unsigned char* const,4> truth, std::span<uint64_t,2> prices)
+{
+    std::array<unsigned char,128> hashes;
+    for (size_t i=0;i<truth.size();++i) {
+        if (!truth[i]) throw std::invalid_argument("null oracle identity");
+        std::copy_n(truth[i],32,hashes.begin()+i*32);
+    }
+    std::array<unsigned char,16> encoded;
+    if (!FrozenProfile(0,confirmations,bytes,hashes.data(),encoded.data(),"Haskell oracle profile decoding failed")) return false;
+    prices[0]=ReadBE64(encoded.data()); prices[1]=ReadBE64(encoded.data()+8);
+    return true;
+}
+
+bool ExchangeTruthcoinProfile(std::span<const unsigned char> bytes, std::span<unsigned char,164> fields)
+{
+    return FrozenProfile(1,0,bytes,nullptr,fields.data(),"Haskell Truthcoin profile decoding failed");
+}
+
+bool ExchangeCheckpointProfile(bool anchor, std::span<const unsigned char> bytes,
+    std::span<const unsigned char,32> policy, std::span<unsigned char,64> identities)
+{
+    return FrozenProfile(anchor ? 3 : 2,0,bytes,policy.data(),identities.data(),"Haskell checkpoint profile decoding failed");
+}
+
+bool ExchangeBondProfile(std::span<const unsigned char> bytes, std::span<const unsigned char,32> codec)
+{
+    unsigned char unused{};
+    return FrozenProfile(9,0,bytes,codec.data(),&unused,"Haskell bond profile decoding failed");
+}
+
+bool ExchangeConfigurationIdentities(bool outer, std::span<const unsigned char> bytes, std::string& error)
+{
+    elements_hs_runtime_init();
+    unsigned char unused{};
+    const int code=elements_hs_exchange_frozen_profile_v1(10,outer,bytes.size(),
+        const_cast<unsigned char*>(bytes.data()),nullptr,&unused);
+    const char* errors[]{outer ? "noncanonical FrozenConfigurationV2/V18: duplicate outer identity" :
+        "noncanonical FrozenConfigurationV2/V18: duplicate base identity",
+        outer ? "noncanonical FrozenConfigurationV2/V18: cross-role identity collision" :
+        "noncanonical FrozenConfigurationV2/V18: policy asset aliases an unrelated base identity"};
+    return LegacyExchangeResult(code,errors,error,"Haskell configuration identity validation failed");
+}
+
+bool ExchangeFrozenTail(bool direct_price, std::span<const unsigned char> bytes, std::string& error)
+{
+    elements_hs_runtime_init();
+    unsigned char unused{};
+    const int code=elements_hs_exchange_frozen_profile_v1(8,direct_price,bytes.size(),
+        const_cast<unsigned char*>(bytes.data()),nullptr,&unused);
+    static constexpr const char* errors[]{
+        "noncanonical FrozenConfigurationV2/V18: bond inbox/matcher limits",
+        "noncanonical FrozenConfigurationV2/V18: versioned oracle conversion identities",
+        "noncanonical FrozenConfigurationV2/V18: recursive proof/bond constants or trailing bytes"};
+    return LegacyExchangeResult(code,errors,error,"Haskell frozen tail decoding failed");
+}
+
+std::optional<std::array<uint64_t,4>> ExchangeForcedV3Append(std::span<const uint64_t,9> fields)
+{
+    std::array<uint64_t,4> result;
+    elements_hs_runtime_init();
+    if (!LegacyCheckedStatus(elements_hs_exchange_forced_v3_append_v1(const_cast<uint64_t*>(fields.data()),
+        result.data()),1,"Haskell exact forced append failed")) return std::nullopt;
+    return result;
+}
+
+std::optional<std::array<uint64_t,3>> ExchangeForcedV3Cursor(std::span<const unsigned char> script)
+{
+    if (script.size()!=31) return std::nullopt;
+    std::array<unsigned char,24> bytes;
+    elements_hs_runtime_init();
+    if (!LegacyCheckedStatus(elements_hs_exchange_forced_v3_bytes_v1(2,script.size(),
+        const_cast<unsigned char*>(script.data()),nullptr,bytes.size(),bytes.data()),24,
+        "Haskell exact forced cursor failed")) return std::nullopt;
+    return std::array<uint64_t,3>{ReadBE64(bytes.data()),ReadBE64(bytes.data()+8),ReadBE64(bytes.data()+16)};
+}
+
+std::vector<unsigned char> ExchangeForcedV3CursorScript(std::span<const uint64_t,3> fields)
+{
+    std::array<unsigned char,24> bytes;
+    for (size_t i=0;i<3;++i) WriteBE64(bytes.data()+8*i,fields[i]);
+    std::vector<unsigned char> script(31);
+    elements_hs_runtime_init();
+    if (LegacyCheckedStatus(elements_hs_exchange_forced_v3_bytes_v1(3,bytes.size(),bytes.data(),nullptr,
+        script.size(),script.data()),31,"Haskell exact forced cursor encoding failed")!=31)
+        throw std::runtime_error("Haskell exact forced cursor encoding rejected");
+    return script;
+}
+
+std::vector<unsigned char> ExchangeGenesisFunding(uint64_t mtp, uint64_t price)
+{
+    elements_hs_runtime_init();
+    std::vector<unsigned char> bytes(725);
+    if (elements_hs_exchange_genesis_funding_v1(mtp, price, bytes.size(), bytes.data()) != 0)
+        throw std::runtime_error("Haskell exchange genesis funding encoding failed");
+    return bytes;
+}
+
+bool ExchangeCursors(uint32_t flags, std::span<const uint64_t, 4> fields,
+    uint64_t& forced, uint64_t& deposit, std::string& error)
+{
+    elements_hs_runtime_init();
+    std::array<uint64_t, 2> result{};
+    const int code = elements_hs_exchange_cursors_v1(flags, const_cast<uint64_t*>(fields.data()), result.data());
+    static constexpr const char* errors[]{"ECX state transition is missing its processed-cursor marker",
+        "ECX processed-cursor marker requires a state transition",
+        "ECX processed cursors are not monotonic or are outside the state transition"};
+    if (!LegacyExchangeResult(code, errors, error, "Haskell exchange cursor validation failed")) return false;
+    forced = result[0];
+    deposit = result[1];
+    return true;
+}
+} // namespace drivechain::haskell
+
+#include <test/util/forced_block_reference.h>
 
 namespace {
 #include <test/capital_snapshot_reference.h>
@@ -254,6 +461,15 @@ uint256 TestSha256(const std::vector<unsigned char>& bytes)
     if (!bytes.empty()) hasher.Write(bytes.data(), bytes.size());
     hasher.Finalize(result.begin());
     return result;
+}
+
+std::vector<unsigned char> PoisonedCapitalSnapshotBytes(unsigned char byte)
+{
+    std::vector<unsigned char> bytes(914, byte);
+    bytes[0] = ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION & 0xff;
+    bytes[1] = ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION >> 8;
+    bytes[2] = 1;
+    return bytes;
 }
 
 uint256 TestTaggedHash(const std::string& tag, const std::vector<unsigned char>& bytes)
@@ -1050,8 +1266,8 @@ BOOST_AUTO_TEST_CASE(exchange_interface_frozen_defaults)
 {
     const ecx::ExchangeConsensus consensus;
     BOOST_CHECK_EQUAL(ecx::EXCHANGE_STATE_INTERFACE_VERSION, 1);
-    BOOST_CHECK_EQUAL(ecx::EXCHANGE_SCRIPT_CACHE_REVISION, 12);
-    BOOST_CHECK_EQUAL(ecx::ECX_CONSENSUS_RULESET_REVISION, 6);
+    BOOST_CHECK_EQUAL(ecx::EXCHANGE_SCRIPT_CACHE_REVISION, 14);
+    BOOST_CHECK_EQUAL(ecx::ECX_CONSENSUS_RULESET_REVISION, 8);
     BOOST_CHECK_EQUAL(consensus.activation_height, std::numeric_limits<int>::max());
     BOOST_CHECK_EQUAL(consensus.bond_v2.deployment_version, 2U);
     BOOST_CHECK(ecx::BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN);
@@ -2905,6 +3121,85 @@ BOOST_AUTO_TEST_CASE(bond_inbox_generated_hash_domains)
     }
 }
 
+BOOST_AUTO_TEST_CASE(batched_transaction_admission_matches_native_predicates)
+{
+    using namespace drivechain::haskell;
+    for (unsigned mask=0; mask<2048; ++mask) {
+        CMutableTransaction tx;
+        tx.vin.resize(1+mask%5);
+        tx.vout.resize(1+(mask/5)%5);
+        tx.witness.vtxinwit.resize(mask%(tx.vin.size()+1));
+        tx.witness.vtxoutwit.resize((mask/7)%(tx.vout.size()+1));
+        for (auto& out : tx.vout) {
+            out.nAsset = CConfidentialAsset(CAsset{uint256S("01")});
+            out.nValue = CConfidentialValue(100);
+        }
+        auto& input = tx.vin.back();
+        auto& output = tx.vout.back();
+        if (mask&1) input.m_is_pegin = true;
+        if (mask&2) input.assetIssuance.nAmount = CConfidentialValue(1);
+        if (mask&4) input.assetIssuance.nInflationKeys = CConfidentialValue(1);
+        if (mask&8) input.assetIssuance.nAmount.vchCommitment.assign(33,8);
+        if (mask&16) input.assetIssuance.nInflationKeys.vchCommitment.assign(33,8);
+        if (mask&32) output.nAsset.vchCommitment.assign(33,10);
+        if (mask&64) output.nValue.vchCommitment.assign(33,8);
+        if (mask&128) output.nNonce.vchCommitment.assign(33,2);
+        if ((mask&256) && !tx.witness.vtxinwit.empty()) tx.witness.vtxinwit.back().vchIssuanceAmountRangeproof = {1};
+        if ((mask&512) && !tx.witness.vtxoutwit.empty()) tx.witness.vtxoutwit.back().vchSurjectionproof = {1};
+        if (mask&1024) input.assetIssuance.assetBlindingNonce = uint256S("02");
+        const bool ordinary = std::all_of(tx.vin.begin(),tx.vin.end(),[](const auto& in) {
+            return !in.m_is_pegin && in.assetIssuance.IsNull();
+        });
+        const bool explicit_only = std::all_of(tx.vout.begin(),tx.vout.end(),[](const auto& out) {
+            return out.nAsset.IsExplicit() && out.nValue.IsExplicit() && out.nNonce.IsNull();
+        }) && std::all_of(tx.vin.begin(),tx.vin.end(),[](const auto& in) {
+            return (in.assetIssuance.nAmount.IsNull() || in.assetIssuance.nAmount.IsExplicit()) &&
+                (in.assetIssuance.nInflationKeys.IsNull() || in.assetIssuance.nInflationKeys.IsExplicit());
+        }) && std::all_of(tx.witness.vtxoutwit.begin(),tx.witness.vtxoutwit.end(),[](const auto& w) {
+            return w.vchRangeproof.empty() && w.vchSurjectionproof.empty();
+        }) && std::all_of(tx.witness.vtxinwit.begin(),tx.witness.vtxinwit.end(),[](const auto& w) {
+            return w.vchIssuanceAmountRangeproof.empty() && w.vchInflationKeysRangeproof.empty();
+        });
+        BOOST_CHECK_EQUAL(AdmitTransaction(TransactionAdmission::ORDINARY_INPUTS,CTransaction(tx)),ordinary);
+        BOOST_CHECK_EQUAL(Consensus::HasOnlyExplicitCreations(CTransaction(tx)),explicit_only);
+        const bool deployment = tx.vout.size() >= 3 &&
+            std::none_of(tx.vin.begin(),tx.vin.end(),[](const auto& in) { return in.m_is_pegin; }) &&
+            std::count_if(tx.vin.begin(),tx.vin.end(),[](const auto& in) { return !in.assetIssuance.IsNull(); }) == 1;
+        BOOST_CHECK_EQUAL(AdmitTransaction(TransactionAdmission::DEPLOYMENT,CTransaction(tx),0,0,1,2),deployment);
+        BOOST_CHECK(!AdmitTransaction(TransactionAdmission::DEPLOYMENT,CTransaction(tx),0,0,1,1));
+        BOOST_CHECK(!AdmitTransaction(TransactionAdmission::DEPLOYMENT,CTransaction(tx),UINT64_MAX,0,1,2));
+    }
+    for (size_t size : {0U,1U,100U,10000U}) {
+        CMutableTransaction tx;
+        tx.vin.resize(size);
+        BOOST_CHECK(AdmitTransaction(TransactionAdmission::ORDINARY_INPUTS,CTransaction(tx)));
+        BOOST_CHECK(Consensus::HasOnlyExplicitCreations(CTransaction(tx)));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(batched_input_admission_removes_nested_entries)
+{
+    namespace hs = drivechain::haskell;
+    CMutableTransaction tx;
+    tx.vin.resize(100);
+    size_t index=0, entries=1, callbacks=0;
+    const bool legacy = hs::ParentReplayWhile(
+        [&] { ++callbacks; return index < tx.vin.size(); },
+        [&] {
+            ++callbacks;
+            ++entries;
+            return hs::ParentReplayAll<2>({
+                [&] { ++callbacks; return !tx.vin[index].m_is_pegin; },
+                [&] { ++callbacks; return tx.vin[index].assetIssuance.IsNull(); }});
+        },
+        [&] { ++callbacks; ++index; });
+    BOOST_REQUIRE(legacy);
+    BOOST_CHECK_EQUAL(entries,101U);
+    BOOST_CHECK_EQUAL(callbacks,501U);
+    BOOST_CHECK_EQUAL(hs::AdmitTransaction(hs::TransactionAdmission::ORDINARY_INPUTS,CTransaction(tx)),legacy);
+    BOOST_TEST_MESSAGE("100 ordinary inputs: legacy 101 entries/501 callbacks; snapshot one entry/no callbacks");
+}
+
 BOOST_AUTO_TEST_CASE(public_bond_deployment_exact_relation)
 {
     CMutableTransaction tx;
@@ -2929,6 +3224,32 @@ BOOST_AUTO_TEST_CASE(public_bond_deployment_exact_relation)
     tx.vout[1].nValue = CConfidentialValue(1);
     tx.vout[1].scriptPubKey = CScript{} << OP_RETURN;
     BOOST_REQUIRE(ecx::VerifyPublicBondDeployment(CTransaction(tx), 0, 0, 1));
+    unsigned derivations=0;
+    const auto caller = std::this_thread::get_id();
+    const auto derive = [&]() -> std::array<unsigned char,64> {
+        ++derivations;
+        BOOST_CHECK(std::this_thread::get_id() == caller);
+        std::array<unsigned char,64> identities;
+        std::copy_n(asset.begin(),32,identities.begin());
+        std::copy_n(token.begin(),32,identities.begin()+32);
+        return identities;
+    };
+    using drivechain::haskell::AdmitTransaction;
+    using drivechain::haskell::TransactionAdmission;
+    BOOST_REQUIRE(AdmitTransaction(TransactionAdmission::PUBLIC_BOND,CTransaction(tx),0,0,1,0,derive));
+    BOOST_CHECK_EQUAL(derivations,1U);
+    BOOST_CHECK(!AdmitTransaction(TransactionAdmission::PUBLIC_BOND,CTransaction(tx),UINT64_MAX,0,1,0,derive));
+    BOOST_CHECK_EQUAL(derivations,1U);
+    const auto fail = []() -> std::array<unsigned char,64> { throw std::logic_error("asset derivation sentinel"); };
+    BOOST_CHECK_EXCEPTION(AdmitTransaction(TransactionAdmission::PUBLIC_BOND,CTransaction(tx),0,0,1,0,fail),
+        std::logic_error,[](const auto& e) { return std::string(e.what()) == "asset derivation sentinel"; });
+    auto wrong_supply = tx;
+    wrong_supply.vin[0].assetIssuance.nAmount = CConfidentialValue(1);
+    BOOST_CHECK(!AdmitTransaction(TransactionAdmission::PUBLIC_BOND,CTransaction(wrong_supply),0,0,1,0,fail));
+    auto wrong_inventory = tx;
+    wrong_inventory.vout[0].nValue = CConfidentialValue(1);
+    BOOST_CHECK(!AdmitTransaction(TransactionAdmission::PUBLIC_BOND,CTransaction(wrong_inventory),0,0,1,0,derive));
+    BOOST_CHECK_EQUAL(derivations,2U);
     const auto reject = [&](auto mutate) {
         auto changed = tx;
         mutate(changed);
@@ -3177,8 +3498,8 @@ BOOST_AUTO_TEST_CASE(haskell_capital_admission_short_circuit_facts)
             [&] { ++reads; return annex[7]==version; }}),annex.size()>7 && annex[7]==version);
         BOOST_CHECK_EQUAL(reads,size>7 ? 1U : 0U);
     }
-    for (bool empty : {false,true}) for (uint64_t forced : {0ULL,1ULL,UINT64_MAX})
-    for (uint64_t deposits : {0ULL,1ULL,UINT64_MAX}) {
+    for (bool empty : {false,true}) for (uint64_t forced : {uint64_t{0},uint64_t{1},UINT64_MAX})
+    for (uint64_t deposits : {uint64_t{0},uint64_t{1},UINT64_MAX}) {
         BOOST_CHECK_EQUAL(hs::ParentReplayAll<3>({[&] { return empty; },
             [&] { return forced==0; }, [&] { return deposits==0; }}),empty && forced==0 && deposits==0);
     }
@@ -3261,7 +3582,7 @@ BOOST_AUTO_TEST_CASE(haskell_capital_projection_preserves_rejected_carry_snapsho
     block.hashExchangeStateRoot=uint256S("52");
     TestBlockIndex previous{block,50};
     ecx::BondV2CapitalSnapshot prior,result;
-    DataStream prior_bytes{std::vector<unsigned char>(914,0xa5)};
+    DataStream prior_bytes{PoisonedCapitalSnapshotBytes(0xa5)};
     prior_bytes >> prior;
     previous.ecxBondV2Capital=prior;
     MemoryCoinsView base;
@@ -3294,7 +3615,7 @@ BOOST_AUTO_TEST_CASE(haskell_capital_projection_preserves_rejected_carry_snapsho
         BOOST_CHECK_EQUAL(error,identity_errors[fault]);
     }
     for (int mode=0;mode<3;++mode) {
-        DataStream poison{std::vector<unsigned char>(914,0x11)};
+        DataStream poison{PoisonedCapitalSnapshotBytes(0x11)};
         poison >> result;
         DataStream before;
         before << result;
@@ -4327,6 +4648,136 @@ BOOST_AUTO_TEST_CASE(incremental_successor_projection_script_and_u128_snapshot_a
         std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(swap_projection_requires_exact_profile_lineage_and_persisted_bridge)
+{
+    // Structural projection test only: the recording proof bytes are not a
+    // cryptographic proof and this helper is called after script verification.
+    auto consensus = ConfiguredConsensus(50, COutPoint{Txid::FromUint256(uint256S("50")),0}, uint256S("51"));
+    PopulateTestBondV2FrozenIdentities(consensus);
+    auto annex = TestIncrementalSuccessorAnnexPayload();
+    annex[7] = 7;
+    WriteBE32(annex.data()+435,24);
+    annex.insert(annex.end(),32,41);
+    annex.insert(annex.end(),32,42);
+    annex.push_back(0);
+    annex.push_back(1);
+    const auto recommit = [](std::vector<unsigned char>& payload) {
+        auto digest = TestSha256({payload.begin()+435,payload.end()});
+        std::copy(digest.begin(),digest.end(),payload.begin()+43);
+    };
+    const auto fill = [](uint256& hash,unsigned char byte) { std::fill(hash.begin(),hash.end(),byte); };
+    const auto field = [&](size_t offset) { uint256 hash; std::copy_n(annex.begin()+435+offset,32,hash.begin()); return hash; };
+    std::copy_n(annex.begin()+11,32,consensus.swap_successor.program_id.begin());
+    consensus.swap_successor.configuration_hash = field(4);
+    consensus.bond_v2.configuration_hash = field(388);
+    std::copy_n(annex.begin()+435+420,32,consensus.chain_id.begin());
+    consensus.bond_v2.bond_asset_id = field(452);
+    consensus.bond_v2.bond_deployment_commitment = field(484);
+    consensus.bond_v2.inventory_covenant_script_sha256 = field(516);
+    fill(consensus.bond_v2.transition_program_id,84);
+    fill(consensus.bond_v2.transition_journal_domain_sha256,85);
+    fill(consensus.bond_v2.transition_cmr,86);
+    fill(consensus.bond_v2.identity_derivation_record_sha256,87);
+    fill(consensus.bond_v2.incremental_successor_program_id,80);
+    fill(consensus.bond_v2.incremental_successor_configuration_hash,81);
+    fill(consensus.swap_successor.transition_cmr,82);
+    fill(consensus.swap_successor.state_node_domain_sha256,83);
+    recommit(annex);
+    const uint256 active_root = uint256S("52");
+    ecx::BondV2CapitalSnapshot snapshot;
+    std::string error;
+    BOOST_CHECK(!ecx::DecodeSwapSuccessorCapitalProjection(annex,active_root,snapshot,error,consensus));
+    consensus.swap_successor.identities_frozen = true;
+    BOOST_REQUIRE_MESSAGE(ecx::DecodeSwapSuccessorCapitalProjection(annex,active_root,snapshot,error,consensus),error);
+    BOOST_CHECK_EQUAL(snapshot.version,5);
+    BOOST_CHECK_EQUAL(snapshot.proof_profile,2);
+    BOOST_CHECK(snapshot.bridge_state_root == field(1659));
+    BOOST_CHECK_EQUAL(snapshot.profit_lock_insolvent,1);
+    BOOST_CHECK(ecx::CheckCapitalProjectionIdentity(snapshot,active_root,consensus));
+    BOOST_CHECK(!ecx::CheckCapitalProjectionIdentity(snapshot,uint256S("53"),consensus));
+    BOOST_CHECK(!ecx::DecodeBondV2IncrementalSuccessorCapitalProjection(annex,active_root,snapshot,error,consensus));
+    for (size_t offset : {size_t{1659},size_t{1691},size_t{1692}}) {
+        auto changed = annex;
+        if (offset==1659) std::fill_n(changed.begin()+435+offset,32,0);
+        else changed[435+offset]=2;
+        recommit(changed);
+        BOOST_CHECK(!ecx::DecodeSwapSuccessorCapitalProjection(changed,active_root,snapshot,error,consensus));
+    }
+    auto unfrozen = consensus;
+    unfrozen.swap_successor.program_id.SetNull();
+    BOOST_CHECK(!ecx::CheckCapitalProjectionIdentity(snapshot,active_root,unfrozen));
+    DataStream serialized;
+    serialized << snapshot;
+    BOOST_CHECK_EQUAL(serialized.size(),947U);
+    ecx::BondV2CapitalSnapshot restored;
+    serialized >> restored;
+    BOOST_CHECK(restored.bridge_state_root == snapshot.bridge_state_root);
+    BOOST_CHECK_EQUAL(restored.profit_lock_insolvent,snapshot.profit_lock_insolvent);
+    BOOST_CHECK(ecx::CheckCapitalProjectionIdentity(restored,active_root,consensus));
+    auto malformed = restored;
+    malformed.proof_profile = 1;
+    BOOST_CHECK_THROW(serialized << malformed,std::ios_base::failure);
+
+    CScript successor_script;
+    BOOST_REQUIRE(ecx::ComputeSwapSuccessorScript(consensus,snapshot.covenant_state_hash,successor_script));
+    CMutableTransaction transition;
+    transition.vin.emplace_back(COutPoint{Txid::FromUint256(uint256S("60")),0});
+    transition.vout.push_back(AuthorityOutput(1));
+    transition.vout[0].scriptPubKey = successor_script;
+    CBlock prior_block;
+    prior_block.hashExchangeStateRoot = uint256S("61");
+    prior_block.hashForcedInboxRoot = field(1252);
+    TestBlockIndex previous{prior_block,50};
+    previous.ecxBondV2Capital = snapshot;
+    previous.ecxBondV2Capital->exchange_state_root = prior_block.hashExchangeStateRoot;
+    previous.ecxBondV2Capital->covenant_state_hash = field(36);
+    previous.ecxBondV2Capital->bridge_state_root = field(1627);
+    previous.ecxBondV2Capital->profit_lock_insolvent = 0;
+    const uint256 parent_hash = uint256S("62");
+    const auto bind = [&](size_t offset,const uint256& hash) { std::copy(hash.begin(),hash.end(),annex.begin()+435+offset); };
+    bind(100,CTransaction(transition).GetHash().ToUint256());
+    bind(132,prior_block.hashExchangeStateRoot);
+    bind(164,parent_hash);
+    WriteBE64(annex.data()+435+1284,8);
+    WriteBE64(annex.data()+435+1292,9);
+    WriteBE64(annex.data()+435+1300,51);
+    MemoryCoinsView base;
+    CCoinsViewCache view{&base};
+    ecx::BondV2CapitalSnapshot projected;
+    const auto project = [&](std::vector<unsigned char> payload) {
+        recommit(payload);
+        payload.insert(payload.begin(),0x50);
+        transition.witness.vtxinwit.resize(1);
+        transition.witness.vtxinwit[0].scriptWitness.stack={{0},std::move(payload)};
+        CBlock block;
+        block.vtx={MakeTransactionRef(transition)};
+        block.hashExchangeStateRoot=ecx::ComputeStateUtxoRoot(Params().GetConsensus().hashGenesisBlock,
+            COutPoint{block.vtx[0]->GetHash(),0},transition.vout[0]);
+        return ecx::DeriveBondV2CapitalProjectionAfterScripts(block,&previous,view,51,parent_hash,8,9,projected,error,consensus);
+    };
+    BOOST_REQUIRE_MESSAGE(project(annex),error);
+    BOOST_CHECK(projected.bridge_state_root == snapshot.bridge_state_root);
+    for (size_t offset : {36U,100U,132U,164U,1252U,1291U,1299U,1307U,1627U,1691U}) {
+        auto changed=annex;
+        changed[435+offset]^=1;
+        BOOST_CHECK(!project(changed));
+    }
+    previous.hashForcedInboxRoot.begin()[0] ^= 1;
+    BOOST_CHECK(!project(annex)); // Same proof, different native source boundary.
+    previous.hashForcedInboxRoot.begin()[0] ^= 1;
+    previous.ecxBondV2Capital->proof_profile=1;
+    previous.ecxBondV2Capital->version=4;
+    BOOST_CHECK(!project(annex)); // No implicit V23-to-swap migration.
+    previous.ecxBondV2Capital->proof_profile=2;
+    previous.ecxBondV2Capital->version=5;
+    CBlock unchanged;
+    unchanged.hashExchangeStateRoot=prior_block.hashExchangeStateRoot;
+    BOOST_REQUIRE_MESSAGE(ecx::DeriveBondV2CapitalProjectionAfterScripts(unchanged,&previous,view,51,
+        parent_hash,8,9,projected,error,consensus),error);
+    BOOST_CHECK(projected.bridge_state_root==previous.ecxBondV2Capital->bridge_state_root);
+    BOOST_CHECK_EQUAL(projected.profit_lock_insolvent,previous.ecxBondV2Capital->profit_lock_insolvent);
+}
+
 BOOST_AUTO_TEST_CASE(finite_source_accepts_real_custody_fixture)
 {
     auto consensus = ConfiguredConsensus(50, COutPoint{Txid::FromUint256(uint256S("50")), 0}, uint256S("51"));
@@ -5219,7 +5670,7 @@ BOOST_AUTO_TEST_CASE(bond_v2_projection_is_frozen_and_activation_fails_closed)
         if (fault != 5) coins.AddCoin(candidate.genesis_state_outpoint, std::move(genesis_coin), false);
         CBlock block;
         block.hashExchangeStateRoot = candidate.genesis_state_root;
-        DataStream poisoned{std::vector<unsigned char>(914,0xa5)};
+        DataStream poisoned{PoisonedCapitalSnapshotBytes(0xa5)};
         poisoned >> snapshot;
         DataStream before;
         before << snapshot;
@@ -5785,6 +6236,11 @@ BOOST_AUTO_TEST_CASE(runtime_consensus_fingerprint_binds_every_field)
     check_consensus_mutation([](auto& value) { value.deposit_inbox_domain[0] ^= 1; });
     check_consensus_mutation([](auto& value) { value.collateral_vault_script.push_back(OP_TRUE); });
     check_consensus_mutation([](auto& value) { value.collateral_vault_script_hash.begin()[0] ^= 1; });
+    check_consensus_mutation([](auto& value) { value.swap_successor.identities_frozen = true; });
+    check_consensus_mutation([](auto& value) { value.swap_successor.program_id.begin()[0] ^= 1; });
+    check_consensus_mutation([](auto& value) { value.swap_successor.configuration_hash.begin()[0] ^= 1; });
+    check_consensus_mutation([](auto& value) { value.swap_successor.transition_cmr.begin()[0] ^= 1; });
+    check_consensus_mutation([](auto& value) { value.swap_successor.state_node_domain_sha256.begin()[0] ^= 1; });
 
     using BondConfig = std::remove_cvref_t<decltype(consensus.bond_v2)>;
     for (auto member : {
@@ -6276,6 +6732,39 @@ BOOST_AUTO_TEST_CASE(haskell_inbox_derivation_guards_callbacks)
     },error));
     BOOST_CHECK_EQUAL(calls,1U);
     BOOST_CHECK_EQUAL(error,"unchanged");
+}
+
+BOOST_AUTO_TEST_CASE(haskell_state_workflow_native_exception_prefix)
+{
+    namespace hs = drivechain::haskell;
+    using Call = std::pair<uint32_t,uint64_t>;
+    const std::vector<Call> expected{{1,0},{17,0},{1,1},{17,1},{1,2},{17,2},
+        {3,0},{4,0},{5,0},{64,0},{65,0},{66,0},{67,0},{68,0},{69,0},{70,0},{71,0},
+        {7,0},{8,1},{24,1},{8,2},{24,2}};
+    struct Failure { size_t site; };
+    for (size_t fault = 0; fault <= expected.size(); ++fault) {
+        std::vector<Call> observed;
+        std::string error{"unchanged"};
+        bool published{false}, threw{false};
+        try {
+            BOOST_CHECK(hs::RunExchangeStateWorkflow(hs::ExchangeStateWorkflow::TRANSITION,3,
+                [&](uint32_t step, uint64_t index, uint64_t input) -> uint64_t {
+                    BOOST_CHECK_EQUAL(input,0U);
+                    observed.emplace_back(step,index);
+                    if (observed.size() == fault+1) throw Failure{fault};
+                    if (step == 7) published = true;
+                    if (step == 17) return index == 0;
+                    return step == 24 ? 0 : 1;
+                },error));
+        } catch (const Failure& failure) {
+            threw = true;
+            BOOST_CHECK_EQUAL(failure.site,fault);
+        }
+        BOOST_CHECK_EQUAL(threw,fault < expected.size());
+        BOOST_CHECK_EQUAL(published,fault > 17);
+        BOOST_CHECK_EQUAL(error,"unchanged");
+        BOOST_CHECK(observed == std::vector<Call>(expected.begin(),expected.begin()+std::min(fault+1,expected.size())));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(haskell_state_transition_preserves_partial_publication)
@@ -10071,7 +10560,7 @@ BOOST_AUTO_TEST_CASE(haskell_capital_snapshot_preserves_complete_serialization)
         BOOST_REQUIRE_EQUAL(expected.size(),914);
         BOOST_CHECK_EQUAL(HexStr(encoded),HexStr(expected));
         ecx::BondV2CapitalSnapshot restored;
-        DataStream poisoned{std::vector<unsigned char>(914,0xa5)};
+        DataStream poisoned{PoisonedCapitalSnapshotBytes(0xa5)};
         poisoned >> restored;
         DataStream stream{encoded};
         stream >> restored;
@@ -10107,7 +10596,7 @@ BOOST_AUTO_TEST_CASE(haskell_genesis_snapshot_preserves_complete_serialization)
         BOOST_REQUIRE_EQUAL(expected.size(),914);
         BOOST_CHECK_EQUAL(HexStr(encoded),HexStr(expected));
         ecx::BondV2CapitalSnapshot restored;
-        DataStream poisoned{std::vector<unsigned char>(914,0xa5)};
+        DataStream poisoned{PoisonedCapitalSnapshotBytes(0xa5)};
         poisoned >> restored;
         DataStream stream{encoded};
         stream >> restored;
@@ -10688,6 +11177,358 @@ BOOST_AUTO_TEST_CASE(withdrawal_bundle_requires_authenticated_m6_pxst_preimage)
     BOOST_CHECK(error.find("only when") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(exact_forced_v3_wide_wire_and_persistent_budgets)
+{
+    namespace hs = drivechain::haskell;
+    const auto pin_bytes = ParseHex(ecx_forced_v3_test::pin);
+    std::array<unsigned char, 32> pin;
+    std::copy_n(pin_bytes.begin(), 32, pin.begin());
+    const auto state = ParseHex(ecx_forced_v3_test::state);
+    BOOST_REQUIRE(hs::ExchangeForcedV3State(state, pin));
+    for (size_t size = 0; size < state.size(); ++size)
+        BOOST_CHECK(!hs::ExchangeForcedV3State(std::span{state}.first(size), pin));
+    const std::array<uint64_t, 3> cursor{uint64_t{1} << 32, 2, 9};
+    const auto script = hs::ExchangeForcedV3CursorScript(cursor);
+    BOOST_CHECK(script == ParseHex(ecx_forced_v3_test::cursor));
+    const auto decoded = hs::ExchangeForcedV3Cursor(script);
+    BOOST_REQUIRE(decoded);
+    BOOST_CHECK(*decoded == cursor);
+    const auto next = hs::ExchangeForcedV3Append(std::array<uint64_t, 9>{0, UINT64_MAX, 0, UINT64_MAX, 100, 1, 0, 101, 4});
+    const std::array<uint64_t, 4> expected{1, 0, 1, 0};
+    BOOST_REQUIRE(next);
+    BOOST_CHECK(*next == expected);
+    BOOST_CHECK(!hs::ExchangeForcedV3Append(std::array<uint64_t, 9>{0, 64, 0, 64, 100, 64, 0, 100, 4}));
+    BOOST_CHECK(!hs::ExchangeForcedV3Append(std::array<uint64_t, 9>{0, 1, 0, 1, 100, 1, 64, 100, 0}));
+    BOOST_CHECK(!hs::ExchangeForcedV3Append(std::array<uint64_t, 9>{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 100, 1, 0, 101, 4}));
+}
+
+BOOST_AUTO_TEST_CASE(exact_forced_v3_actual_signature_admission_or_unavailable)
+{
+    const auto encoded = ParseHex(ecx_forced_v3_test::economics);
+    std::array<unsigned char, 259> economics;
+    std::copy_n(encoded.begin(), economics.size(), economics.begin());
+    const auto pin_bytes = ParseHex(ecx_forced_v3_test::pin);
+    std::array<unsigned char, 32> pin;
+    std::copy_n(pin_bytes.begin(), 32, pin.begin());
+    const auto bytes = ParseHex(ecx_forced_v3_test::script);
+    const CAsset asset{std::vector<unsigned char>(economics.begin() + 50, economics.begin() + 82)};
+    CMutableTransaction tx;
+    tx.vout.emplace_back(asset, 0, CScript(bytes.begin(), bytes.end()));
+    std::string error;
+    auto verify = [&](const CMutableTransaction& candidate, uint64_t parent = 100) {
+        return ecx::VerifyForcedActionV3Output(CTransaction(candidate), 0, asset, economics, pin, parent, error);
+    };
+    const auto result = verify(tx);
+    BOOST_TEST_MESSAGE("ECXFv3 linked signature backend available: " << ecx::ForcedActionV3BackendAvailable());
+    if (!ecx::ForcedActionV3BackendAvailable()) {
+        BOOST_CHECK(!result);
+        BOOST_CHECK(error.find("unavailable") != std::string::npos);
+        return;
+    }
+    BOOST_REQUIRE_MESSAGE(result, error);
+    BOOST_CHECK_EQUAL(result->Kind(), 4);
+    const auto metadata = ParseHex(ecx_forced_v3_test::metadata);
+    BOOST_CHECK_EQUAL_COLLECTIONS(result->ActionHash().begin(), result->ActionHash().end(), metadata.begin() + 2, metadata.begin() + 34);
+    BOOST_CHECK(!verify(tx, 112));
+    pin[0] ^= 1;
+    BOOST_CHECK(!verify(tx));
+    pin[0] ^= 1;
+    auto bad = tx;
+    bad.vout[0].scriptPubKey.back() ^= 1;
+    BOOST_CHECK(!verify(bad));
+    bad = tx;
+    bad.vout[0].nValue = CConfidentialValue(1);
+    BOOST_CHECK(!verify(bad));
+    bad = tx;
+    bad.witness.vtxoutwit.resize(1);
+    bad.witness.vtxoutwit[0].vchRangeproof = {1};
+    BOOST_CHECK(!verify(bad));
+}
+
+BOOST_AUTO_TEST_CASE(exact_forced_v3_output_workflow_order_and_publication)
+{
+    const auto encoded = ParseHex(ecx_forced_v3_test::economics);
+    std::array<unsigned char,259> economics;
+    std::copy_n(encoded.begin(),economics.size(),economics.begin());
+    const auto pin_bytes = ParseHex(ecx_forced_v3_test::pin);
+    std::array<unsigned char,32> pin;
+    std::copy_n(pin_bytes.begin(),pin.size(),pin.begin());
+    const CAsset asset{std::vector<unsigned char>(economics.begin()+50,economics.begin()+82)};
+    const auto script = ParseHex(ecx_forced_v3_test::script);
+    CMutableTransaction valid;
+    valid.vout.emplace_back(asset,0,CScript(script.begin(),script.end()));
+    for (unsigned fault=0; fault<13; ++fault) {
+        auto tx = valid;
+        auto actual_economics = economics;
+        auto actual_pin = pin;
+        size_t index = 0;
+        uint64_t parent = 100;
+        switch (fault) {
+        case 0: break;
+        case 1: index=1; break;
+        case 2: tx.vout[0].nAsset.vchCommitment.assign(33,10); break;
+        case 3: tx.vout[0].nAsset=CAsset{uint256::ONE}; break;
+        case 4: actual_economics[50]^=1; break;
+        case 5: tx.vout[0].nValue.vchCommitment.assign(33,8); break;
+        case 6: tx.vout[0].nValue=CConfidentialValue(1); break;
+        case 7: tx.vout[0].nNonce.vchCommitment.assign(33,2); break;
+        case 8: tx.witness.vtxoutwit.resize(1); tx.witness.vtxoutwit[0].vchSurjectionproof={1}; break;
+        case 9: actual_pin[0]^=1; break;
+        case 10: tx.vout[0].scriptPubKey.resize(5000); break;
+        case 11: tx.vout[0].scriptPubKey.back()^=1; break;
+        case 12: parent=112; break;
+        }
+        const CTransaction transaction(tx);
+        std::string error="unchanged";
+        const auto action = ecx::VerifyForcedActionV3Output(transaction,index,asset,actual_economics,actual_pin,parent,error);
+        if (!ecx::ForcedActionV3BackendAvailable()) {
+            BOOST_CHECK(!action);
+            BOOST_CHECK_EQUAL(error,"Exact forced admission backend is unavailable");
+            continue;
+        }
+        if (!fault) {
+            BOOST_REQUIRE(action);
+            BOOST_CHECK_EQUAL(error,"unchanged");
+            BOOST_CHECK_EQUAL(action->Kind(),4);
+        } else {
+            BOOST_CHECK(!action);
+            BOOST_CHECK_EQUAL(error, fault==1 ? "Exact forced output index is invalid" :
+                fault<=8 ? "Exact forced output has a noncanonical asset/value/witness" :
+                fault<=10 ? "Exact forced marker framing or economic domain is invalid" :
+                fault==11 ? "Exact forced canonical codec or signature rejected" :
+                "Exact forced request is outside its admission lifetime");
+        }
+        error="unchanged";
+        const bool canonical = ecx::IsCanonicalForcedActionV3Output(transaction,index,asset,actual_economics,actual_pin,error);
+        BOOST_CHECK_EQUAL(canonical,fault==0 || fault==12);
+        if (canonical) BOOST_CHECK_EQUAL(error,"unchanged");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(exact_forced_v3_native_source_append_and_unavailable_execution)
+{
+    struct Mode { bool old{g_con_ecx_swap_v3}; Mode() { g_con_ecx_swap_v3=true; } ~Mode() {g_con_ecx_swap_v3=old;} } mode;
+    const auto encoded=ParseHex(ecx_forced_v3_test::economics);
+    std::array<unsigned char,259> economics;
+    std::copy_n(encoded.begin(),economics.size(),economics.begin());
+    const auto pin_bytes=ParseHex(ecx_forced_v3_test::pin);
+    std::array<unsigned char,32> pin;
+    std::copy_n(pin_bytes.begin(),pin.size(),pin.begin());
+    const CAsset asset{std::vector<unsigned char>(economics.begin()+50,economics.begin()+82)};
+    CBlock prior;
+    prior.nVersion=4|CBlockHeader::SWAP_FORCED_STATE_HF_MASK;
+    prior.ecxParentHeight=100;
+    prior.hashExchangeStateRoot=uint256::ONE;
+    const auto state=ParseHex(ecx_forced_v3_test::state);
+    std::copy_n(state.begin(),state.size(),prior.swapForcedState.begin());
+    TestBlockIndex previous{prior,3,nullptr};
+    CBlock block;
+    block.nVersion=prior.nVersion;
+    block.ecxParentHeight=100;
+    block.hashExchangeStateRoot=prior.hashExchangeStateRoot;
+    block.swapForcedState=prior.swapForcedState;
+    std::string error;
+    BOOST_CHECK(ecx::CheckForcedV3SourceAppend(block,previous,asset,economics,pin,4,100,error));
+    BOOST_CHECK(!ecx::CheckForcedV3DeploymentMode(error));
+    BOOST_CHECK(error.find("unavailable")!=std::string::npos);
+    BOOST_CHECK(!ecx::CheckExchangeStateHeader(block,4,error,ecx::ExchangeConsensus{}));
+    auto changed=block;changed.hashExchangeStateRoot=uint256::ZERO;
+    BOOST_CHECK(!ecx::CheckForcedV3SourceAppend(changed,previous,asset,economics,pin,4,100,error));
+    for(size_t i=0;i<block.swapForcedState.size();++i) {
+        changed=block;changed.swapForcedState[i]^=1;
+        BOOST_CHECK(!ecx::CheckForcedV3SourceAppend(changed,previous,asset,economics,pin,4,100,error));
+    }
+    CMutableTransaction tx;
+    const auto script=ParseHex(ecx_forced_v3_test::script);
+    tx.vout.emplace_back(asset,0,CScript(script.begin(),script.end()));
+    block.vtx={MakeTransactionRef(tx)};
+    std::array<unsigned char,145> next;
+    if(!ecx::ForcedActionV3BackendAvailable()) {
+        BOOST_CHECK(!ecx::DeriveForcedV3SourceAppend(block,previous,asset,economics,pin,4,100,next,error));
+        return;
+    }
+    BOOST_REQUIRE_MESSAGE(ecx::DeriveForcedV3SourceAppend(block,previous,asset,economics,pin,4,100,next,error),error);
+    block.swapForcedState=next;
+    BOOST_CHECK(ecx::CheckForcedV3SourceAppend(block,previous,asset,economics,pin,4,100,error));
+    changed=block;
+    auto changed_tx=tx;changed_tx.nLockTime=1;
+    changed.vtx={MakeTransactionRef(changed_tx)};
+    BOOST_CHECK(!ecx::CheckForcedV3SourceAppend(changed,previous,asset,economics,pin,4,100,error));
+    auto ordered=block;
+    ordered.vtx.push_back(MakeTransactionRef(changed_tx));
+    BOOST_REQUIRE(ecx::DeriveForcedV3SourceAppend(ordered,previous,asset,economics,pin,4,100,next,error));
+    ordered.swapForcedState=next;
+    BOOST_CHECK(ecx::CheckForcedV3SourceAppend(ordered,previous,asset,economics,pin,4,100,error));
+    std::reverse(ordered.vtx.begin(),ordered.vtx.end());
+    BOOST_CHECK(!ecx::CheckForcedV3SourceAppend(ordered,previous,asset,economics,pin,4,100,error));
+    changed=block;changed.vtx.push_back(changed.vtx[0]);
+    BOOST_CHECK(!ecx::DeriveForcedV3SourceAppend(changed,previous,asset,economics,pin,4,100,next,error));
+    // Keep the signed ECXF payload, but encode its 254-byte push nonminimally.
+    changed_tx=tx;changed_tx.vout[0].scriptPubKey[1]=OP_PUSHDATA2;
+    changed_tx.vout[0].scriptPubKey.insert(changed_tx.vout[0].scriptPubKey.begin()+3,0);
+    changed.vtx={MakeTransactionRef(changed_tx)};
+    BOOST_CHECK(!ecx::DeriveForcedV3SourceAppend(changed,previous,asset,economics,pin,4,100,next,error));
+}
+
+BOOST_AUTO_TEST_CASE(exact_forced_v3_block_workflow_matches_prior_cpp)
+{
+    struct Mode { bool old{g_con_ecx_swap_v3}; Mode() { g_con_ecx_swap_v3=true; } ~Mode() {g_con_ecx_swap_v3=old;} } mode;
+    std::array<unsigned char,259> economics;
+    const auto encoded=ParseHex(ecx_forced_v3_test::economics);
+    std::copy_n(encoded.begin(),economics.size(),economics.begin());
+    std::array<unsigned char,32> pin;
+    const auto pin_bytes=ParseHex(ecx_forced_v3_test::pin);
+    std::copy_n(pin_bytes.begin(),pin.size(),pin.begin());
+    const CAsset asset{std::vector<unsigned char>(economics.begin()+50,economics.begin()+82)};
+    CBlock prior;
+    prior.nVersion=4|CBlockHeader::SWAP_FORCED_STATE_HF_MASK;
+    prior.ecxParentHeight=100;
+    prior.hashExchangeStateRoot=uint256::ONE;
+    const auto state=ParseHex(ecx_forced_v3_test::state);
+    std::copy_n(state.begin(),state.size(),prior.swapForcedState.begin());
+    CBlock base=prior;
+    CMutableTransaction action;
+    const auto script=ParseHex(ecx_forced_v3_test::script);
+    action.vout.emplace_back(asset,0,CScript(script.begin(),script.end()));
+    base.vtx={MakeTransactionRef(action)};
+
+    const auto compare=[&](const CBlock& block,const CBlock& predecessor,int prior_height,
+                           const CAsset& selected_asset,const auto& config,const auto& selected_pin,
+                           uint64_t height,uint64_t parent) {
+        TestBlockIndex previous{predecessor,prior_height,nullptr};
+        for (bool custody : {false,true}) {
+            std::array<unsigned char,145> expected,actual;
+            expected.fill(0xa5); actual=expected;
+            std::string expected_error="unchanged",actual_error=expected_error;
+            const bool old_result=custody ? forced_block_reference::DeriveCustodyForcedV3SourceAppend(
+                block,previous,selected_asset,config,selected_pin,height,parent,nullptr,expected,expected_error) :
+                forced_block_reference::DeriveForcedV3SourceAppend(
+                block,previous,selected_asset,config,selected_pin,height,parent,expected,expected_error);
+            const bool new_result=custody ? ecx::DeriveCustodyForcedV3SourceAppend(
+                block,previous,selected_asset,config,selected_pin,height,parent,nullptr,actual,actual_error) :
+                ecx::DeriveForcedV3SourceAppend(
+                block,previous,selected_asset,config,selected_pin,height,parent,actual,actual_error);
+            BOOST_CHECK_EQUAL(new_result,old_result);
+            BOOST_CHECK_EQUAL(actual_error,expected_error);
+            BOOST_CHECK(actual==expected);
+            if (!new_result) BOOST_CHECK(std::all_of(actual.begin(),actual.end(),[](auto v){return v==0xa5;}));
+        }
+    };
+    compare(base,prior,3,asset,economics,pin,4,100);
+    for (unsigned int fault=0;fault<16;++fault) {
+        auto block=base,predecessor=prior;
+        int prior_height=3;
+        uint64_t height=4,parent=100;
+        auto selected_asset=asset;
+        switch (fault) {
+        case 0: block.nVersion=4; break;
+        case 1: predecessor.nVersion=4; break;
+        case 2: prior_height=-1; break;
+        case 3: height=0; break;
+        case 4: height=std::numeric_limits<uint64_t>::max(); break;
+        case 5: parent=0; break;
+        case 6: predecessor.ecxParentHeight=101; break;
+        case 7: block.ecxParentHeight=101; break;
+        case 8: block.depositProcessedCursor=1; break;
+        case 9: block.forcedProcessedCursor=1; break;
+        case 10: predecessor.hashExchangeStateRoot.SetNull(); break;
+        case 11: block.hashExchangeStateRoot.SetNull(); break;
+        case 12: selected_asset=CAsset{uint256::ONE}; break;
+        case 13: block.vtx.clear(); break;
+        case 14: block.vtx.push_back(block.vtx.front()); break;
+        case 15: block.vtx.insert(block.vtx.begin(),MakeTransactionRef(CMutableTransaction{})); break;
+        }
+        BOOST_TEST_CONTEXT("header/layout mutation " << fault) {
+            compare(block,predecessor,prior_height,selected_asset,economics,pin,height,parent);
+        }
+    }
+    for (size_t i=0;i<economics.size();++i) {
+        auto changed=economics; changed[i]^=1;
+        compare(base,prior,3,asset,changed,pin,4,100);
+    }
+    for (size_t i=0;i<pin.size();++i) {
+        auto changed=pin; changed[i]^=1;
+        compare(base,prior,3,asset,economics,changed,4,100);
+    }
+    for (size_t i=0;i<prior.swapForcedState.size();++i) {
+        auto changed=prior;changed.swapForcedState[i]^=1;
+        compare(base,changed,3,asset,economics,pin,4,100);
+    }
+    for (size_t i=0;i<script.size();++i) {
+        auto tx=action; tx.vout[0].scriptPubKey[i]^=1;
+        auto block=base;block.vtx={MakeTransactionRef(tx)};
+        BOOST_TEST_CONTEXT("signed script mutation " << i) {
+            compare(block,prior,3,asset,economics,pin,4,100);
+        }
+    }
+    for (unsigned int count : {0,1,2,63,64,65}) {
+        auto block=base;block.vtx.clear();
+        for (unsigned int i=0;i<count;++i) {
+            auto tx=action;tx.nLockTime=i;
+            tx.vout.emplace_back(asset,0,CScript{}<<OP_RETURN<<std::vector<unsigned char>{1,2,3});
+            block.vtx.push_back(MakeTransactionRef(tx));
+        }
+        compare(block,prior,3,asset,economics,pin,4,100);
+        std::reverse(block.vtx.begin(),block.vtx.end());
+        compare(block,prior,3,asset,economics,pin,4,100);
+    }
+    // Candidate preparation can observe proposed consumption but cannot create
+    // a VerifiedCustodySource. Compare both paths without forging that receipt.
+    for (unsigned int mutation=0;mutation<8;++mutation) {
+        TestBlockIndex previous{prior,3,nullptr};
+        CMutableTransaction tx;
+        auto cursor=std::array<uint64_t,3>{0,0,0};
+        if (mutation==1) cursor[0]=uint64_t{1}<<32;
+        if (mutation==2) cursor[1]=1;
+        if (mutation==3) cursor[2]=1;
+        const auto bytes=drivechain::haskell::ExchangeForcedV3CursorScript(cursor);
+        tx.vout.emplace_back(asset,mutation==4 ? 1 : 0,CScript(bytes.begin(),bytes.end()));
+        CBlock block=base;block.vtx={MakeTransactionRef(tx)};
+        const uint256 transaction=mutation==5 ? uint256{} : uint256{block.vtx[0]->GetHash()};
+        uint256 root;
+        std::copy_n(prior.swapForcedState.begin()+81,32,root.begin());
+        if (mutation==6) root.SetNull();
+        if (mutation==7) block.vtx.push_back(block.vtx.front());
+        const std::array<unsigned char,16> consumed{};
+        std::array<unsigned char,145> expected,actual;
+        expected.fill(0xa5);actual=expected;
+        std::string expected_error="unchanged",actual_error=expected_error;
+        const bool old_result=forced_block_reference::PrepareCustodySourceAppend(
+            block,previous,asset,economics,pin,4,100,transaction,root,consumed,expected,expected_error);
+        const bool new_result=ecx::PrepareCustodySourceAppend(
+            block,previous,asset,economics,pin,4,100,transaction,root,consumed,actual,actual_error);
+        BOOST_CHECK_EQUAL(new_result,old_result);
+        BOOST_CHECK_EQUAL(actual_error,expected_error);
+        BOOST_CHECK(actual==expected);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(exact_forced_v3_cursor_binds_actual_transaction_and_all_bits)
+{
+    const CAsset asset{uint256::ONE};
+    const std::array<uint64_t,3> cursor{uint64_t{1}<<32,2,9};
+    const auto bytes=drivechain::haskell::ExchangeForcedV3CursorScript(cursor);
+    CMutableTransaction tx;
+    tx.vout.emplace_back(asset,0,CScript(bytes.begin(),bytes.end()));
+    CBlock block;block.vtx={MakeTransactionRef(tx)};
+    const uint256 id=block.vtx[0]->GetHash();
+    std::string error;
+    BOOST_CHECK(ecx::CheckForcedV3CursorMarker(block,asset,id,cursor,error));
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(block,asset,uint256::ZERO,cursor,error));
+    auto bad_cursor=cursor;bad_cursor[0]^=1;
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(block,asset,id,bad_cursor,error));
+    auto changed=block;changed.vtx.push_back(changed.vtx[0]);
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(changed,asset,id,cursor,error));
+    auto bad=tx;bad.nLockTime=1;changed.vtx={MakeTransactionRef(bad)};
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(changed,asset,id,cursor,error));
+    bad=tx;bad.vout[0].scriptPubKey[6]=1;changed.vtx={MakeTransactionRef(bad)};
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(changed,asset,changed.vtx[0]->GetHash(),cursor,error));
+    bad=tx;bad.vout[0].scriptPubKey.push_back(OP_FALSE);changed.vtx={MakeTransactionRef(bad)};
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(changed,asset,changed.vtx[0]->GetHash(),cursor,error));
+    bad=tx;bad.vout[0].nValue=CConfidentialValue(1);changed.vtx={MakeTransactionRef(bad)};
+    BOOST_CHECK(!ecx::CheckForcedV3CursorMarker(changed,asset,changed.vtx[0]->GetHash(),cursor,error));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 #ifdef ECX_PRODUCTION_ACTIVATION_PROFILE_FROZEN
@@ -10697,10 +11538,10 @@ BOOST_AUTO_TEST_CASE(load_actual_frozen_profile)
 {
     BOOST_REQUIRE_EQUAL(Params().NetworkIDString(), "elements");
     BOOST_REQUIRE_EQUAL(Params().GetConsensus().hashGenesisBlock.GetHex(),
-        "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
+                        "672af009bd90bfc6527a5a9dda4c83aba0048c15cff3697d07e89a7f96fa5bcd");
     const auto& consensus = ecx::LayerTwoLabsExchangeConsensus();
     BOOST_CHECK_EQUAL(consensus.activation_height,
-        gArgs.GetIntArg("-ecxactivationheight", -1));
+                      gArgs.GetIntArg("-ecxactivationheight", -1));
     BOOST_CHECK(consensus.bond_v2.activation_enabled);
     BOOST_CHECK(consensus.bond_v2.identities_frozen);
     BOOST_REQUIRE(consensus.bond_v2.deployment_transaction);

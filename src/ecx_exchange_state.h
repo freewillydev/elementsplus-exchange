@@ -6,10 +6,12 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <ecx_bond_v2.h>
+#include <ecx_custody_projection.h>
 #include <haskell/bmm_constants.h>
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <array>
 #include <limits>
 #include <optional>
@@ -193,6 +195,29 @@ struct ExchangeConsensus
         uint256 genesis_initialization_block_hash;
         uint64_t genesis_initialization_parent_mtp{0};
     } bond_v2;
+    /** Separate nonactivating candidate identity tuple. A V23 deployment has
+     * no implicit migration into this profile. All fields must be qualified
+     * together with a fresh genesis or an explicit migration proof. */
+    struct SwapSuccessorFrozenConsensus {
+        bool identities_frozen{false};
+        uint256 program_id;
+        uint256 configuration_hash;
+        uint256 transition_cmr;
+        uint256 state_node_domain_sha256;
+    } swap_successor;
+    /** Fresh exact-ECX profile. No selected chain supplies these pins yet. */
+    struct CustodySuccessorFrozenConsensus {
+        bool activation_enabled{false};
+        bool identities_frozen{false};
+        uint256 program_id, composition_policy, ecx_configuration, clearing_policy;
+        uint256 source_configuration, custodian_registry, vault_asset, vault_script, forced_source_domain;
+        uint256 transition_cmr, state_node_domain_sha256;
+        std::array<unsigned char,32> keyless_internal_key{};
+        std::array<unsigned char,259> canonical_economics{};
+        std::array<unsigned char,145> genesis_forced_state{};
+        std::optional<CustodyProjection> genesis_projection;
+    } custody_successor;
+
 };
 
 /** Exact node-derived source record exported to a proof producer.  The
@@ -309,6 +334,34 @@ bool DecodeBondV2IncrementalSuccessorCapitalProjection(
     std::string& error,
     const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
 
+/** Decode only; callers must separately authenticate the exact input script. */
+bool PrepareCustodyHeader(CBlock&,const CBlockIndex*,uint64_t,uint64_t,std::string&,const ExchangeConsensus&);
+bool CustodySourceAppendBudget(const CBlockIndex&,uint64_t,uint64_t&);
+bool CustodySuccessorAvailable(const ExchangeConsensus& consensus);
+bool CustodyGenesisConfigured(const ExchangeConsensus& consensus);
+bool InitializeCustodyProjection(const CBlock& block, const CCoinsViewCache& view,
+    uint64_t height, CustodyProjection& snapshot, std::string& error,
+    const ExchangeConsensus& consensus);
+bool CheckCustodyProjectionIdentity(const CustodyProjection& snapshot,
+    const uint256& exchange_root, const ExchangeConsensus& consensus);
+bool ComputeCustodySuccessorScript(const ExchangeConsensus& consensus,
+    const uint256& outer_root, CScript& script);
+bool DecodeCustodyProjection(const std::vector<unsigned char>& stripped_annex,
+    const uint256& exchange_root, CustodyProjection& snapshot, std::string& error,
+    const ExchangeConsensus& consensus);
+bool DeriveCustodyProjectionAfterScripts(const CBlock& block, const CBlockIndex* previous,
+    const CBlockUndo& undo, uint64_t height, const uint256& parent_hash,
+    uint64_t parent_height, uint64_t parent_mtp, CustodyProjection& snapshot,
+    std::string& error, const ExchangeConsensus& consensus);
+
+bool DecodeSwapSuccessorCapitalProjection(
+    const std::vector<unsigned char>& stripped_annex, const uint256& active_exchange_state_root,
+    BondV2CapitalSnapshot& snapshot, std::string& error, const ExchangeConsensus& consensus);
+
+/** Check persisted projection against its header and trusted deployment pins. */
+bool CheckCapitalProjectionIdentity(const BondV2CapitalSnapshot& snapshot,
+    const uint256& active_exchange_state_root, const ExchangeConsensus& consensus);
+
 /** Bind the consumed finite-state coin; this does not verify its input script. */
 bool CheckBondV2ActivationPredecessorCoin(
     const CTransaction& transition,
@@ -378,6 +431,9 @@ bool ComputeBondV2IncrementalSuccessorScript(
     const ExchangeConsensus& consensus,
     const uint256& successor_state_root,
     CScript& script);
+
+bool ComputeSwapSuccessorScript(const ExchangeConsensus& consensus,
+    const uint256& successor_state_root, CScript& script);
 
 /**
  * Versioned commitment to every runtime-selectable ECX/private-BMM consensus
@@ -477,12 +533,21 @@ bool IsCanonicalForcedActionOutput(
     std::string& error,
     const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
 
+/** Early fresh-only check shared by relay and template filtering. */
+bool CheckCustodyReservedSpendPolicy(
+    const CTransaction& transaction,
+    const CBlockIndex* previous,
+    std::string& error,
+    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus(),
+    const std::function<CTransactionRef(const Txid&)>& unconfirmed_parent = {});
+
 /** Reject reserved ECXF/ECXD lookalikes before they can poison block templates. */
 bool CheckSourceTransactionPolicy(
     const CTransaction& transaction,
     int next_height,
     std::string& error,
-    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
+    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus(),
+    std::optional<uint64_t> authenticated_parent_height = std::nullopt);
 
 /** Count canonical source markers after applying the fail-closed parser. */
 bool CountSourceTransactionMarkers(
@@ -490,7 +555,8 @@ bool CountSourceTransactionMarkers(
     uint64_t& forced_count,
     uint64_t& deposit_count,
     std::string& error,
-    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus());
+    const ExchangeConsensus& consensus = LayerTwoLabsExchangeConsensus(),
+    std::optional<uint64_t> authenticated_parent_height = std::nullopt);
 
 /**
  * Exact successor resource reservation for one authenticated parent-height

@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/haskell_reference.h>
 #include <drivechain_bmm.h>
 #include <script/interpreter.h>
 #include <haskell/bridge.h>
@@ -25,6 +26,93 @@
 #include <tuple>
 #include <type_traits>
 
+namespace drivechain::haskell {
+// Legacy ABI probes stay in the test target; production uses Bmm capabilities directly.
+std::array<unsigned char, 32> BmmCommitmentBytes(uint32_t kind, std::span<const unsigned char> payload)
+{
+    elements_hs_runtime_init();
+    std::array<unsigned char, 32> bytes{};
+    if (payload.size() > 37 || elements_hs_bmm_commitment_bytes_v1(kind, payload.size(),
+            const_cast<unsigned char*>(payload.data()), bytes.data()) != 0)
+        throw std::runtime_error("Haskell commitment payload failed");
+    return bytes;
+}
+
+using BmmScript = int32_t (*)(void*, uint32_t, uint32_t, int64_t*);
+int64_t BmmCommitment(uint32_t kind, int32_t slot, uint32_t count, BmmScript read, void* context, std::string& error)
+{
+    elements_hs_runtime_init();
+    const auto result = elements_hs_bmm_commitment_v2(kind, slot, count, reinterpret_cast<HsFunPtr>(read), context);
+    if (kind > 3 || result == -3 || result < (kind == 3 ? -4 : -2) || result >= count || (kind == 2 && result == -2)) throw std::runtime_error("Haskell BMM commitment evaluation failed");
+    if (kind == 3) {
+        if (result == -4) error = "block coinbase contains a noncanonical ELMTP parent commitment";
+        if (result == -2) error = "block coinbase contains multiple canonical drivechain parent commitments";
+        if (result == -1) error = "block coinbase does not contain one canonical ELMTP drivechain parent commitment";
+        return result;
+    }
+    if (result == -1 && kind != 2) error = kind == 0 ? "BMM successor coinbase has no M8 commitment for slot 24" : "sidechain block has no L1 parent commitment";
+    if (result == -2) error = kind == 0 ? "BMM successor coinbase contains multiple M8 commitments for slot 24" : "sidechain block has multiple L1 parent commitments";
+    return result;
+}
+
+std::array<uint32_t, 6> BmmSignetTemplate()
+{
+    elements_hs_runtime_init();
+    std::array<uint32_t, 6> fields{};
+    if (elements_hs_bmm_signet_template_v1(fields.size(), fields.data()) != 0)
+        throw std::runtime_error("Haskell signet template failed");
+    return fields;
+}
+
+void BmmPreimage(uint32_t kind, const std::function<void(uint32_t)>& write)
+{
+    std::array<uint32_t,10> fields{};
+    size_t count{0};
+    const std::function<int32_t(uint32_t,uint32_t)> collect = [&](uint32_t field,uint32_t) {
+        if (count == fields.size()) return 0;
+        fields[count++] = field;
+        return 1;
+    };
+    const auto result = ReferenceReadBoundAdmission<int32_t,0>(elements_hs_bmm_preimage_v1,collect,kind);
+    if (result != 1) throw std::runtime_error("Haskell BMM action plan failed");
+    for (size_t i = 0; i < count; ++i) write(fields[i]);
+}
+
+static int32_t ReferenceBmmLifecycleResult(int32_t result, const std::string& state_error, std::string& error)
+{
+    constexpr std::array<const char*, 7> errors{{
+        "historical signet BMM state is not valid on native Elements",
+        "public BMM checkpoint cannot overwrite existing parent-chain state",
+        "",
+        "public BMM checkpoint state is inconsistent during disconnect",
+        "public BMM checkpoint state could not be removed",
+        "cannot disconnect BMM proof without authenticated state",
+        "BMM state is inconsistent during disconnect",
+    }};
+    if (result < -7 || result > 7) throw std::runtime_error("Haskell BMM lifecycle failed");
+    if (result < 0 && (result != -7 || error.empty())) error = result == -3 ? state_error : errors[-result - 1];
+    return result;
+}
+
+int32_t BmmLifecycle(BmmLifecyclePhase phase, uint32_t facts, const std::string& state_error, std::string& error)
+{
+    elements_hs_runtime_init();
+    return ReferenceBmmLifecycleResult(elements_hs_bmm_lifecycle_v1(static_cast<uint32_t>(phase), facts),state_error,error);
+}
+
+// Previous orchestration remains available only as a differential test oracle.
+bool RunBmmStateWorkflow(BmmStateStep start, const std::function<int32_t(BmmStateStep)>& action,
+    const std::string& state_error, std::string& error)
+{
+    const std::function<int32_t(uint32_t)> read = [&](uint32_t step) { return action(static_cast<BmmStateStep>(step)); };
+    const auto result = ReferenceReadBoundAdmission<int64_t,INT64_MIN>(elements_hs_bmm_state_workflow_v1,read,static_cast<uint32_t>(start));
+    if (result >= 101 && result <= 107) ReferenceBmmLifecycleResult(100-result,state_error,error);
+    else if (result >= 201 && result <= 203) ReferenceBmmStateSourceResult(200-result,state_error,error);
+    else ReferenceCheckedStatus(result,1,"Haskell BMM state workflow failed");
+    return result == 0;
+}
+}
+
 namespace {
 
 struct ElementsTestingSetup : BasicTestingSetup {
@@ -42,6 +130,14 @@ std::vector<unsigned char> SerializeValue(const T& value)
     return {
         UCharCast(stream.data()),
         UCharCast(stream.data()) + stream.size()};
+}
+
+template <typename T, size_t N>
+std::vector<unsigned char> SerializeValue(const std::array<T, N>& values)
+{
+    DataStream stream;
+    for (const auto& value : values) stream << TX_WITH_WITNESS(value);
+    return {UCharCast(stream.data()), UCharCast(stream.data()) + stream.size()};
 }
 
 drivechain::BmmL1State AuthenticState6399()
@@ -324,6 +420,78 @@ BOOST_AUTO_TEST_CASE(target_scaling_preserves_native_uint256_arithmetic)
     BOOST_CHECK_EQUAL(target, original);
     hs::BmmScaleTarget(0x100000000ULL, 1, bytes, bytes);
     BOOST_CHECK(target.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(retarget_workflow_preserves_reference_results_and_lazy_reads)
+{
+    namespace hs = drivechain::haskell;
+    const int64_t targets[]{1,3,4,1209600,0x100000000LL,INT64_MAX / 4};
+    for (uint64_t i = 0; i < 2048; ++i) {
+        uint256 expected = (HashWriter{} << i).GetHash();
+        const uint256 limit = (HashWriter{} << i << uint8_t{1}).GetHash();
+        std::vector<unsigned char> source(expected.begin(),expected.end());
+        source.insert(source.end(),limit.begin(),limit.end());
+        const auto target = targets[i % std::size(targets)];
+        const uint32_t height = i % 2 ? 2015 : 2014;
+        const uint32_t time = i % 3 ? UINT32_MAX : 0;
+        const auto span = hs::BmmRetarget(height,2016,target,time,100);
+        if (span >= 0) hs::BmmScaleTarget(span,target,
+            std::span<unsigned char,32>{expected.begin(),32},
+            std::span<const unsigned char,32>{limit.begin(),32});
+        uint256 actual{source.data(),32};
+        std::vector<uint32_t> calls;
+        hs::RunBmmRetarget(height,2016,target,time,100,
+            [&](uint32_t step,uint64_t index,std::span<const unsigned char> bytes) {
+                calls.push_back(step);
+                BOOST_CHECK_EQUAL(index,0);
+                if (step == 0) {
+                    BOOST_CHECK(bytes.empty());
+                    return source;
+                }
+                BOOST_REQUIRE_EQUAL(step,1);
+                BOOST_REQUIRE_EQUAL(bytes.size(),32);
+                std::copy(bytes.begin(),bytes.end(),actual.begin());
+                return std::vector<unsigned char>{};
+            });
+        BOOST_CHECK_EQUAL(actual,expected);
+        BOOST_CHECK(calls == (span < 0 ? std::vector<uint32_t>{} : std::vector<uint32_t>{0,1}));
+    }
+    const hs::NativeWorkflow forbidden = [](uint32_t,uint64_t,std::span<const unsigned char>) -> std::vector<unsigned char> {
+        BOOST_FAIL("retarget forced an unnecessary native read");
+        return {};
+    };
+    BOOST_CHECK_NO_THROW(hs::RunBmmRetarget(0,2016,0,0,0,forbidden));
+    for (const auto interval : {-1,0,1}) {
+        BOOST_CHECK_EXCEPTION(hs::RunBmmRetarget(0,interval,0,0,0,forbidden),std::runtime_error,
+            [](const auto& error) { return std::string(error.what()) == "Haskell BMM retarget evaluation failed"; });
+    }
+}
+
+BOOST_AUTO_TEST_CASE(retarget_workflow_rejects_malformed_data_and_preserves_first_exception)
+{
+    namespace hs = drivechain::haskell;
+    for (const size_t size : {0,32,63,65}) {
+        unsigned calls = 0;
+        BOOST_CHECK_EXCEPTION(hs::RunBmmRetarget(0,1,4,4,0,
+            [&](uint32_t step,uint64_t,std::span<const unsigned char>) {
+                ++calls;
+                BOOST_CHECK_EQUAL(step,0);
+                return std::vector<unsigned char>(size,1);
+            }),std::runtime_error,
+            [](const auto& error) { return std::string(error.what()) == "Haskell BMM state flow failed"; });
+        BOOST_CHECK_EQUAL(calls,1);
+    }
+    struct Failure { uint32_t step; };
+    for (uint32_t fault = 0; fault < 2; ++fault) {
+        std::vector<uint32_t> calls;
+        BOOST_CHECK_EXCEPTION(hs::RunBmmRetarget(0,1,4,4,0,
+            [&](uint32_t step,uint64_t,std::span<const unsigned char>) {
+                calls.push_back(step);
+                if (step == fault) throw Failure{step};
+                return std::vector<unsigned char>(64,1);
+            }),Failure,[&](const auto& error) { return error.step == fault; });
+        BOOST_CHECK(calls == (fault == 0 ? std::vector<uint32_t>{0} : std::vector<uint32_t>{0,1}));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(retarget_boundary_proofs_use_clamped_target)
@@ -802,6 +970,42 @@ BOOST_AUTO_TEST_CASE(advancement_preserves_wrapping_retarget_and_history)
     }
 }
 
+BOOST_AUTO_TEST_CASE(proof_workflow_native_exception_prefix)
+{
+    namespace hs = drivechain::haskell;
+    const std::vector<uint32_t> expected{1,147,18,2,200,201,202,203,204,205,3,4,150,151,152,154,155,6,7,8,9,10,19};
+    struct Failure { size_t site; };
+    for (size_t fault = 0; fault <= expected.size(); ++fault) {
+        std::vector<uint32_t> observed;
+        std::string error{"prior diagnostic"};
+        bool published{false}, threw{false};
+        try {
+            BOOST_CHECK(hs::RunBmmProofWorkflow(hs::BmmTraversalStep::START,
+                [&](uint32_t step) -> std::array<uint64_t,4> {
+                    observed.push_back(step);
+                    if (observed.size() == fault+1) throw Failure{fault};
+                    if (step == 19) published = true;
+                    switch (step) {
+                    case 1: return {1,1,1,0};
+                    case 2: return {0,1,1,100};
+                    case 3: return {1,1,1,0};
+                    case 7: return {0,1,0,0};
+                    case 154: return {0,1,0,0};
+                    case 205: return {1,1,0,0};
+                    default: return {1,0,0,0};
+                    }
+                },error));
+        } catch (const Failure& failure) {
+            threw = true;
+            BOOST_CHECK_EQUAL(failure.site,fault);
+        }
+        BOOST_CHECK_EQUAL(threw,fault < expected.size());
+        BOOST_CHECK_EQUAL(published,fault == expected.size());
+        BOOST_CHECK_EQUAL(error,"prior diagnostic");
+        BOOST_CHECK(observed == std::vector<uint32_t>(expected.begin(),expected.begin()+std::min(fault+1,expected.size())));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(traversal_gates_entry_mutations_and_publication)
 {
     namespace hs = drivechain::haskell;
@@ -952,6 +1156,120 @@ BOOST_AUTO_TEST_CASE(proof_codec_bounds_and_partial_outputs)
     BOOST_CHECK_EQUAL(error, "serialized BMM proof exceeds its consensus size bound");
     BOOST_CHECK(block.m_bmm_proof == bytes);
     BOOST_CHECK(block.hashBmmProof == uint256S("123"));
+}
+
+BOOST_AUTO_TEST_CASE(proof_session_preserves_callback_failures_and_short_circuits)
+{
+    namespace hs = drivechain::haskell;
+    for (bool retarget : {false,true}) {
+    drivechain::BmmL1State initial{uint256S("01"),retarget ? 2015U : 1U,retarget ? 2017U : 100U,0x207fffff,0,1,{}};
+    for (int i=10; i>=0; --i) initial.recent_times.push_back(initial.block_time-i);
+    auto expected_state = initial;
+    expected_state.block_hash = uint256S("02");
+    ++expected_state.height;
+    ++expected_state.block_time;
+    if (retarget) {
+        expected_state.period_start_height = expected_state.height;
+        expected_state.period_start_time = expected_state.block_time;
+        arith_uint256 target;
+        target.SetCompact(initial.n_bits);
+        target *= 2016;
+        target /= 2016;
+        expected_state.n_bits = target.GetCompact();
+    }
+    expected_state.recent_times.erase(expected_state.recent_times.begin());
+    expected_state.recent_times.push_back(expected_state.block_time);
+    for (const auto mode : {hs::ReplayStoreWorkflow::PROOF_ENCODE, hs::ReplayStoreWorkflow::PROOF_DECODE,
+        hs::ReplayStoreWorkflow::PROOF_ATTACH, hs::ReplayStoreWorkflow::PROOF_ENTRIES,
+        hs::ReplayStoreWorkflow::PROOF_BLOCK, hs::ReplayStoreWorkflow::PROOF_PARENT}) {
+        const auto exercise = [&](int fault, bool malformed, std::vector<uint32_t>& trace) {
+            return hs::RunReplayStore(mode, [&](uint32_t step, uint64_t index, std::span<const unsigned char> input) {
+                trace.push_back(step);
+                BOOST_CHECK_EQUAL(index, 0U);
+                BOOST_CHECK_MESSAGE(input.empty() || step == 405 || step == 406 || step == 407 || step == 523 || step == 623,
+                    "unexpected projection input at " << step << ": " << std::string(input.begin(), input.end()));
+                if (static_cast<int>(trace.size()) == fault+1) {
+                    if (!malformed) throw std::logic_error("proof native callback failure");
+                    return std::vector<unsigned char>{};
+                }
+                if (step >= 500 && step < 690) {
+                    const bool m8 = step < 600;
+                    auto payload = m8 ? ParseHex("d161736818") : std::vector<unsigned char>{};
+                    for (unsigned char i = 1; i <= 32; ++i) payload.push_back(i);
+                    switch (step % 100) {
+                    case 0: return SerializeValue(std::array<uint64_t,3>{m8 ? 0U : 1U,24,1});
+                    case 11: return SerializeValue(std::array<uint64_t,4>{106,0,0,0});
+                    case 12: return SerializeValue(std::array<uint64_t,4>{payload.size(),0,0,0});
+                    case 13: return SerializeValue(std::array<uint64_t,4>{1,payload.size(),ReadLE32(payload.data()),payload[4]});
+                    case 20: case 21: return SerializeValue(uint64_t{1});
+                    case 22: return payload;
+                    case 23:
+                        if (m8) {
+                            payload.erase(payload.begin(),payload.begin()+5);
+                            std::reverse(payload.begin(),payload.end());
+                        }
+                        BOOST_CHECK(std::vector<unsigned char>(input.begin(),input.end()) == payload);
+                        return SerializeValue(uint64_t{1});
+                    default: throw std::logic_error("unexpected commitment callback");
+                    }
+                }
+                switch (step) {
+                case 400: return SerializeValue(std::array<uint64_t,11>{1,retarget ? 2016U : 2000U,1,
+                    initial.height,initial.block_time,initial.n_bits,0,1,11,initial.block_time,1});
+                case 401: return SerializeValue(initial);
+                case 402: return SerializeValue(uint256S("01"));
+                case 403: return SerializeValue(std::array<uint32_t,2>{expected_state.block_time,expected_state.n_bits});
+                case 404: return SerializeValue(uint256S("02"));
+                case 405: {
+                    BOOST_REQUIRE_EQUAL(input.size(),4U);
+                    BOOST_CHECK_EQUAL(ReadLE32(input.data()),initial.n_bits);
+                    const auto target = ArithToUint256(arith_uint256{}.SetCompact(initial.n_bits));
+                    return SerializeValue(std::array<uint256,2>{target,target});
+                }
+                case 406:
+                    BOOST_REQUIRE_EQUAL(input.size(),32U);
+                    return SerializeValue(UintToArith256(uint256{input.data(),input.size()}).GetCompact());
+                case 407:
+                    BOOST_CHECK(std::vector<unsigned char>(input.begin(),input.end()) == SerializeValue(expected_state));
+                    break;
+                }
+                std::vector<unsigned char> reply(step < 256 ? 32 : 8);
+                uint64_t value{1};
+                if (step == 300) {
+                    reply.resize(9); reply[0] = 1; WriteLE64(reply.data()+1, 10); return reply;
+                }
+                if (step == 301) value = 10;
+                if (step == 303) value = drivechain::BMM_PROOF_SCHEMA_VERSION;
+                WriteLE64(reply.data(), value);
+                if (step < 256) {
+                    std::array<uint64_t,4> fields{1,0,0,0};
+                    switch (step) {
+                    case 1: fields = {1,1,128,0}; break;
+                    case 2: fields = {0,1,1,100}; break;
+                    case 3: fields = {1,1,1,0}; break;
+                    case 7: fields = {0,1,0,0}; break;
+                    case 12: fields = {3,10,1000,0}; break;
+                    case 154: fields = {0,0,0,0}; break;
+                    case 205: fields = {1,1,0,0}; break;
+                    }
+                    for (size_t i=0; i<fields.size(); ++i) WriteLE64(reply.data()+8*i, fields[i]);
+                }
+                return reply;
+            });
+        };
+        std::vector<uint32_t> expected;
+        BOOST_REQUIRE_EQUAL(exercise(-1, false, expected), 1U);
+        for (size_t fault=0; fault<expected.size(); ++fault) {
+            for (bool malformed : {false,true}) {
+                std::vector<uint32_t> trace;
+                if (malformed) BOOST_CHECK_THROW(exercise(fault,true,trace), std::runtime_error);
+                else BOOST_CHECK_EXCEPTION(exercise(fault,false,trace), std::logic_error,
+                    [](const auto& error) { return std::string{error.what()} == "proof native callback failure"; });
+                BOOST_CHECK(trace == std::vector<uint32_t>(expected.begin(), expected.begin()+fault+1));
+            }
+        }
+    }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(coin_preflight_stops_before_guarded_access)
@@ -1263,6 +1581,84 @@ BOOST_AUTO_TEST_CASE(state_encoding_preserves_order_and_exceptions)
     }
 }
 
+BOOST_AUTO_TEST_CASE(composed_state_storage_matches_legacy_effects_and_exception_prefixes)
+{
+    namespace hs = drivechain::haskell;
+    using Event = std::pair<uint32_t, uint32_t>;
+    for (const auto height : {INT32_MIN, -1, 0, 1, 2, INT32_MAX}) {
+        for (const bool restore : {false, true}) {
+            for (int failure = -1; failure < 8; ++failure) {
+                const auto exercise = [&](bool legacy) {
+                    std::vector<Event> events;
+                    bool threw{false};
+                    const auto effect = [&](uint32_t step, uint32_t value) {
+                        events.emplace_back(step, value);
+                        if (static_cast<int>(events.size()) == failure+1)
+                            throw std::logic_error("persisted state effect failure");
+                    };
+                    try {
+                        if (legacy) {
+                            hs::BmmStoreState(height, [&](uint32_t step, uint32_t value) {
+                                if (step == 0) effect(10, value);
+                                else if (step == 1) {
+                                    hs::BmmEncodeState([&](uint32_t action, uint32_t opcode) {
+                                        effect(action+11, opcode);
+                                    });
+                                    effect(15, value);
+                                } else effect(16, value);
+                            }, restore);
+                        } else {
+                            BOOST_CHECK_EQUAL(hs::RunReplayStore(restore ? hs::ReplayStoreWorkflow::STATE_RESTORE :
+                                hs::ReplayStoreWorkflow::STATE_STORE,
+                                [&](uint32_t step, uint64_t value, std::span<const unsigned char> input) {
+                                    BOOST_CHECK(input.empty());
+                                    BOOST_CHECK_LE(value, UINT32_MAX);
+                                    std::vector<unsigned char> reply(8);
+                                    if (step == 0) WriteLE64(reply.data(), static_cast<uint32_t>(height));
+                                    else { effect(step, value); WriteLE64(reply.data(), 1); }
+                                    return reply;
+                                }), 1U);
+                        }
+                    } catch (const std::logic_error& error) {
+                        threw = true;
+                        BOOST_CHECK_EQUAL(error.what(), "persisted state effect failure");
+                    }
+                    BOOST_CHECK_EQUAL(threw, failure >= 0);
+                    return events;
+                };
+                BOOST_CHECK(exercise(false) == exercise(true));
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(composed_state_storage_checks_native_reply_frames_before_continuing)
+{
+    namespace hs = drivechain::haskell;
+    for (const uint64_t bad_height : {uint64_t{UINT32_MAX}+1, UINT64_MAX}) {
+        unsigned effects{0};
+        BOOST_CHECK_THROW(hs::RunReplayStore(hs::ReplayStoreWorkflow::STATE_STORE,
+            [&](uint32_t step, uint64_t, std::span<const unsigned char>) {
+                if (step != 0) ++effects;
+                std::vector<unsigned char> reply(8);
+                WriteLE64(reply.data(), bad_height);
+                return reply;
+            }), std::runtime_error);
+        BOOST_CHECK_EQUAL(effects, 0U);
+    }
+    for (size_t bad = 0; bad < 9; ++bad) {
+        size_t calls{0};
+        BOOST_CHECK_THROW(hs::RunReplayStore(hs::ReplayStoreWorkflow::STATE_STORE,
+            [&](uint32_t step, uint64_t, std::span<const unsigned char>) {
+                std::vector<unsigned char> reply(8);
+                WriteLE64(reply.data(), step == 0 ? 100 : 1);
+                if (calls++ == bad) reply.push_back(0);
+                return reply;
+            }), std::runtime_error);
+        BOOST_CHECK_EQUAL(calls, bad+1);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(private_construction_flow_retries_and_short_circuits)
 {
     using Step = drivechain::haskell::BmmStateStep;
@@ -1300,6 +1696,22 @@ BOOST_AUTO_TEST_CASE(private_template_preserves_native_byte_and_integer_semantic
             BOOST_CHECK_EQUAL_COLLECTIONS(commitment.begin(), commitment.end(), expected.begin(), expected.end());
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(retired_preimage_adapter_allows_post_return_reentry)
+{
+    for (uint32_t kind : {0U,1U}) {
+        std::vector<uint32_t> fields;
+        drivechain::haskell::BmmPreimage(kind,[&](uint32_t field) {
+            BOOST_CHECK(drivechain::haskell::BmmSignetTemplate() == (std::array<uint32_t,6>{0,0,0,0,OP_0,OP_RETURN}));
+            fields.push_back(field);
+        });
+        const std::vector<uint32_t> expected = kind == 0 ? std::vector<uint32_t>{0,1,2,3,4,5,6,7,8,9} : std::vector<uint32_t>{0,1,2,3};
+        BOOST_CHECK(fields == expected);
+    }
+    bool called{false};
+    BOOST_CHECK_THROW(drivechain::haskell::BmmPreimage(UINT32_MAX,[&](uint32_t) { called = true; }),std::runtime_error);
+    BOOST_CHECK(!called);
 }
 
 BOOST_AUTO_TEST_CASE(preimage_order_preserves_writer_failure_boundaries)
@@ -1844,6 +2256,47 @@ BOOST_AUTO_TEST_CASE(commitment_selection_preserves_push_encodings_and_duplicate
     }
 }
 
+BOOST_AUTO_TEST_CASE(tagged_commitment_preserves_partial_publication_and_canonical_pushes)
+{
+    auto payload = ParseHex("454c4d5450");
+    for (unsigned char i = 1; i <= 32; ++i) payload.push_back(i);
+    const uint256 expected{payload.data()+5,32};
+    const CScript valid = CScript() << OP_RETURN << payload;
+    for (bool prefix : {false,true}) for (unsigned mode = 0; mode < 6; ++mode) {
+        std::vector<CTxOut> outputs;
+        const auto append = [&](const CScript& script) {
+            outputs.emplace_back();
+            outputs.back().scriptPubKey = script;
+        };
+        if (prefix) append(valid);
+        CScript altered = valid;
+        if (mode == 1) altered << OP_TRUE;
+        if (mode == 2) {
+            altered = CScript() << OP_RETURN << OP_PUSHDATA1;
+            altered.push_back(payload.size());
+            altered.insert(altered.end(),payload.begin(),payload.end());
+        }
+        if (mode == 3) {
+            auto short_payload = payload;
+            short_payload.pop_back();
+            altered = CScript() << OP_RETURN << short_payload;
+        }
+        if (mode == 4) altered = CScript() << OP_TRUE;
+        if (mode != 5) append(altered);
+        uint256 actual = uint256S("feed");
+        std::string error{"existing diagnostic"};
+        const bool accepted = drivechain::ExtractTaggedParentCommitment(outputs,actual,error);
+        const bool malformed = mode >= 1 && mode <= 3;
+        const bool duplicate = prefix && mode == 0;
+        const bool found = prefix || mode == 0;
+        BOOST_CHECK_EQUAL(accepted,found && !malformed && !duplicate);
+        BOOST_CHECK(actual == (found ? expected : uint256S("feed")));
+        BOOST_CHECK_EQUAL(error, malformed ? "block coinbase contains a noncanonical ELMTP parent commitment" :
+            duplicate ? "block coinbase contains multiple canonical drivechain parent commitments" :
+            !found ? "block coinbase does not contain one canonical ELMTP drivechain parent commitment" : "existing diagnostic");
+    }
+}
+
 BOOST_AUTO_TEST_CASE(signet_selects_last_raw_witness_commitment)
 {
     const auto previous = EasyState();
@@ -1872,6 +2325,46 @@ BOOST_AUTO_TEST_CASE(signet_selects_last_raw_witness_commitment)
         BOOST_CHECK_EQUAL(drivechain::VerifyBmmProofEntries(proof, critical,
             previous.block_hash, next, error, EasyConsensus()), expected);
         if (!expected) BOOST_CHECK(error.find("signet solution cannot be decoded") != std::string::npos);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(signet_sessions_isolate_solution_state_between_entries)
+{
+    const auto initial = EasyState();
+    const auto critical = uint256S("abcd1234");
+    auto witness_bytes = ParseHex("aa21a9ed");
+    witness_bytes.resize(36, 0);
+    const auto base = CScript() << OP_RETURN << witness_bytes;
+    const auto m8 = CScript() << OP_RETURN << ParseHex("d161736818" + critical.GetHex());
+    for (int count = 1; count <= 6; ++count) {
+        for (int malformed = -1; malformed < count; ++malformed) {
+            drivechain::BmmProof proof;
+            proof.previous_state = initial;
+            auto expected = initial;
+            uint256 parent;
+            for (int i = 0; i < count; ++i) {
+                auto script = base;
+                if (i == malformed) script << ParseHex("ecc7daa2ff");
+                else if (i % 2 == 0) script << ParseHex("ecc7daa20000");
+                const std::vector<CScript> scripts{script,m8};
+                parent = expected.block_hash;
+                const auto part = EasyProof(expected, critical, &scripts);
+                proof.entries.push_back(part.entries.front());
+                const auto header = DecodeMerkleProof(part.entries.front()).header;
+                ++expected.height;
+                expected.block_hash = header.GetHash();
+                expected.block_time = header.nTime;
+                expected.n_bits = header.nBits;
+                expected.recent_times.erase(expected.recent_times.begin());
+                expected.recent_times.push_back(header.nTime);
+            }
+            auto next = initial;
+            std::string error{"old diagnostic"};
+            const bool accepted = drivechain::VerifyBmmProofEntries(proof,critical,parent,next,error,EasyConsensus());
+            BOOST_CHECK_EQUAL(accepted,malformed < 0);
+            BOOST_CHECK(next == (malformed < 0 ? expected : initial));
+            BOOST_CHECK_EQUAL(error,malformed < 0 ? "" : "BMM parent block signet solution cannot be decoded");
+        }
     }
 }
 
@@ -2167,6 +2660,32 @@ BOOST_AUTO_TEST_CASE(enforces_public_checkpoint_activation)
         BOOST_CHECK(!stored.fCoinBase);
         BOOST_REQUIRE(drivechain::GetBmmState(view, state, &error));
         BOOST_CHECK(state == drivechain::LayerTwoLabsInitialBmmState());
+        // Rejected lifecycle workflows must not replace or remove the existing
+        // state coin, even after proof decoding has touched borrowed outputs.
+        auto unrelated_proof = AuthenticProof6400();
+        std::vector<unsigned char> unrelated_bytes;
+        BOOST_REQUIRE(drivechain::SerializeBmmProof(unrelated_proof, unrelated_bytes, error));
+        for (const auto& bytes : {std::vector<unsigned char>{}, std::vector<unsigned char>{0}, unrelated_bytes}) {
+            CBlock rejected;
+            rejected.nVersion = 0x20000000 | CBlockHeader::BMM_PROOF_HF_MASK;
+            rejected.m_bmm_proof = bytes;
+            rejected.hashBmmProof = drivechain::BmmProofCommitment(bytes);
+            for (bool disconnect : {false, true}) {
+                error.clear();
+                const bool accepted = disconnect ?
+                    drivechain::DisconnectBmmState(rejected, &public_height_one, view, 3, error) :
+                    drivechain::ConnectBmmState(rejected, &public_height_one, view, 3, false, error);
+                BOOST_CHECK(!accepted);
+                BOOST_CHECK(!error.empty());
+                const Coin& unchanged = view.AccessCoin(state_outpoint);
+                BOOST_REQUIRE(!unchanged.IsSpent());
+                BOOST_CHECK_EQUAL_COLLECTIONS(unchanged.out.scriptPubKey.begin(), unchanged.out.scriptPubKey.end(),
+                    expected_script.begin(), expected_script.end());
+                BOOST_CHECK_EQUAL(unchanged.nHeight, 2);
+                BOOST_REQUIRE(drivechain::GetBmmState(view, state, &error));
+                BOOST_CHECK(state == drivechain::LayerTwoLabsInitialBmmState());
+            }
+        }
         BOOST_CHECK(!drivechain::ConnectBmmState(checkpoint_block, &public_height_one, view, 2, false, error));
         BOOST_CHECK_EQUAL(error, "public BMM checkpoint cannot overwrite existing parent-chain state");
         BOOST_REQUIRE(drivechain::DisconnectBmmState(checkpoint_block, &public_height_one, view, 2, error));
@@ -2317,5 +2836,46 @@ BOOST_AUTO_TEST_CASE(private_activation_height_does_not_invalidate_history)
 
 }
 #endif
+
+BOOST_AUTO_TEST_CASE(composed_state_workflow_preserves_errors_and_lazy_native_state)
+{
+    namespace hs = drivechain::haskell;
+    using Step = hs::BmmStateStep;
+    for (const bool proof : {false,true}) for (const bool persisted : {false,true}) {
+        std::string error;
+        std::vector<Step> trace;
+        const bool result = hs::RunBmmStateWorkflow(Step::CONNECT_START, [&](Step step) -> int32_t {
+            trace.push_back(step);
+            switch (step) {
+            case Step::CONNECT_KIND: case Step::NATIVE_HEADER: return 1;
+            case Step::NATIVE_CHECK_PROOF: return proof;
+            case Step::NATIVE_CHECK_LOOKUP: return persisted;
+            default: BOOST_FAIL("composed native state performed an unexpected action"); return -1;
+            }
+        },{},error);
+        BOOST_CHECK_EQUAL(result, !proof && !persisted);
+        BOOST_CHECK_EQUAL(trace.size(), proof ? 3U : 4U);
+        BOOST_CHECK_EQUAL(error, result ? "" : "historical signet BMM state is not valid on native Elements");
+    }
+    for (const std::string& existing : {std::string{},std::string{"preserve native verification error"}}) {
+        std::string error = existing;
+        BOOST_CHECK(!hs::RunBmmStateWorkflow(Step::DISCONNECT_START, [](Step step) -> int32_t {
+            switch (step) {
+            case Step::DISCONNECT_KIND: case Step::EXTRACT_PARENT: case Step::REJECT_PRIOR: return 0;
+            case Step::HAS_PROOF: case Step::DECODE_PROOF: case Step::LOAD_CURRENT: return 1;
+            default: throw std::logic_error("rejection fell through to publication");
+            }
+        },{},error));
+        BOOST_CHECK_EQUAL(error, existing.empty() ? "BMM state is inconsistent during disconnect" : existing);
+    }
+    std::string error;
+    BOOST_CHECK(!hs::RunBmmStateWorkflow(Step::EFFECTIVE_START, [](Step step) -> int32_t {
+        return step == Step::EFFECTIVE_NETWORK ? 0 : 2;
+    },"malformed stored state",error));
+    BOOST_CHECK_EQUAL(error,"malformed stored state");
+    BOOST_CHECK_THROW(hs::RunBmmStateWorkflow(Step::CONNECT_START, [](Step) -> int32_t {
+        throw std::logic_error("original native exception");
+    },{},error),std::logic_error);
+}
 
 BOOST_AUTO_TEST_SUITE_END()

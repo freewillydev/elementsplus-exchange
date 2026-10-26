@@ -8,7 +8,9 @@
 > [repository README](../README.md) instead. The remaining text is retained
 > only as an audit trail and does not describe the current implementation.
 
-**Production-ready fork/adaptation of Blockstream Elements/Liquid** to run as a native sidechain on Luke's private drivechain signet (and future real BIP300/301 networks), **using only the CUSF native mechanisms** (no federation, no multisig pegin shortcut).
+**Retired, unqualified prototype, not production-ready.** The historical design
+below explored Elements on a private drivechain signet using CUSF mechanisms.
+It is not deployment guidance or security evidence for the current node.
 
 - **Upstream base**: ElementsProject/elements (cloned into this workspace at commit 75499e7 on branch `liquid-drivechain-signet-adaptation`).
 - **Target environment**: The private Drivechain signet in `../drivechain-wallet-dev/local-dev` (mainchain + bip300301_enforcer + bitassets ID 4 live example).
@@ -297,4 +299,5 @@ See `docs/DESIGN.md` for full architecture + earlier evidence.
 - [x] Commit useful changes (harness polish + clean state.json).
 - [x] Full production evidence (real txids, BMM inclusion, side H/credits, restart, polished e2e exit 0) on machine.
 
-**This is the single source of truth for "Liquid as native drivechain sidechain".** Production-ready.
+This historical document is not an authoritative description of the current
+node and does not establish production readiness. See the root README.

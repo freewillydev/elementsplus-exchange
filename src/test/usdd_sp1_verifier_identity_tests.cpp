@@ -2,11 +2,17 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/util/haskell_reference.h>
+#include <test/data/usdd_mainnet_segment.raw.h>
+#include <test/data/usdd_mainnet_journal.raw.h>
 #include <init.h>
 #include <elements_drivechain_identity.h>
+#include <haskell/simplicity_ffi.h>
 #include <primitives/confidential.h>
+#include <script/usdd_sp1_annex.h>
 #include <script/usdd_sp1_verifier_ffi.h>
 #include <usdd_sp1_verifier_identity.h>
+#include <util/strencodings.h>
 
 #include <array>
 #include <optional>
@@ -89,7 +95,7 @@ BOOST_AUTO_TEST_CASE(activation_requires_the_exact_linked_semantics)
 #endif
 }
 
-BOOST_AUTO_TEST_CASE(linked_verifier_matches_the_v11_parameterized_profile_identity)
+BOOST_AUTO_TEST_CASE(patched_verifier_preserves_the_genesis_transcript)
 {
     static constexpr std::array<uint8_t, 32> CORRECTED_VERIFIER{{
         0x6b, 0x02, 0x92, 0x57, 0x0f, 0xa1, 0x20, 0xae,
@@ -118,8 +124,13 @@ BOOST_AUTO_TEST_CASE(linked_verifier_matches_the_v11_parameterized_profile_ident
         USDD_SP1_VERIFIER_ACCEPTED);
     BOOST_CHECK_EQUAL_COLLECTIONS(
         linked.begin(), linked.end(),
-        ElementsDrivechainIdentity::USDD_SP1_VERIFIER_SEMANTIC_IDENTITY.begin(),
-        ElementsDrivechainIdentity::USDD_SP1_VERIFIER_SEMANTIC_IDENTITY.end());
+        UsddSp1VerifierRelease::SEMANTIC_IDENTITY.begin(),
+        UsddSp1VerifierRelease::SEMANTIC_IDENTITY.end());
+    std::string error;
+    BOOST_CHECK(CheckCanonicalUsddSp1VerifierStartupIdentity(&error));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK(!CheckUsddSp1VerifierStartupIdentity(true, CORRECTED_VERIFIER, &error));
+    BOOST_CHECK_EQUAL(error, "linked USDD SP1 verifier semantics do not match the production identity");
 #endif
 }
 
@@ -157,5 +168,62 @@ BOOST_AUTO_TEST_CASE(production_fee_asset_is_immutable)
     BOOST_CHECK(!ResolveElementsFeeAsset("not-an-asset", pegged, true, resolved, &error));
     BOOST_CHECK_EQUAL(error, "-feeasset must be exactly 64 hexadecimal characters");
 }
+
+#if defined(HAVE_USDD_SP1_VERIFIER)
+// Real Windows receipt, compiled into the test only, never the daemon.
+BOOST_AUTO_TEST_CASE(windows_mainnet_segment_is_not_a_mint)
+{
+    const auto sha256 = [](const std::vector<unsigned char>& bytes) {
+        std::array<unsigned char, 32> digest{};
+        CSHA256().Write(bytes.data(), bytes.size()).Finalize(digest.data());
+        return digest;
+    };
+    const auto read = [&](const auto& fixture, size_t size, const char* hash) {
+        const auto* begin = reinterpret_cast<const unsigned char*>(fixture.data());
+        const std::vector<unsigned char> bytes(begin, begin + fixture.size());
+        BOOST_REQUIRE_EQUAL(bytes.size(), size);
+        BOOST_REQUIRE_EQUAL(HexStr(sha256(bytes)), hash);
+        return bytes;
+    };
+    auto proof = read(test::data::usdd_mainnet_segment, 1'273'035,
+        "2ed9cab58fcb22430f503ffc1dc73404f274708e0fda4726d8f5f22786fffbd0");
+    const auto journal = read(test::data::usdd_mainnet_journal, 466,
+        "be9ab3e6a9f8850a5f903607668b885827f9a560b2c6c4c947836623d0fc3a42");
+    // The pinned Rust compatibility probe decodes this exact SDK envelope and
+    // proves that its first 1,272,546 bytes are the canonical compressed proof.
+    proof.resize(1'272'546);
+    const auto program = ParseHex("327a8b856ff3efc438c60b521dc0ce081584878274f1b456080fdc77773d5ce0");
+    const auto journal_hash = sha256(journal);
+    for (const bool replace_with_hash : {false, true}) {
+        const std::vector<unsigned char> values = replace_with_hash
+            ? std::vector<unsigned char>{journal_hash.begin(), journal_hash.end()} : journal;
+        const auto digest = sha256(values);
+        for (const uint8_t kind : {1, 3}) {
+            BOOST_TEST_CONTEXT("statement=" << unsigned(kind) << " hashed-output=" << replace_with_hash) {
+                std::vector<unsigned char> annex{'\x50','U','S','D','D','S','P','1',0,1,1,kind,1,0,0};
+                annex.resize(usdd::SP1_ANNEX_HEADER_SIZE);
+                WriteBE32(annex.data() + 15, values.size());
+                WriteBE32(annex.data() + 19, proof.size());
+                std::copy(program.begin(), program.end(), annex.begin() + 23);
+                annex.insert(annex.end(), values.begin(), values.end());
+                annex.insert(annex.end(), proof.begin(), proof.end());
+                usdd::Sp1ProofAnnexView view;
+                const auto parsed = usdd::ParseUsddSp1ProofAnnex(annex, view);
+                BOOST_CHECK(parsed == (kind == 3 && !replace_with_hash
+                    ? usdd::Sp1AnnexError::INVALID_STRONG_EXECUTION_PUBLIC_VALUES : usdd::Sp1AnnexError::OK));
+                BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(annex, program, digest) == usdd::Sp1VerifierResult::REJECTED);
+                const auto read_annex = [](const void* context, const unsigned char** data, size_t* size) {
+                    const auto& bytes = *static_cast<const std::vector<unsigned char>*>(context);
+                    *data = bytes.data();
+                    *size = bytes.size();
+                    return true;
+                };
+                BOOST_CHECK(!elements_haskell_verify_jet(usdd_sp1_verifier_abi_version, usdd_sp1_verify_annex,
+                    read_annex, &annex, program.data(), digest.data()));
+            }
+        }
+    }
+}
+#endif
 
 BOOST_AUTO_TEST_SUITE_END()

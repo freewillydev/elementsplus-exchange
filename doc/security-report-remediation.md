@@ -1,5 +1,11 @@
 # Security report remediation (2026-09-02)
 
+**Historical evidence, not current configuration instructions.** The checkpoint,
+transport executable and endpoint restrictions below describe the September 2
+revision. Current instructions are in [RPC security](drivechain-rpc-security.md)
+and the [generated network identity](drivechain-network-identity.md). In particular,
+the current client is linked Haskell gRPC, not an external grpcurl executable.
+
 Scope: the report against `295a4ea293`, reviewed against the actual native
 `-chain=elements` execution path. These changes are not an independent audit,
 a release certification, or authorization to use real funds. No live node,

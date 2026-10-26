@@ -2,7 +2,7 @@
 
 RPC documentation: [Supported calls, availability and fork-specific methods](doc/supported-rpcs.md).
 
-Elements sidechain implementation targeting Betanet **slot 130** (historical Alpha slot 24). Use `-chain=elements`.
+Elements sidechain implementation targeting ECX Betanet **slot 24**. Use `-chain=elements`.
 This is not Liquid, Bitcoin mainnet, or the historical signet demo.
 Confidential transactions and explicit payments are supported. Rangeproof,
 surjection-proof and amount-conservation checks remain mandatory.
@@ -10,11 +10,13 @@ surjection-proof and amount-conservation checks remain mandatory.
 ## Betanet migration status
 
 This checkout freezes a new Betanet identity at parent checkpoint 967679. It is
-an **operator-authorized FreeBank slot-130 test profile**, not an Elements slot
-activation: the existing FreeBank proposal bytes, name and hash are unchanged.
+an **operator-authorized existing Elements slot-24 test profile**: the existing
+Elements proposal bytes, name and hash are unchanged.
 Parent replay must authenticate that exact proposal and activation. The child
-manifest, genesis and native asset are independently bound; the FreeBank parent
-proposal does not commit to the Elements implementation.
+manifest, genesis and native asset are independently bound; the existing parent
+proposal describes replay v4, while this distinct child uses replay v5.
+See the [generated identity table](doc/drivechain-network-identity.md). Production
+eCash mainnet support is a separate release target, not this built-in identity.
 
 The independent serializer reproduces the frozen identity, but native build,
 continuous pruned-parent operation and fresh node/indexer deployment still need
@@ -41,10 +43,14 @@ chain-compatibility or deployment certification.
 Follow the [build instructions](doc/upstream-merge-20260902.md).
 You need CMake 3.22+, a C++20 compiler, and the matching USDD and ECX native
 verifier archives. A source checkout alone does not supply those archives.
+Supplied archives require [trusted SHA-256 pins](doc/verifier-build-integrity.md)
+in addition to the existing ABI and semantic checks.
 
 ## 2. Configure
 
-You need a synced parent node and enforcer matching the frozen identity.
+You need a synced parent node matching the frozen identity. A miner-operated
+enforcer endpoint is needed for withdrawal proposal submission, not deposits
+or locally funded BMM bids.
 Complete the [parent RPC and enforcer mTLS setup](doc/drivechain-rpc-security.md)
 first. Keep RPC private; do not expose either node's RPC port to the internet.
 
@@ -52,6 +58,8 @@ Create a private data directory and an `elements.conf` inside it:
 
 ```ini
 chain=elements
+# Explicitly acknowledge this existing-proposal test chain, not a production chain.
+acceptbetanettestprofile=1
 server=1
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
@@ -69,8 +77,10 @@ For a local credential bridge, use `mainchainrpccredentialfile` instead of
 TLS settings from that guide; this minimal excerpt does not replace them.
 
 The defaults are P2P **7066**, RPC **7065**, and chain subdirectory
-`elements-betanet-v1`. The [frozen network identity](src/elements_drivechain_identity.h)
+`elements-betanet-slot24-v1`. The [frozen network identity](src/elements_drivechain_identity.h)
 defines the required Betanet parent checkpoint. Do not reuse another chain's data.
+Parent RPC must also serve the [post-fork Betanet identity](doc/betanet-slot24-test.md),
+not just the Bitcoin-shared genesis and pre-fork bootstrap checkpoint.
 
 ## 3. Run
 

@@ -1,8 +1,11 @@
 // Copyright (c) 2026 The Elements Core developers
 // Distributed under the MIT software license.
 #include <haskell/bridge.h>
+#include <util/translation.h>
 #include <chrono>
 #include <iostream>
+
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 int main(int argc, char** argv)
 {

@@ -44,11 +44,14 @@ add_executable(test_elements
   dynafed_tests.cpp
   drivechain_bmm_tests.cpp
   drivechain_bid_wallet_tests.cpp
+  drivechain_network_safety_tests.cpp
   utreexo_tests.cpp
   drivechain_peg_tests.cpp
   drivechain_treasury_tests.cpp
   drivechain_withdrawal_tests.cpp
   ecx_exchange_state_tests.cpp
+  ecx_custody_projection_tests.cpp
+  ecx_swap_header_tests.cpp
   ecx_simplicity_test_shim.c
   feefrac_tests.cpp
   flatfile_tests.cpp
@@ -153,6 +156,8 @@ target_json_data_sources(test_elements
 )
 target_raw_data_sources(test_elements NAMESPACE test::data
   data/asmap.raw
+  data/usdd_mainnet_segment.raw
+  data/usdd_mainnet_journal.raw
 )
 
 target_link_libraries(test_elements

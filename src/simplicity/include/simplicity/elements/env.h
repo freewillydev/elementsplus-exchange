@@ -105,6 +105,28 @@ extern bool simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex
   unsigned char public_values_sha256[32],
   unsigned char public_values[ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN]);
 
+/** Candidate V24 swap relation. This parser does not verify the proof. */
+extern bool simplicity_elements_parse_sp1_groth16_v7_swap_successor_annex(
+  const unsigned char* annex, size_t annexLen,
+  unsigned char program_id[32], unsigned char public_values_sha256[32],
+  unsigned char public_values[ECX_SP1_SWAP_SUCCESSOR_PUBLIC_VALUES_LEN]);
+
+extern bool simplicity_elements_verify_sp1_groth16_v7_swap_successor_annex_sha256(
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext);
+
+/** Candidate V25 funded custody relation. This parser does not verify the proof. */
+extern bool simplicity_elements_parse_sp1_groth16_v8_custody_successor_annex(
+  const unsigned char* annex, size_t annexLen,
+  unsigned char program_id[32], unsigned char public_values_sha256[32],
+  unsigned char public_values[ECX_SP1_CUSTODY_SUCCESSOR_PUBLIC_VALUES_LEN]);
+
+extern bool simplicity_elements_verify_sp1_groth16_v8_custody_successor_annex_sha256(
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext);
+
 /** Dedicated incremental successor verifier. Every finite/activation/historical
  * annex version is rejected. */
 extern bool simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha256(

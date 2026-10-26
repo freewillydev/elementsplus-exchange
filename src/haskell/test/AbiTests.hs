@@ -1,7 +1,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
-module AbiTests (abiRoundTrip, abiRejectsBeforeEffects, abiSignedCanonical, abiExceptionsPreserveResult) where
+module AbiTests (abiRoundTrip, abiRejectsBeforeEffects, abiSignedCanonical, abiExceptionsPreserveResult, abiFamilyRouting) where
 
-import Abi (dispatch, handler)
+import Abi (dispatch, dispatchFamily, handler)
+import Data.Bits ((.|.), shiftL)
 import Data.Int (Int32, Int64)
 import Data.IORef (newIORef, modifyIORef', readIORef)
 import Data.Word (Word8, Word32, Word64)
@@ -63,3 +64,27 @@ abiExceptionsPreserveResult = once $ ioProperty $ do
     pure $ conjoin [code === -3, stored === 42] |
     action <- [ioError (userError "ABI effect failure"), pure (error "ABI lazy result failure")] :: [IO Int32]]
   pure (conjoin checks)
+
+abiFamilyRouting :: Property
+abiFamilyRouting = forAll (choose (0,3 :: Word32)) $ \section ->
+  forAll (choose (0,4 :: Word32)) $ \operation ->
+  forAll (frequency [(1,fromIntegral <$> (arbitrary :: Gen Word32)),(1,arbitrary :: Gen Word64)]) $ \value -> ioProperty $ do
+    calls <- newIORef []
+    let action s o (_ :: Word32) = modifyIORef' calls (++ [(s,o)]) >> pure (fromIntegral (s*10+o) :: Int32)
+        sections = [[handler (action s o) | o <- [0..s]] | s <- [0..3]]
+        selected = (section `shiftL` 16) .|. operation
+        valid = operation <= section
+        canonical = value <= 0xffffffff
+    withArray [value] $ \scalars -> with (42 :: Word64) $ \result -> do
+      code <- dispatchFamily sections selected 1 scalars 0 nullPtr 0 nullPtr result
+      stored <- peek result
+      invoked <- readIORef calls
+      -- The first absent section and the largest possible section cannot alias a handler.
+      absent <- dispatchFamily sections (4 `shiftL` 16) maxBound nullPtr 0 nullPtr 0 nullPtr result
+      largest <- dispatchFamily sections maxBound 1 scalars 0 nullPtr 0 nullPtr result
+      unchanged <- peek result
+      finalCalls <- readIORef calls
+      pure $ conjoin [code === (if not valid then -1 else if canonical then 0 else -2),
+        stored === (if valid && canonical then fromIntegral (section*10+operation) else 42),
+        invoked === (if valid && canonical then [(section,operation)] else []),
+        absent === -1, largest === -1, unchanged === stored, finalCalls === invoked]

@@ -87,33 +87,39 @@ if(APPLE)
   endif()
 endif()
 configure_file(runtime.c runtime.c COPYONLY)
-add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechain_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/GrpcClient_stub.h"
+add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/GrpcClient_stub.h"
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_abi.py" --check
   COMMAND ${grpc_exec} "${ELEMENTS_GHC}" -O2 -Wall -Werror -fforce-recomp -dynamic -shared -fPIC -threaded -flink-rts
-    -no-hs-main -no-user-package-db -hide-all-packages -package base -package bytestring -package transformers
+    -no-hs-main -no-user-package-db -hide-all-packages -package base -package bytestring -package binary -package transformers
     -package grpc-haskell-core -package grpc-haskell -package proto3-suite -package async -package text -package vector -package containers -package deepseq -package aeson
     "-i${CMAKE_CURRENT_SOURCE_DIR}" "-i${operation_capabilities_SOURCE_DIR}/src"
     "-i${grpc_generated}"
     -odir "${CMAKE_CURRENT_BINARY_DIR}" -hidir "${CMAKE_CURRENT_BINARY_DIR}"
     -stubdir "${CMAKE_CURRENT_BINARY_DIR}" ${hs_link_flags}
     "${CMAKE_CURRENT_SOURCE_DIR}/DomainABI.hs" "${CMAKE_CURRENT_SOURCE_DIR}/GrpcClient.hs" "${CMAKE_CURRENT_SOURCE_DIR}/Utreexo.hs" "${CMAKE_CURRENT_BINARY_DIR}/runtime.c" -o "${hs_library}"
-  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs Bmm.hs BmmConstants.hs ParentReplay.hs Exchange.hs Usdd.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c VERBATIM)
-add_custom_target(elements_haskell_build DEPENDS "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechain_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h")
+  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs NativeDeposit.hs Bmm.hs BmmConstants.hs ParentBlock.hs ParentHeader.hs ParentReplay.hs ParentCache.hs ReplayStore.hs Exchange.hs ExchangeCustody.hs ExchangeForcedV3.hs ExchangeForcedV3Block.hs Usdd.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c VERBATIM)
+add_custom_target(elements_haskell_build DEPENDS "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h")
 add_library(elements_haskell_runtime SHARED IMPORTED GLOBAL)
 set_target_properties(elements_haskell_runtime PROPERTIES IMPORTED_LOCATION "${hs_library}")
+if(APPLE)
+  # The generated library does not exist yet during a clean configuration.
+  # Declare its install name so CMake emits the dependent build-tree rpath.
+  set_target_properties(elements_haskell_runtime PROPERTIES
+    IMPORTED_SONAME "@rpath/libelements_haskell.dylib")
+endif()
 add_dependencies(elements_haskell_runtime elements_haskell_build)
-add_library(elements_haskell STATIC bridge.cpp simplicity_bridge.cpp grpc_bridge.cpp)
-set_target_properties(elements_haskell PROPERTIES POSITION_INDEPENDENT_CODE ON OUTPUT_NAME elements_haskell_bridge)
+# Native adapters live in the existing consensus and parent-RPC owners.
+add_library(elements_haskell INTERFACE)
 add_dependencies(elements_haskell elements_haskell_build)
-target_include_directories(elements_haskell PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-target_include_directories(elements_haskell SYSTEM PRIVATE ${rts_includes})
-target_link_libraries(elements_haskell PUBLIC elements_haskell_runtime elements_utreexo PRIVATE core_interface)
+target_include_directories(elements_haskell INTERFACE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(elements_haskell SYSTEM INTERFACE ${rts_includes})
+target_link_libraries(elements_haskell INTERFACE elements_haskell_runtime elements_utreexo bitcoin_util)
 if(BUILD_TESTS)
   add_test(NAME haskell_cabal_version COMMAND "${CMAKE_COMMAND}"
     "-DTEST_TMP=${CMAKE_CURRENT_BINARY_DIR}/cabal-version-test"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/test/cabal_check.cmake")
   add_executable(haskell_grpc_probe EXCLUDE_FROM_ALL test/grpc_probe.cpp)
-  target_link_libraries(haskell_grpc_probe PRIVATE elements_haskell core_interface)
+  target_link_libraries(haskell_grpc_probe PRIVATE elements_haskell bitcoin_node bitcoin_common core_interface)
   set_target_properties(haskell_grpc_probe PROPERTIES SKIP_BUILD_RPATH FALSE BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
@@ -127,7 +133,6 @@ endif()
 configure_file(BundleRuntime.cmake.in BundleRuntime.cmake @ONLY)
 # Component installs (including libconsensus alone) need the same runtime.
 install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/BundleRuntime.cmake" ALL_COMPONENTS)
-install(TARGETS elements_haskell ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT elementsconsensus)
 
 if(BUILD_TESTS)
   find_program(ELEMENTS_BASH bash REQUIRED)
@@ -137,7 +142,7 @@ if(BUILD_TESTS)
   add_executable(test_haskell_ffi ffi_tests.cpp)
   target_include_directories(test_haskell_ffi PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_include_directories(test_haskell_ffi SYSTEM PRIVATE ${rts_includes})
-  target_link_libraries(test_haskell_ffi PRIVATE elements_haskell core_interface)
+  target_link_libraries(test_haskell_ffi PRIVATE elements_haskell bitcoin_common core_interface)
   add_test(NAME haskell_ffi_parity COMMAND test_haskell_ffi)
   set_tests_properties(haskell_ffi_parity PROPERTIES TIMEOUT 60)
   add_executable(test_haskell_loader loader_tests.cpp)
@@ -148,6 +153,6 @@ if(BUILD_TESTS)
   add_dependencies(test_haskell_domain_abi elements_haskell_build)
   target_include_directories(test_haskell_domain_abi PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_include_directories(test_haskell_domain_abi SYSTEM PRIVATE ${rts_includes})
-  target_link_libraries(test_haskell_domain_abi PRIVATE elements_haskell core_interface)
+  target_link_libraries(test_haskell_domain_abi PRIVATE elements_haskell bitcoin_common core_interface)
   add_test(NAME haskell_domain_abi COMMAND test_haskell_domain_abi)
 endif()

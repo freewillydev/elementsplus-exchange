@@ -16,8 +16,22 @@
 #include <array>
 #include <string>
 
+// Release admission is separate from the immutable genesis transcript. The
+// historical transcript remains unchanged; this build requires the patched
+// verifier even when replaying that chain. Never accept both implementations.
+namespace UsddSp1VerifierRelease {
+inline constexpr char VERSION[]{"6.8.1"};
+inline constexpr char GIT_COMMIT[]{"c84ada1ed5911f28c4d3c9d0ed2f9e6cd7edb824"};
+inline constexpr std::array<uint8_t, 32> SEMANTIC_IDENTITY{{
+    0xa6, 0xb6, 0xb2, 0xc1, 0xf0, 0x91, 0x7d, 0x5d,
+    0xfc, 0xa9, 0x90, 0xe5, 0x78, 0x7d, 0xfb, 0xe8,
+    0x35, 0x58, 0x1f, 0x0d, 0xb0, 0xfc, 0xc7, 0xa6,
+    0x0c, 0x3b, 0x67, 0x0a, 0x87, 0xf4, 0xad, 0x02,
+}};
+}
+
 /**
- * Enforce the verifier identity required by the immutable production network.
+ * Enforce the verifier identity required by this release.
  *
  * Keeping this check at startup prevents build-dependent consensus after the
  * proof gate is activated: a node cannot run the sole production network with
@@ -47,7 +61,7 @@ inline bool CheckCanonicalUsddSp1VerifierStartupIdentity(std::string* error)
 {
     return CheckUsddSp1VerifierStartupIdentity(
         ElementsDrivechainIdentity::USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED,
-        ElementsDrivechainIdentity::USDD_SP1_VERIFIER_SEMANTIC_IDENTITY,
+        UsddSp1VerifierRelease::SEMANTIC_IDENTITY,
         error);
 }
 

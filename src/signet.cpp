@@ -9,6 +9,7 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/common.h>
 #include <drivechain_bmm.h>
 #include <hash.h>
 #include <haskell/bridge.h>
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -159,29 +161,26 @@ bool CheckSignetBlockSolution(const CBlock& block, const Consensus::Params& cons
     return true;
 }
 
-uint256 ComputeBitcoinModifiedMerkleRoot(const Bitcoin::CMutableTransaction& coinbase,
-                                         const Bitcoin::CBlock& block)
-{
+namespace {
+struct BitcoinSignetMerkleNative {
+    const Bitcoin::CMutableTransaction& coinbase;
+    const Bitcoin::CBlock& block;
     std::vector<uint256> leaves;
-    size_t index{0};
     uint256 root;
-    namespace hs = drivechain::haskell;
-    hs::ParentReplayStore(hs::ReplayStoreFlow::SIGNET_MERKLE, [&](uint32_t action) -> uint32_t {
-        switch (action) {
-        case 1: leaves.reserve(block.vtx.size()); return 1;
-        case 2: leaves.push_back(coinbase.GetHash()); return 1;
-        case 3: index = 1; return 1;
-        case 4: return hs::ParentReplayRecord(hs::ReplayRecordKind::LESS, 0, 0, index, block.vtx.size());
-        case 5: leaves.push_back(block.vtx[index]->GetHash()); return 1;
-        case 6: ++index; return 1;
-        case 7: root = ComputeMerkleRoot(std::move(leaves)); return 1;
+
+    uint64_t Read(uint32_t step, uint64_t index)
+    {
+        switch (step) {
+        case 601: leaves.reserve(block.vtx.size()); return 1;
+        case 602: leaves.push_back(coinbase.GetHash()); return 1;
+        case 603: return block.vtx.size();
+        case 604: leaves.push_back(block.vtx.at(index)->GetHash()); return 1;
+        case 605: root = ComputeMerkleRoot(std::move(leaves)); return 1;
         default: throw std::logic_error("invalid parent signet Merkle action");
         }
-    });
-    return root;
-}
+    }
+};
 
-namespace {
 bool SetSignetError(std::string* error, const std::string& message)
 {
     if (error) *error = message;
@@ -190,68 +189,97 @@ bool SetSignetError(std::string* error, const std::string& message)
 
 } // namespace
 
-bool CheckBitcoinSignetBlockSolution(const Bitcoin::CBlock& block,
-                                     const CScript& challenge,
-                                     const uint256& genesis_hash,
-                                     std::string* error)
-{
-    namespace hs = drivechain::haskell;
+namespace {
+struct BitcoinSignetNative {
+    const Bitcoin::CBlock& block;
+    const CScript& challenge;
+    const uint256& genesis_hash;
+    std::string* error;
     int commitment_index{-1};
-    std::optional<Bitcoin::CMutableTransaction> modified_coinbase, spend, sign;
-    std::optional<Bitcoin::CTransaction> immutable;
-    std::vector<uint8_t> solution, block_data;
-    uint256 merkle;
+    std::optional<Bitcoin::CMutableTransaction> modified_coinbase{}, spend{}, sign{};
+    std::optional<Bitcoin::CTransaction> immutable{};
+    std::vector<uint8_t> solution{}, block_data{};
+    std::optional<SpanReader> reader{};
+    std::optional<BitcoinSignetMerkleNative> merkle{};
+    std::optional<VectorWriter> writer{};
     ScriptError script_error{SCRIPT_ERR_OK};
-    return hs::ParentReplayStore(hs::ReplayStoreFlow::PARENT_SIGNET, [&](uint32_t action) -> uint32_t {
-        switch (action) {
-        case 1: return block.GetHash() == genesis_hash;
-        case 2: return block.vtx.empty();
-        case 3: return block.vtx[0]->IsCoinBase();
-        case 4: return SetSignetError(error, "parent signet block has no coinbase transaction");
-        case 5:
-            commitment_index = drivechain::BitcoinWitnessCommitmentIndex(block.vtx[0]->vout);
-            return commitment_index >= 0;
-        case 6: return SetSignetError(error, "parent signet block has no witness commitment");
-        case 7: modified_coinbase.emplace(*block.vtx[0]); return 1;
-        case 8:
+
+    uint64_t ReadScalar(uint32_t step, uint64_t index)
+    {
+        if (step >= 601 && step <= 605) return merkle->Read(step,index);
+        if (step >= 300 && step <= 303) {
+            drivechain::BitcoinSignetDataAction(step-300, block, merkle->root, *writer);
+            return 1;
+        }
+        switch (step) {
+        case 400: return block.GetHash() == genesis_hash;
+        case 401: return block.vtx.empty();
+        case 402: return block.vtx[0]->IsCoinBase();
+        case 407: modified_coinbase.emplace(*block.vtx[0]); return 1;
+        case 408:
             FetchAndClearCommitmentSection(SIGNET_HEADER, modified_coinbase->vout[commitment_index].scriptPubKey, solution);
             return 1;
-        case 9:
-            spend.emplace();
-            sign.emplace();
-            drivechain::BuildBitcoinSignetTransactions(challenge, *spend, *sign);
-            return 1;
-        case 10: return solution.empty();
-        case 11:
-            try {
-                SpanReader reader{solution};
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::RAW_DECODE, [&](uint32_t step) -> uint32_t {
-                    switch (step) {
-                    case 1: reader >> sign->vin[0].scriptSig; return 1;
-                    case 2: reader >> sign->vin[0].scriptWitness.stack; return 1;
-                    case 3: return !reader.empty();
-                    case 4: return SetSignetError(error, "parent signet solution has trailing bytes");
-                    default: throw std::logic_error("invalid signet decode action");
-                    }
-                });
-            } catch (const std::exception&) {
-                return SetSignetError(error, "parent signet solution is not canonically encoded");
-            }
-        case 12: merkle = ComputeBitcoinModifiedMerkleRoot(*modified_coinbase, block); return 1;
-        case 13: block_data = drivechain::BitcoinSignetBlockData(block, merkle); return 1;
-        case 14:
+        case 409: spend.emplace(); sign.emplace(); return 1;
+        case 410: return solution.empty();
+        case 420: reader.emplace(solution); return 1;
+        case 421: *reader >> sign->vin[0].scriptSig; return 1;
+        case 422: *reader >> sign->vin[0].scriptWitness.stack; return 1;
+        case 423: return !reader->empty();
+        case 424: return SetSignetError(error, "parent signet solution has trailing bytes");
+        case 425: return SetSignetError(error, "parent signet solution is not canonically encoded");
+        case 412: merkle.emplace(*modified_coinbase,block,std::vector<uint256>{},uint256{}); return 1;
+        case 413: writer.emplace(block_data,0); return 1;
+        case 414:
             spend->vin[0].scriptSig << block_data;
             sign->vin[0].prevout = Bitcoin::COutPoint(spend->GetHash(), 0);
             return 1;
-        case 15: immutable.emplace(std::move(*sign)); return 1;
-        case 16: {
+        case 415: immutable.emplace(std::move(*sign)); return 1;
+        case 416: {
             const drivechain::BitcoinSignetSignatureChecker checker{*immutable, 0,
                 drivechain::BitcoinSignetSignatureChecker::Mode::PARENT};
             return VerifyScript(immutable->vin[0].scriptSig, challenge,
                 &immutable->vin[0].scriptWitness, BLOCK_SCRIPT_VERIFY_FLAGS, checker, &script_error);
         }
-        case 17: return SetSignetError(error, strprintf("parent signet solution failed challenge validation: %s", ScriptErrorString(script_error)));
+        case 440:
+            switch (index) {
+            case 0: return SetSignetError(error, "parent signet block has no coinbase transaction");
+            case 1: return SetSignetError(error, "parent signet block has no witness commitment");
+            case 2: return SetSignetError(error, strprintf("parent signet solution failed challenge validation: %s", ScriptErrorString(script_error)));
+            }
+            [[fallthrough]];
         default: throw std::logic_error("invalid parent signet action");
         }
-    }) == 1;
+    }
+
+    std::vector<unsigned char> Read(uint32_t step, uint64_t index, std::span<const unsigned char> input)
+    {
+        if (step >= 420 && step <= 424) {
+            try {
+                std::vector<unsigned char> result(9);
+                result[0] = 1;
+                WriteLE64(result.data()+1,ReadScalar(step,index));
+                return result;
+            } catch (const std::exception&) {
+                return std::vector<unsigned char>{0};
+            }
+        }
+        std::vector<unsigned char> result(8);
+        if (step >= 200 && step <= 205) {
+            drivechain::BitcoinSignetTransactionAction(step-200,input,challenge,*spend,*sign);
+            WriteLE64(result.data(),1);
+        } else if (step >= 500 && step <= 502) {
+            return drivechain::BitcoinWitnessCommitmentNative(block.vtx[0]->vout,commitment_index,step,index);
+        } else {
+            WriteLE64(result.data(),ReadScalar(step,index));
+        }
+        return result;
+    }
+};
+} // namespace
+
+drivechain::haskell::NativeWorkflow drivechain::haskell::PrepareParentSignet(
+    const Bitcoin::CBlock& block, const CScript& challenge, const uint256& genesis, std::string* error)
+{
+    return [native = std::make_shared<BitcoinSignetNative>(block,challenge,genesis,error)]
+        (uint32_t step, uint64_t index, std::span<const unsigned char> input) { return native->Read(step,index,input); };
 }

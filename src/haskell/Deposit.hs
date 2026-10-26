@@ -1,29 +1,38 @@
 {-# LANGUAGE ForeignFunctionInterface, TypeFamilies #-}
+{-# LANGUAGE ConstraintKinds, DataKinds, FlexibleContexts, FlexibleInstances #-}
+{-# LANGUAGE GADTs, MultiParamTypeClasses, TypeApplications, ScopedTypeVariables #-}
 -- Copyright (c) 2026 The Elements Core developers
 -- Distributed under the MIT software license.
 module Deposit where
 
-import Control.Monad (guard)
-import Control.Exception (evaluate)
-import Data.IORef (IORef, readIORef, writeIORef)
+import CapabilityContext (CapabilityContext)
+import Control.Exception (SomeException, try)
+import Control.Monad (guard, unless, when, forM_)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE)
 import Data.Bits ((.&.), (.|.), clearBit, shiftL, shiftR, testBit)
+import qualified Data.Binary.Get as G
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Data.Char (digitToInt)
 import Data.Int (Int32, Int64)
+import Data.Functor.Identity (runIdentity)
 import Data.List (find, elemIndex)
 import BmmConstants (withdrawalStatuses, withdrawalLifecycle, alphaPeginOneConfirmationHeight,
-  depositAddressLimit, depositMarker, legacyDepositMarker)
+  depositAddressLimit, depositMarker, legacyDepositMarker, sidechainSlot,
+  peginIdentityNetwork, peginIdentitySlot, peginIdentityDepth, peginIdentityPins)
 import Data.Word (Word8, Word32, Word64)
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Marshal.Array (peekArray)
-import Foreign.Ptr (Ptr, FunPtr, castPtr)
-import Foreign.Storable (peekElemOff, poke)
+import Foreign.Marshal.Array (peekArray, pokeArray)
+import Foreign.Ptr (Ptr, FunPtr, castPtr, nullFunPtr)
+import Foreign.Storable (peek, peekElemOff, poke)
 import Withdrawal (readLE, wordLE)
 import ParentReplay (transition, Record(..), nonEmptyBounded)
+import qualified ParentReplay
+import qualified ReplayStore as RS
 import Control.Operation
 import Control.Operation.Validation
-import Workflow (CommandFlow(..), orderedFacts, runReportedEffects)
+import Workflow (NativeBytes, CommandFlow(..), PredicateFlow(..), orderedFacts, runReportedEffects)
 
 data InputLimit = InputLimit Bool Word64 Word64 (Word32 -> Word64 -> Word64 -> IO Word64)
 instance Validation InputLimit where
@@ -56,11 +65,22 @@ instance Validation NativeAdmissionFlow where
 -- Pinned Alpha/Beta identities share facts but retain their original read order.
 -- Mode 2 clamps an already-selected depth without reading identity facts.
 data ConfirmationPolicy = ConfirmationPolicy Word32 Int64 Word32 (Word32 -> IO Int32)
+requiredConfirmationDepth :: Word32 -> Word32
+requiredConfirmationDepth = max 1
+
+hasDepositDepth :: Word32 -> Word32 -> Word32 -> Bool
+hasDepositDepth deposit tip required =
+  required > 0 && deposit <= tip && tip - deposit >= required - 1
+
 instance Validation ConfirmationPolicy where
   type ValidationResult ConfirmationPolicy = IO Int64
-  validate (ConfirmationPolicy mode height configured readFact)
+  validate (ConfirmationPolicy mode height configured readFact) =
+    confirmationPolicy mode height configured readFact
+
+confirmationPolicy :: Monad m => Word32 -> Int64 -> Word32 -> (Word32 -> m Int32) -> m Int64
+confirmationPolicy mode height configured readFact
     | mode > 2 = pure (-1)
-    | mode == 2 = pure (fromIntegral (max 1 configured))
+    | mode == 2 = pure (fromIntegral (requiredConfirmationDepth configured))
     | mode == 0 = matches alpha (pure 1) (pure 0)
     | otherwise = matches [0,1,2,3,8,9,5,7] (pure 6) $
         if height >= alphaPeginOneConfirmationHeight then matches alpha (pure 1) fallback else fallback
@@ -72,6 +92,59 @@ instance Validation ConfirmationPolicy where
         0 -> no
         1 -> matches rest yes no
         _ -> pure (-1)
+
+-- Copied native facts, not a new consensus or persisted identity encoding.
+data ConfirmationIdentity = ConfirmationIdentity B.ByteString Bool Bool (Maybe Word8)
+  B.ByteString B.ByteString B.ByteString Word32 deriving (Eq, Show)
+data ConfirmationSelection = ConfirmationSelection Bool Int64 ConfirmationIdentity deriving (Eq, Show)
+
+confirmationSelection :: Bool -> G.Get ConfirmationSelection
+confirmationSelection alpha = do
+  height <- G.getInt64le
+  network <- B.pack <$> RS.counted 1 G.getWord8
+  elements <- RS.flag
+  parent <- RS.flag
+  present <- RS.flag
+  slot <- G.getWord8
+  unless (present || slot == 0) (fail "noncanonical absent confirmation slot")
+  identity <- ConfirmationIdentity network elements parent (if present then Just slot else Nothing)
+    <$> RS.hash <*> RS.hash <*> RS.hash <*> G.getWord32le
+  pure (ConfirmationSelection alpha height identity)
+
+instance Validation ConfirmationSelection where
+  type ValidationResult ConfirmationSelection = Int64
+  validate (ConfirmationSelection alpha height (ConfirmationIdentity network elements parent slot genesis parentGenesis manifest configured)) =
+    runIdentity (confirmationPolicy (if alpha then 0 else 1) height configured (pure . fact))
+    where
+      matches value name = lookup name peginIdentityPins == Just (ParentReplay.hashHex value)
+      fact step = fromIntegral . fromEnum $ case step of
+        0 -> network == C.pack peginIdentityNetwork
+        1 -> elements
+        2 -> parent
+        3 -> fmap fromIntegral slot == Just peginIdentitySlot
+        4 -> matches genesis "PEGIN_ALPHA_GENESIS"
+        5 -> matches parentGenesis "PEGIN_PARENT_GENESIS"
+        6 -> matches manifest "PEGIN_ALPHA_MANIFEST"
+        7 -> configured == peginIdentityDepth
+        8 -> matches genesis "PEGIN_BETA_GENESIS"
+        9 -> matches manifest "PEGIN_BETA_MANIFEST"
+        _ -> error "unknown confirmation identity fact"
+
+selectedConfirmationDepth :: Bool -> NativeBytes -> Word32 -> ExceptT Int32 IO Word32
+selectedConfirmationDepth alpha native step = do
+  reply <- liftIO (native step 0 B.empty)
+  selection <- either throwE pure (RS.decode (confirmationSelection alpha) reply)
+  let depth = validate selection
+  unless (depth >= 0 && depth <= fromIntegral (maxBound :: Word32)) (throwE (-1))
+  pure (fromIntegral depth)
+
+data ConfirmationWorkflow = ConfirmationWorkflow Bool NativeBytes
+instance Validation ConfirmationWorkflow where
+  type ValidationResult ConfirmationWorkflow = IO Int32
+  validate (ConfirmationWorkflow alpha native) = fmap (either id (const 1)) $ runExceptT $ do
+    depth <- selectedConfirmationDepth alpha native 0
+    reply <- liftIO (native 1 (fromIntegral depth) B.empty)
+    unless (B.null reply) (throwE (-1))
 
 -- Signed timestamps travel as their Word64 bit patterns. Integer subtraction
 -- avoids overflowing the age cutoff at the signed timestamp boundary.
@@ -138,18 +211,23 @@ instance Validation PreviousSequence where
   validate (PreviousSequence current) = if current > 0 then current - 1 else -1
 
 data EvidenceBuild = EvidenceBuild Int64 Int64 Word32 (Word32 -> IO Int32)
+canBuildEvidence :: Int64 -> Int64 -> Word32 -> Bool
+canBuildEvidence sequenceNumber height flags =
+  validate (PreviousSequence sequenceNumber) >= 0 && flags == 3 && height >= 0
 instance Validation EvidenceBuild where
   type ValidationResult EvidenceBuild = IO Int32
   validate (EvidenceBuild sequenceNumber height flags action)
-    | validate (PreviousSequence sequenceNumber) < 0 || flags /= 3 || height < 0 = pure 1
+    | not (canBuildEvidence sequenceNumber height flags) = pure 1
     | otherwise = runReportedEffects action
         (\stage -> lookup stage [(5,8),(6,8),(7,8)]) [1,5,6,7,2,3,4]
 
 data HeaderBuild = HeaderBuild Word64 Int64 (Word32 -> Word64 -> IO Int32)
+headerWindow :: Word64 -> Int64 -> Bool
+headerWindow first tip = validate (Record 22 0 tip first 2016) == 1
 instance Validation HeaderBuild where
   type ValidationResult HeaderBuild = IO Int32
   validate (HeaderBuild first tip action)
-    | validate (Record 22 0 tip first 2016) /= 1 = pure 1
+    | not (headerWindow first tip) = pure 1
     | otherwise = runReportedEffects (uncurry action)
         (\(stage,height) -> if stage == 2 then Just (3,height) else Nothing)
         ((1,0) : [(stage,height) | height <- [first..fromIntegral tip], stage <- [2,4]])
@@ -170,6 +248,301 @@ instance Validation CtipSearch where
                   1 -> search (index+1) True
                   _ -> pure (-1)
             _ -> pure (-1)
+
+-- One reconstruction operation keeps the fork's source checks, treasury search
+-- and confirmation traversal in Haskell. Native code owns RPC and serialization.
+data Construction = Construction Int64 Int64 Word32 Int32 NativeBytes
+type ConstructionCheck = ExceptT Int32 IO
+class DepositSource op where
+  readDepositSource :: op -> ConstructionCheck ()
+class PriorTreasury op where
+  readPriorTreasury :: op -> ConstructionCheck ()
+class ConfirmationHeaders op where
+  readConfirmationHeaders :: op -> ConstructionCheck ()
+
+constructionWord :: B.ByteString -> IO Word64
+constructionWord bytes
+  | B.length bytes == 8 = pure (ParentReplay.replayWord bytes)
+  | otherwise = ioError (userError "invalid construction scalar reply")
+
+constructionScalar :: NativeBytes -> Word32 -> Word64 -> IO Word64
+constructionScalar native step index = native step index B.empty >>= constructionWord
+
+constructionEffect :: NativeBytes -> Word32 -> B.ByteString -> IO ()
+constructionEffect native step payload = do
+  reply <- native step 0 payload
+  unless (B.null reply) (ioError (userError "invalid construction effect reply"))
+
+constructionFlag :: Word64 -> ConstructionCheck Bool
+constructionFlag value = case value of
+  0 -> pure False
+  1 -> pure True
+  _ -> throwE (-1)
+
+instance DepositSource Construction where
+  readDepositSource (Construction sequenceNumber height flags _ native) = do
+    unless (canBuildEvidence sequenceNumber height flags) (throwE 1)
+    liftIO (constructionEffect native 0 B.empty)
+    forM_ [1..3] $ \step -> do
+      valid <- constructionFlag =<< liftIO (constructionScalar native step 0)
+      unless valid (throwE 2)
+    liftIO (constructionEffect native 4 B.empty)
+
+-- Only the previous-transaction scan historically tolerates native failures.
+-- Its envelope preserves runtime-error text and rethrows the original native
+-- exception when the existing fatal-message rule matches; other stages fail closed.
+candidateReply :: NativeBytes -> Word32 -> Word64 -> IO (Maybe B.ByteString)
+candidateReply native step index = do
+  result <- native (100+step) index B.empty
+  case B.uncons result of
+    Just (0,body) -> pure (Just body)
+    Just (1,message) -> do
+      when (validate (MessageMatches 2 message) == 1) $ do
+        _ <- native 109 0 B.empty
+        ioError (userError "native candidate exception was not rethrown")
+      pure Nothing
+    Just (2,body) | B.null body -> pure Nothing
+    _ -> ioError (userError "invalid candidate reply envelope")
+
+instance PriorTreasury Construction where
+  readPriorTreasury (Construction sequenceNumber _ _ slot native) = do
+    count <- liftIO (constructionScalar native 10 0)
+    let action step index = do
+          reply <- candidateReply native step index
+          case reply of
+            Nothing -> pure 0
+            Just body -> case step of
+              1 -> do
+                unless (B.length body == 16) (ioError (userError "invalid candidate hex snapshot"))
+                let field 1 = pure (ParentReplay.replayWord (B.take 8 body))
+                    field 2 = pure (ParentReplay.replayWord (B.drop 8 body))
+                    field 4 = pure 1
+                    field _ = ioError (userError "invalid candidate hex field")
+                status <- validate (ReadExecution 0 2 0 field)
+                pure (if status == 0 then 1 else if status == 1 then 0 else -1)
+              5 -> pure $ if slot >= 0 && slot <= 255 && B.length body == 4 &&
+                ParentReplay.treasurySlot (fromIntegral (ParentReplay.replayWord body)) 0xb4 == slot
+                then 1 else 0
+              _ -> do
+                value <- constructionWord body
+                pure (if value <= 1 then fromIntegral value else -1)
+    status <- liftIO (validate (CtipSearch count action))
+    case status of
+      0 -> liftIO (constructionEffect native 11 (wordLE 8 (fromIntegral (validate (PreviousSequence sequenceNumber)))))
+      1 -> throwE 3
+      2 -> throwE 4
+      _ -> throwE (-1)
+
+instance ConfirmationHeaders Construction where
+  readConfirmationHeaders (Construction _ height _ _ native) = do
+    tip <- fromIntegral <$> liftIO (constructionScalar native 12 0)
+    let first = fromIntegral height
+    unless (headerWindow first tip) (throwE 5)
+    liftIO (constructionEffect native 20 B.empty)
+    forM_ [first..fromIntegral tip] $ \current -> do
+      valid <- constructionFlag =<< liftIO (constructionScalar native 21 current)
+      unless valid (throwE 6)
+      liftIO (constructionEffect native 22 B.empty)
+
+constructEvidence :: (DepositSource op, PriorTreasury op, ConfirmationHeaders op) => op -> ConstructionCheck ()
+constructEvidence value = readDepositSource value >> readPriorTreasury value >> readConfirmationHeaders value
+
+type ConstructionCapabilities = '[DepositSource, PriorTreasury, ConfirmationHeaders]
+instance Operation Construction ConstructionCapabilities where
+  type Context Construction = CapabilityContext ConstructionCapabilities Construction
+  type Outcome Construction = IO Int32
+  data DSL Construction where
+    ReconstructEvidence :: Context Construction => DSL Construction
+  interpret operation request = withOperation @Construction operation $ \value -> case request of
+    ReconstructEvidence -> Just (either id (const 0) <$> runExceptT (constructEvidence value))
+
+-- Borrowed witness fields remain live for this synchronous request. The same
+-- evidence/witness rules serve both this workflow and their independent APIs.
+data Parsing = Parsing Word64 Word64 Word64 DeterministicEvidence
+  (Ptr Int64 -> DepositWitness) NativeBytes
+class EvidenceParsing op where
+  parseEvidence :: op -> ConstructionCheck ()
+class InclusionVerification op where
+  verifyInclusion :: op -> ConstructionCheck ()
+class TreasuryVerification op where
+  verifyTreasury :: op -> ConstructionCheck ()
+class DestinationSelection op where
+  selectDestination :: op -> ConstructionCheck ()
+class DepositPublication op where
+  publishDeposit :: op -> ConstructionCheck ()
+
+parseChecked :: Int32 -> IO a -> ConstructionCheck a
+parseChecked failure action = do
+  result <- liftIO (try action)
+  case result of
+    Left (_ :: SomeException) -> throwE failure
+    Right value -> pure value
+
+parseStatus :: Int32 -> Int32 -> ConstructionCheck ()
+parseStatus group status = unless (status == 0) (throwE (group+status))
+
+parseFlag :: NativeBytes -> Word32 -> Word64 -> ConstructionCheck Bool
+parseFlag native step index = constructionFlag =<< liftIO (constructionScalar native step index)
+
+parsingInt32 :: NativeBytes -> Word32 -> Word64 -> IO Int32
+parsingInt32 native step index = do
+  value <- constructionScalar native step index
+  if value <= fromIntegral (maxBound :: Int32) || value >= fromIntegral (minBound :: Int32)
+    then pure (fromIntegral value) else ioError (userError "invalid parsing int32 reply")
+
+instance EvidenceParsing Parsing where
+  parseEvidence (Parsing inputs index witnesses evidence _ native) = do
+    unless (index < inputs && index < witnesses) (throwE 1)
+    status <- parseChecked (-2) (validate evidence)
+    parseStatus 0x100 status
+    liftIO (constructionEffect native 0 B.empty)
+    forM_ [1..3] $ \step -> parseFlag native step 0 >>= \valid -> unless valid (throwE 2)
+
+instance InclusionVerification Parsing where
+  verifyInclusion (Parsing _ _ _ _ _ native) = do
+    row <- liftIO (native 4 0 B.empty)
+    unless (B.length row == 24) (throwE (-1))
+    let word offset = ParentReplay.replayWord (B.take 8 (B.drop offset row))
+    when (word 0 > fromIntegral (maxBound :: Word32) || word 16 > fromIntegral (maxBound :: Word32)) (throwE (-1))
+    status <- parseChecked (-3) (checkInclusion (fromIntegral (word 0)) (word 8) (fromIntegral (word 16))
+      (\index -> parsingInt32 native 5 (fromIntegral index)))
+    parseStatus 0x200 status
+    liftIO (constructionEffect native 6 B.empty)
+
+historicalTreasury :: B.ByteString -> Bool
+historicalTreasury script = B.length script == 4 &&
+  ParentReplay.treasurySlot (fromIntegral (ParentReplay.replayWord script)) 0xb4 == fromIntegral sidechainSlot
+
+instance TreasuryVerification Parsing where
+  verifyTreasury (Parsing _ _ _ _ witness native) = do
+    count <- liftIO (constructionScalar native 7 0)
+    let scan index matches
+          | index == count = pure matches
+          | otherwise = do
+              hashMatches <- parseFlag native 8 index
+              bounded <- if hashMatches then parseFlag native 9 index else pure False
+              matchesScript <- if bounded then historicalTreasury <$> liftIO (native 10 index B.empty) else pure False
+              if matchesScript then do
+                reply <- liftIO (native 11 index B.empty)
+                unless (B.null reply) (throwE (-1))
+                scan (index+1) (matches+1)
+              else scan (index+1) matches
+    matches <- scan 0 0
+    previous <- if matches == 0 then pure 0 else fromIntegral <$> liftIO (constructionScalar native 12 0)
+    (decoded,value) <- parseChecked (-5) $ allocaBytes 8 $ \output -> do
+      poke output 0
+      result <- validate (witness output)
+      amount <- peek output
+      pure (result /= 0,amount)
+    liftIO (constructionEffect native 13 (wordLE 8 (fromIntegral value)))
+    treasury <- historicalTreasury <$> liftIO (native 14 0 B.empty)
+    current <- fromIntegral <$> liftIO (constructionScalar native 15 0)
+    let facts = fromIntegral (fromEnum treasury) .|. (fromIntegral (fromEnum decoded) `shiftL` 1)
+    parseStatus 0x200 (validate (DepositCtip facts matches current previous value))
+
+instance DestinationSelection Parsing where
+  selectDestination (Parsing _ _ _ _ _ native) = do
+    count <- liftIO (constructionScalar native 16 0)
+    when (count > fromIntegral (maxBound :: Word32)) (throwE (-4))
+    result <- parseChecked (-4) (destinationScan (fromIntegral count)
+      (\index step -> parsingInt32 native (20+step) (fromIntegral index)))
+    when (result < 0) (throwE (0x300-fromIntegral result))
+
+instance DepositPublication Parsing where
+  publishDeposit (Parsing _ _ _ _ _ native) = liftIO (constructionEffect native 24 B.empty)
+
+parseDeposit :: (EvidenceParsing op, InclusionVerification op, TreasuryVerification op,
+  DestinationSelection op, DepositPublication op) => op -> ConstructionCheck ()
+parseDeposit value = parseEvidence value >> verifyInclusion value >> verifyTreasury value >>
+  selectDestination value >> publishDeposit value
+
+type ParsingCapabilities = '[EvidenceParsing, InclusionVerification, TreasuryVerification, DestinationSelection, DepositPublication]
+instance Operation Parsing ParsingCapabilities where
+  type Context Parsing = CapabilityContext ParsingCapabilities Parsing
+  type Outcome Parsing = IO Int32
+  data DSL Parsing where
+    ParseDeposit :: Context Parsing => DSL Parsing
+  interpret operation request = withOperation @Parsing operation $ \value -> case request of
+    ParseDeposit -> Just (either id (const 0) <$> runExceptT (parseDeposit value))
+
+-- One borrowed transaction view serves lookup, legacy authentication and claim
+-- verification. Each constructor selects a capability after payload equality.
+data Claim = Claim Word64 Word64 Word64 Word64
+  (Word32 -> Ptr Int64 -> DepositWitness) NativeBytes
+class CheckpointDiscovery op where
+  discoverCheckpoint :: op -> ConstructionCheck ()
+class LegacyAuthentication op where
+  authenticateLegacy :: op -> ConstructionCheck ()
+class TransactionVerification op where
+  verifyClaimTransaction :: op -> ConstructionCheck ()
+
+claimWitness :: Claim -> Word32 -> ConstructionCheck (Bool,Int64)
+claimWitness (Claim _ _ _ _ witness _) mode = parseChecked (-5) $ allocaBytes 8 $ \output -> do
+  poke output 0
+  kind <- validate (witness mode output)
+  value <- peek output
+  pure (kind /= 0,value)
+
+instance CheckpointDiscovery Claim where
+  discoverCheckpoint value@(Claim inputs index witnesses _ _ native) = do
+    unless (index < inputs && index < witnesses) (throwE 1)
+    (eligible,_) <- claimWitness value 3
+    -- The old native call evaluated both hashes even when eligibility was false.
+    identity <- liftIO (native 0 0 B.empty)
+    unless (B.length identity == 68) (throwE (-2))
+    let previous = B.take 32 (B.drop 32 identity)
+        vout = ParentReplay.replayWord (B.drop 64 identity)
+        record = if eligible && vout == 0 then checkpointRecord (B.take 32 identity) previous else B.empty
+    when (B.null record) (throwE 1)
+    unless (B.length record == 136) (throwE (-2))
+    liftIO (constructionEffect native 1 record)
+
+instance LegacyAuthentication Claim where
+  authenticateLegacy value@(Claim _ _ _ _ _ native) = do
+    (decoded,actual) <- claimWitness value 1
+    destination <- parseFlag native 10 0
+    expected <- fromIntegral <$> liftIO (constructionScalar native 11 0)
+    parseStatus 0 (validate (LegacyClaim (fromIntegral (fromEnum decoded) .|.
+      (fromIntegral (fromEnum destination) `shiftL` 1)) actual expected))
+    liftIO (constructionEffect native 12 B.empty)
+
+instance TransactionVerification Claim where
+  verifyClaimTransaction value@(Claim inputs index witnesses outputs _ native) = do
+    (facts,witnessed) <- if inputs == 1 && index == 0 && witnesses == 1 then do
+      inputFacts <- liftIO (constructionScalar native 20 0)
+      when (inputFacts > 15) (throwE (-1))
+      if inputFacts /= 15 then pure (fromIntegral inputFacts,0) else do
+        (decoded,amount) <- claimWitness value 1
+        projected <- liftIO (native 21 0 (B.singleton (fromIntegral (fromEnum decoded))))
+        flags <- liftIO (constructionWord projected)
+        when (flags > 3) (throwE (-1))
+        pure (15 .|. (fromIntegral (fromEnum decoded) `shiftL` 4) .|. (fromIntegral flags `shiftL` 5),amount)
+      else pure (0,0)
+    -- Output projection historically follows even a failed input preflight.
+    outs <- mapM (\i -> do
+      row <- liftIO (native 22 i B.empty)
+      unless (B.length row == 16) (throwE (-1))
+      let flags = ParentReplay.replayWord (B.take 8 row)
+          amount = fromIntegral (ParentReplay.replayWord (B.drop 8 row))
+      when (flags > 255) (throwE (-1))
+      pure (fromIntegral flags,amount)) (take (fromIntegral (min 2 outputs)) [0..])
+    claimed <- fromIntegral <$> liftIO (constructionScalar native 23 0)
+    parseStatus 0 (validate (AuthenticatedDeposit inputs index witnesses facts claimed witnessed outputs outs))
+
+type ClaimCapabilities = '[CheckpointDiscovery, LegacyAuthentication, TransactionVerification]
+instance Operation Claim ClaimCapabilities where
+  type Context Claim = CapabilityContext ClaimCapabilities Claim
+  type Outcome Claim = IO Int32
+  data DSL Claim where
+    DiscoverCheckpoint :: Context Claim => DSL Claim
+    AuthenticateLegacy :: Context Claim => DSL Claim
+    VerifyClaimTransaction :: Context Claim => DSL Claim
+  interpret operation request = withOperation @Claim operation $ \value ->
+    let run = Just . fmap (either id (const 0)) . runExceptT
+    in case request of
+      DiscoverCheckpoint -> run (discoverCheckpoint value)
+      AuthenticateLegacy -> run (authenticateLegacy value)
+      VerifyClaimTransaction -> run (verifyClaimTransaction value)
 
 data TreasuryDelta = TreasuryDelta Int64 Int64 Int64 Int64
 instance Validation TreasuryDelta where
@@ -485,28 +858,18 @@ instance Validation PegEvent where
 -- The native reader supplies four initialized Int64 fields per requested step.
 -- 0 preserves a parser error, 1 succeeds; other statuses are adapter faults.
 type ReadPegFields = Ptr () -> Word32 -> Ptr Int64 -> IO Int32
-foreign import ccall unsafe "dynamic" readPegFields :: FunPtr ReadPegFields -> ReadPegFields
+foreign import ccall safe "dynamic" readPegFields :: FunPtr ReadPegFields -> ReadPegFields
 type EvidenceFields = (Int64, Int64, Int64, Int64)
 data EvidencePlan = EvidenceDone Int32 | EvidenceRead Word32 (EvidenceFields -> EvidencePlan)
 data LiveEvidence = LiveEvidence Word32 (FunPtr ReadPegFields) (Ptr ())
-                  | ResumeEvidence (IORef EvidencePlan) (Maybe EvidenceFields)
 instance Validation LiveEvidence where
   type ValidationResult LiveEvidence = IO Int32
-  validate (ResumeEvidence ref supplied) = do
-    current <- readIORef ref
-    next <- case (current, supplied) of
-      (EvidenceRead _ continue, Just snapshot) -> evaluate (continue snapshot)
-      (_, Nothing) -> pure current
-      _ -> error "unexpected live evidence snapshot"
-    writeIORef ref next
-    case next of
-      EvidenceDone result -> pure result
-      EvidenceRead step _ -> pure (256 + fromIntegral step)
   validate (LiveEvidence phase reader context) = run (liveEvidencePlan phase)
     where
       run (EvidenceDone result) = pure result
       run (EvidenceRead step next) = do
         snapshot <- allocaBytes 32 $ \output -> do
+          pokeArray output (replicate 4 (0 :: Int64))
           status <- readPegFields reader context step output
           if status == 0 then pure Nothing else if status /= 1 then error "live evidence reader fault"
           else Just <$> ((,,,) <$> peekElemOff output 0 <*> peekElemOff output 1 <*>
@@ -604,8 +967,11 @@ instance Validation CheckpointLookup where
     | otherwise = do
         identity <- copyBytes txid 32
         outpoint <- copyBytes previous 32
-        pure $ maybe B.empty (\(_,_,record) -> record) $
-          find (\(known,prior,_) -> identity == known && outpoint == prior) legacyCheckpoints
+        pure (checkpointRecord identity outpoint)
+
+checkpointRecord :: B.ByteString -> B.ByteString -> B.ByteString
+checkpointRecord identity outpoint = maybe B.empty (\(_,_,record) -> record) $
+  find (\(known,prior,_) -> identity == known && outpoint == prior) legacyCheckpoints
 
 -- Facts: witness decoded, destination accepted by the upstream address decoder.
 data LegacyClaim = LegacyClaim Word32 Int64 Int64
@@ -623,22 +989,25 @@ foreign import ccall unsafe "dynamic" inspectDestination :: FunPtr InspectDestin
 data DepositDestination = DepositDestination Word32 (FunPtr InspectDestination) (Ptr ())
 instance Validation DepositDestination where
   type ValidationResult DepositDestination = IO Int64
-  validate (DepositDestination count inspector context) = go 0 Nothing
+  validate (DepositDestination count inspector context) = destinationScan count (inspectDestination inspector context)
+
+destinationScan :: Word32 -> (Word32 -> Word32 -> IO Int32) -> IO Int64
+destinationScan count inspect = go 0 Nothing
     where
       go index found
         | index == count = pure (maybe (-1) fromIntegral found)
         | otherwise = do
-            first <- inspectDestination inspector context index 0
+            first <- inspect index 0
             if first < 0 || first > 511 then error "destination first opcode adapter fault" else pure ()
-            second <- inspectDestination inspector context index 1
+            second <- inspect index 1
             if second < 0 || second > 2047 then error "destination second opcode adapter fault" else pure ()
             let script = first .|. (second `shiftL` 9)
             if script .&. 511 /= 106 || (script `shiftR` 9) .&. 511 > 78 ||
                     (script `shiftR` 18) .&. 3 /= 3 then go (index+1) found
             else do
-              decoded <- inspectDestination inspector context index 2
+              decoded <- inspect index 2
               if decoded == 1 then do
-                published <- inspectDestination inspector context index 3
+                published <- inspect index 3
                 if published == 1 then pure () else error "destination publication adapter fault"
               else pure ()
               case (decoded,found) of
@@ -653,6 +1022,26 @@ data DepositStatePhase = CheckCheckpoint | CheckPrior | ConnectPrior | Disconnec
   deriving (Enum, Bounded)
 
 -- Facts: state present, decoding failed, state/anchor matches its expected value.
+data DepositStateWorkflow = DepositStateWorkflow Word32 (Word32 -> IO Int64)
+instance Validation DepositStateWorkflow where
+  type ValidationResult DepositStateWorkflow = IO Int32
+  validate (DepositStateWorkflow start native)
+    | start `notElem` [0,11,19,27] = pure (-1)
+    | otherwise = validate (PredicateFlow True start 82
+        (\phase result -> fromIntegral (validate (DepositVerification phase result))) readFact)
+    where
+      readFact step = do
+        result <- native step
+        case lookup step [(2,0),(9,1),(25,2),(28,3),(30,4),(33,5),(13,6),(17,7)] of
+          Nothing -> pure result
+          Just phase | result < 0 || result > 7 -> pure (-1)
+                     | otherwise -> case validate (DepositStateRule phase (fromIntegral result)) of
+                         0 -> pure 1
+                         code | code > 0 && code <= 11 -> do
+                           published <- native (82+fromIntegral code)
+                           pure (if published == 1 then 0 else -1)
+                         _ -> pure (-1)
+
 data DepositStateRule = DepositStateRule Word32 Word32 | DepositVerification Word32 Word32
                      | DepositProjection Word32 Word64
 instance Validation DepositStateRule where
@@ -772,8 +1161,15 @@ type ReadCtipOpcode = Ptr () -> Word32 -> IO Int32
 foreign import ccall unsafe "dynamic" readCtipOpcode :: FunPtr ReadCtipOpcode -> ReadCtipOpcode
 data PersistedCtip = PersistedCtip Word32 Int64 Word32 (FunPtr DecodeCtip) (Ptr ())
                   | CtipScript (Word32 -> IO Int32)
+                  | PersistedCtipWorkflow Word32 Int64 (Word32 -> IO Int32) (FunPtr DecodeCtip) (Ptr ())
 instance Validation PersistedCtip where
   type ValidationResult PersistedCtip = IO Int32
+  validate (PersistedCtipWorkflow facts amount readOpcode decoder context) = do
+    script <- validate (CtipScript readOpcode)
+    ended <- readOpcode 3
+    if ended < 0 || ended > 1 then error "invalid CTIP cursor fact"
+      else if decoder == nullFunPtr then error "missing CTIP payload decoder"
+      else validate (PersistedCtip (facts .|. (fromIntegral ended `shiftL` 4)) amount (fromIntegral script) decoder context)
   validate (CtipScript readOpcode) = go 0 0
     where
       go 3 packed = pure packed
@@ -799,7 +1195,11 @@ type CheckParentHeader = ReadCtipOpcode
 data DepositInclusion = DepositInclusion Word32 Word64 Word32 (FunPtr CheckParentHeader) (Ptr ())
 instance Validation DepositInclusion where
   type ValidationResult DepositInclusion = IO Int32
-  validate (DepositInclusion facts matches count checker context)
+  validate (DepositInclusion facts matches count checker context) =
+    checkInclusion facts matches count (readCtipOpcode checker context)
+
+checkInclusion :: Word32 -> Word64 -> Word32 -> (Word32 -> IO Int32) -> IO Int32
+checkInclusion facts matches count checkHeader
     | facts .&. 1 == 0 = pure 1
     | facts .&. 14 /= 14 || matches /= 1 = pure 2
     | count < 1 || count > 2017 = error "deposit header adapter count invalid"
@@ -808,7 +1208,7 @@ instance Validation DepositInclusion where
       go index
         | index == count = pure 0
         | otherwise = do
-            result <- readCtipOpcode checker context index
+            result <- checkHeader index
             if result < 0 || result > 3 then error "parent header adapter fault"
             else if result .&. 1 == 0 then pure 3
             else if index > 0 && result .&. 2 == 0 then pure 4

@@ -40,6 +40,8 @@ data EcxSp1Variant
   | Groth16V4PublicValuesV5Sha256
   | Groth16V5IncrementalActivationSha256
   | Groth16V6IncrementalSuccessorSha256
+  | Groth16V7SwapSuccessorSha256
+  | Groth16V8CustodySuccessorSha256
   deriving (Eq, Show)
 
 
@@ -141,6 +143,8 @@ data EcxPrim a b where
   IncrementalSuccessorTransitionCmrRequired :: EcxPrim () Word256
   VerifySp1Groth16V5IncrementalActivationSha256 :: EcxPrim (Word256, Word256) Bit
   VerifySp1Groth16V6IncrementalSuccessorSha256 :: EcxPrim (Word256, Word256) Bit
+  VerifySp1Groth16V7SwapSuccessorSha256 :: EcxPrim (Word256, Word256) Bit
+  VerifySp1Groth16V8CustodySuccessorSha256 :: EcxPrim (Word256, Word256) Bit
 
 
 instance Eq (EcxPrim a b) where
@@ -168,6 +172,8 @@ instance Eq (EcxPrim a b) where
   IncrementalSuccessorTransitionCmrRequired == IncrementalSuccessorTransitionCmrRequired = True
   VerifySp1Groth16V5IncrementalActivationSha256 == VerifySp1Groth16V5IncrementalActivationSha256 = True
   VerifySp1Groth16V6IncrementalSuccessorSha256 == VerifySp1Groth16V6IncrementalSuccessorSha256 = True
+  VerifySp1Groth16V7SwapSuccessorSha256 == VerifySp1Groth16V7SwapSuccessorSha256 = True
+  VerifySp1Groth16V8CustodySuccessorSha256 == VerifySp1Groth16V8CustodySuccessorSha256 = True
   _ == _ = False
 
 
@@ -200,6 +206,8 @@ ecxPrimName BondV2IncrementalActivationCmrRequired = "bond_v2_incremental_activa
 ecxPrimName IncrementalSuccessorTransitionCmrRequired = "incremental_successor_transition_cmr_required"
 ecxPrimName VerifySp1Groth16V5IncrementalActivationSha256 = "verify_sp1_groth16_v5_incremental_activation_sha256"
 ecxPrimName VerifySp1Groth16V6IncrementalSuccessorSha256 = "verify_sp1_groth16_v6_incremental_successor_sha256"
+ecxPrimName VerifySp1Groth16V7SwapSuccessorSha256 = "verify_sp1_groth16_v7_swap_successor_sha256"
+ecxPrimName VerifySp1Groth16V8CustodySuccessorSha256 = "verify_sp1_groth16_v8_custody_successor_sha256"
 
 
 nonzero256 :: Word256 -> Bool
@@ -296,3 +304,7 @@ ecxPrimSem VerifySp1Groth16V5IncrementalActivationSha256 (programId, publicValue
   Just . toBit $ verifySp1Groth16Sha256 env Groth16V5IncrementalActivationSha256 programId publicValuesHash
 ecxPrimSem VerifySp1Groth16V6IncrementalSuccessorSha256 (programId, publicValuesHash) env =
   Just . toBit $ verifySp1Groth16Sha256 env Groth16V6IncrementalSuccessorSha256 programId publicValuesHash
+ecxPrimSem VerifySp1Groth16V7SwapSuccessorSha256 (programId, publicValuesHash) env =
+  Just . toBit $ verifySp1Groth16Sha256 env Groth16V7SwapSuccessorSha256 programId publicValuesHash
+ecxPrimSem VerifySp1Groth16V8CustodySuccessorSha256 (programId, publicValuesHash) env =
+  Just . toBit $ verifySp1Groth16Sha256 env Groth16V8CustodySuccessorSha256 programId publicValuesHash

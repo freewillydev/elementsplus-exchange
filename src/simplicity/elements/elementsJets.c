@@ -17,7 +17,9 @@
 _Static_assert(ECX_SP1_GROTH16_PROOF_LEN == 356, "Haskell Groth16 proof contract");
 _Static_assert(ECX_SP1_PUBLIC_VALUES_V4_LEN == 609 && ECX_SP1_PUBLIC_VALUES_V5_LEN == 850 &&
   ECX_SP1_INCREMENTAL_ACTIVATION_PUBLIC_VALUES_LEN == 364 &&
-  ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN == 1627, "Haskell Groth16 layout contract");
+  ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN == 1627 &&
+  ECX_SP1_SWAP_SUCCESSOR_PUBLIC_VALUES_LEN == 1693 &&
+  ECX_SP1_CUSTODY_SUCCESSOR_PUBLIC_VALUES_LEN == 791, "Haskell Groth16 layout contract");
 
 static bool ecxSha256(
   unsigned char outputBytes[32],
@@ -61,6 +63,22 @@ bool simplicity_elements_parse_sp1_groth16_v6_incremental_successor_annex(
 ) {
   return elements_haskell_parse_groth16(4, annex, annexLen, programId,
     publicValuesSha256, publicValues, ECX_SP1_INCREMENTAL_SUCCESSOR_PUBLIC_VALUES_LEN, ecxSha256);
+}
+
+bool simplicity_elements_parse_sp1_groth16_v7_swap_successor_annex(
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_SWAP_SUCCESSOR_PUBLIC_VALUES_LEN]
+) {
+  return elements_haskell_parse_groth16(5, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_SWAP_SUCCESSOR_PUBLIC_VALUES_LEN, ecxSha256);
+}
+
+bool simplicity_elements_parse_sp1_groth16_v8_custody_successor_annex(
+  const unsigned char* annex, size_t annexLen, unsigned char programId[32],
+  unsigned char publicValuesSha256[32], unsigned char publicValues[ECX_SP1_CUSTODY_SUCCESSOR_PUBLIC_VALUES_LEN]
+) {
+  return elements_haskell_parse_groth16(6, annex, annexLen, programId,
+    publicValuesSha256, publicValues, ECX_SP1_CUSTODY_SUCCESSOR_PUBLIC_VALUES_LEN, ecxSha256);
 }
 
 /* A production build defines HAVE_USDD_SP1_VERIFIER only when it links the
@@ -339,6 +357,24 @@ bool simplicity_elements_verify_sp1_groth16_v6_incremental_successor_annex_sha25
     expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
 }
 
+bool simplicity_elements_verify_sp1_groth16_v7_swap_successor_annex_sha256(
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext
+) {
+  return elements_haskell_groth16_proof(5, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
+}
+
+bool simplicity_elements_verify_sp1_groth16_v8_custody_successor_annex_sha256(
+  const unsigned char* annex, size_t annexLen,
+  const unsigned char expectedProgramIdBytes[32], const unsigned char expectedPublicValuesHashBytes[32],
+  ecx_sp1_groth16_verify_fn verify, void* verifyContext
+) {
+  return elements_haskell_groth16_proof(6, annex, annexLen,
+    expectedProgramIdBytes, expectedPublicValuesHashBytes, ecxSha256, verify, verifyContext);
+}
+
 static bool simplicity_verify_groth16_frame(frameItem* dst, frameItem src, const txEnv* env, uint32_t kind) {
   sha256_midstate expectedProgramId, expectedPublicValuesHash;
   unsigned char program[32], digest[32];
@@ -370,6 +406,15 @@ bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* d
 
 bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env) {
   return simplicity_verify_groth16_frame(dst, src, env, 4);
+}
+
+/* Separate candidate jet: the frozen V6 jet never accepts V7 bytes. */
+bool simplicity_verify_sp1_groth16_v7_swap_successor_sha256(frameItem* dst, frameItem src, const txEnv* env) {
+  return simplicity_verify_groth16_frame(dst, src, env, 5);
+}
+
+bool simplicity_verify_sp1_groth16_v8_custody_successor_sha256(frameItem* dst, frameItem src, const txEnv* env) {
+  return simplicity_verify_groth16_frame(dst, src, env, 6);
 }
 
 /* Write an outpoint value to the 'dst' frame, advancing the cursor 288 cells.

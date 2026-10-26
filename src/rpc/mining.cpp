@@ -973,10 +973,8 @@ static RPCHelpMan getblocktemplate()
         }
         entry.pushKV("sigops", nTxSigOps);
         entry.pushKV("weight", GetTransactionWeight(tx));
-        const uint64_t simplicity_milliweight{GetSimplicityValidationMilliweight(tx)};
+        const uint64_t simplicity_milliweight{GetSimplicityValidationMilliweight(tx, &total_simplicity_milliweight)};
         entry.pushKV("simplicityworkmilliweight", simplicity_milliweight);
-        drivechain::haskell::BmmWorkTotal(true,1,
-            [&](uint64_t) { return simplicity_milliweight; },total_simplicity_milliweight);
 
         transactions.push_back(std::move(entry));
     }

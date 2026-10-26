@@ -157,7 +157,6 @@ if(ENABLE_WALLET)
       createwalletdialog.h
       editaddressdialog.cpp
       editaddressdialog.h
-      issueassetdialog.cpp
       issueassetdialog.h
       openuridialog.cpp
       openuridialog.h
